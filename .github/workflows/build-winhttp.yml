@@ -1,0 +1,74 @@
+name: Build Windows WinHTTP Lua module
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-winhttp.yml"
+      - "native/winhttp/**"
+  pull_request:
+    paths:
+      - ".github/workflows/build-winhttp.yml"
+      - "native/winhttp/**"
+
+jobs:
+  build:
+    name: dtrmflickr_winhttp.dll
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Download Lua source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          curl.exe -L -o build\lua-5.4.6.tar.gz https://www.lua.org/ftp/lua-5.4.6.tar.gz
+          tar -xzf build\lua-5.4.6.tar.gz -C build
+
+      - name: Build Lua import library
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $luaSrc = Resolve-Path build\lua-5.4.6\src
+          $luaBuild = Resolve-Path build
+          Push-Location $luaSrc
+          cl.exe /nologo /MD /O2 /c /DLUA_BUILD_AS_DLL `
+            lapi.c lauxlib.c lbaselib.c lcode.c lcorolib.c lctype.c ldblib.c ldebug.c `
+            ldo.c ldump.c lfunc.c lgc.c linit.c liolib.c llex.c lmathlib.c lmem.c `
+            loadlib.c lobject.c lopcodes.c loslib.c lparser.c lstate.c lstring.c `
+            lstrlib.c ltable.c ltablib.c ltm.c lundump.c lutf8lib.c lvm.c lzio.c
+          link.exe /nologo /DLL /OUT:$luaBuild\lua54.dll /IMPLIB:$luaBuild\lua54.lib *.obj
+          cl.exe /nologo /MD /O2 lua.c /Fe:$luaBuild\lua.exe $luaBuild\lua54.lib
+          Pop-Location
+
+      - name: Build dtrmflickr WinHTTP module
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\native\winhttp\build.ps1 `
+            -LuaInclude "$PWD\build\lua-5.4.6\src" `
+            -LuaLib "$PWD\build\lua54.lib" `
+            -OutDir "$PWD\build\artifact"
+
+      - name: Smoke test module load and HTTPS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:PATH = "$PWD\build;$env:PATH"
+          $env:LUA_CPATH = "$PWD\build\artifact\?.dll;$PWD\build\artifact\?\init.dll"
+          .\build\lua.exe -e "local h=require('dtrmflickr_winhttp'); local b,e=h.request('GET','https://example.com/'); assert(b,b or e); assert(b:find('Example Domain',1,true), 'unexpected response'); print('WinHTTP module OK')"
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtrmflickr-winhttp-windows-x64
+          path: build/artifact/dtrmflickr_winhttp.dll
+          if-no-files-found: error

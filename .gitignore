@@ -1,0 +1,19 @@
+# Local agent / editor settings
+.claude/
+
+# Local darktable/debug artifacts
+/*.inspect.db
+/*.log
+/memory/
+
+# Build outputs (keep the shipped runtime DLL; ignore stray build dlls/objs)
+build/
+*.dll
+!dtrmflickr_winhttp.dll
+*.obj
+*.lib
+*.exp
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
