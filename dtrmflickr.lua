@@ -2347,7 +2347,7 @@ function M.new(opts)
     recent_limit = math.max(0, tonumber(opts.recent_limit) or 25),
     stats = {
       enqueued = 0, started = 0, succeeded = 0, coalesced = 0, stale = 0,
-      failed = 0, retried = 0, rate_limited = 0, waited_ms = 0,
+      failed = 0, retried = 0, rate_limited = 0, waited_ms = 0, waits = 0,
     },
   }, Queue)
 end
@@ -2434,7 +2434,15 @@ function Queue:wait(job, ms, why, attempt)
   ms = math.floor(tonumber(ms) or 0)
   if ms <= 0 then return end
   self.stats.waited_ms = self.stats.waited_ms + ms
+  self.stats.waits = self.stats.waits + 1
   if job then job.waited_ms = (job.waited_ms or 0) + ms end
+  -- Lifecycle `waiting` event for all wait reasons (pace, transient, rate-limit)
+  -- so a queued/running/waiting/retrying UI can show a single "waiting Ns
+  -- because <why>" state. This complements `retry` (the decision to retry) and
+  -- `rate-limit`/`transient` `on_wait` (the human-facing message): pace waits
+  -- previously had no event at all, so a UI could not distinguish pace-throttling
+  -- from a plain run. The `retry` event still fires first for retry waits.
+  self:emit("waiting", job, { ms = ms, why = why, attempt = attempt })
   if job and job.on_wait then job.on_wait(ms, why, job.method, attempt) end
   sleep_ms(self.sleep_ms, ms)
 end
