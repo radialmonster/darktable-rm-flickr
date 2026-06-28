@@ -1095,6 +1095,15 @@ local function set_tag(account_nsid, set_id)
   return table.concat({ PREFIX, tostring(account_nsid), "set", tostring(set_id) }, "|")
 end
 
+local function valid_component(value)
+  value = tostring(value or "")
+  return value ~= "" and value:find("|", 1, true) == nil
+end
+
+local function assert_component(kind, value)
+  assert(valid_component(value), "invalid Flickr " .. kind)
+end
+
 local function ensure_tag(name)
   return dt.tags.find(name) or dt.tags.create(name)
 end
@@ -1142,6 +1151,8 @@ function M.get_any_photo_id(image)
 end
 
 function M.set_photo_id(image, account_nsid, photo_id)
+  assert_component("account id", account_nsid)
+  assert_component("photo id", photo_id)
   local old_id = M.get_photo_id(image, account_nsid)
   if old_id and old_id ~= tostring(photo_id) then
     local old_tag = dt.tags.find(photo_tag(account_nsid, old_id))
@@ -1151,6 +1162,7 @@ function M.set_photo_id(image, account_nsid, photo_id)
 end
 
 function M.clear_photo_id(image, account_nsid)
+  assert_component("account id", account_nsid)
   local old_id = M.get_photo_id(image, account_nsid)
   if not old_id then return false end
   local old_tag = dt.tags.find(photo_tag(account_nsid, old_id))
@@ -1159,22 +1171,27 @@ function M.clear_photo_id(image, account_nsid)
 end
 
 function M.get_sets(image, account_nsid)
+  assert_component("account id", account_nsid)
   local prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|set|"
   local sets = {}
   for _, tag in ipairs(image_tags(image) or {}) do
     local name = tag_name(tag)
     local id = name and name:sub(1, #prefix) == prefix and name:sub(#prefix + 1) or nil
-    if id and id ~= "" then sets[#sets + 1] = id end
+    if valid_component(id) then sets[#sets + 1] = id end
   end
   table.sort(sets)
   return sets
 end
 
 function M.add_set(image, account_nsid, set_id)
+  assert_component("account id", account_nsid)
+  assert_component("set id", set_id)
   attach(image, ensure_tag(set_tag(account_nsid, set_id)))
 end
 
 function M.remove_set(image, account_nsid, set_id)
+  assert_component("account id", account_nsid)
+  assert_component("set id", set_id)
   local tag = dt.tags.find(set_tag(account_nsid, set_id))
   if tag then detach(image, tag) end
 end
@@ -2979,6 +2996,20 @@ function panel_sets.resolve(value)
   return nil, kind
 end
 
+local function flickr_error_code(err)
+  return tostring(err or ""):match("%((%d+)%)")
+end
+
+local function photoset_add_is_already_present(err)
+  return flickr_error_code(err) == "3"
+    and tostring(err or ""):lower():find("already in set", 1, true) ~= nil
+end
+
+local function photoset_remove_is_already_absent(err)
+  return flickr_error_code(err) == "3"
+    and tostring(err or ""):lower():find("not in set", 1, true) ~= nil
+end
+
 function panel_sets.add()
   local image, acc, photo_id, api_key, api_secret = panel_sets.api_context(_("adding an album"))
   if not image then return end
@@ -2995,7 +3026,7 @@ function panel_sets.add()
     local item, kind = panel_sets.resolve(part)
     if item and item.id and item.id ~= "" then
       local ok, err = rest.photosets_add_photo(api_key, api_secret, acc, item.id, photo_id)
-      if ok or tostring(err or ""):find("%(3%): Photo already in set", 1, false) then
+      if ok or photoset_add_is_already_present(err) then
         state.add_set(image, acc.nsid, item.id)
         added = added + 1
       else
@@ -3067,7 +3098,7 @@ function panel_sets.remove_selected()
   end
 
   local ok, err = rest.photosets_remove_photo(api_key, api_secret, acc, set_id, photo_id)
-  local already_absent = tostring(err or ""):find("%(3%): Photo not in set", 1, false) ~= nil
+  local already_absent = photoset_remove_is_already_absent(err)
   if ok or already_absent then state.remove_set(image, acc.nsid, set_id) end
   panel_sets_label.label = panel_sets.format_memberships(state.get_sets(image, acc.nsid))
   panel_sets.update_current_choices(image, acc.nsid)
@@ -3912,7 +3943,7 @@ local function finalize(storage, image_table, extra_data)
       local item = extra_data.uploaded[i]
       local ok, err = rest.photosets_add_photo(extra_data.api_key, extra_data.api_secret, extra_data.account,
         photoset_id, item.photo_id)
-      if ok then
+      if ok or photoset_add_is_already_present(err) then
         state.add_set(item.image, extra_data.account.nsid, photoset_id)
       else
         album_errors = album_errors + 1
