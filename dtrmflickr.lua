@@ -1034,6 +1034,7 @@ function M.paged_call(api_key, api_secret, account, method, args, container, opt
   local page = tonumber(opts.start_page or args.page) or 1
   local per_page = tonumber(opts.per_page or args.per_page) or 500
   local max_pages = tonumber(opts.max_pages) or 0
+  local start_page = page
   local pages = page
 
   while page <= pages do
@@ -1069,7 +1070,12 @@ function M.paged_call(api_key, api_secret, account, method, args, container, opt
     if opts.on_page then opts.on_page(body, page_infos[#page_infos], page) end
 
     pages = page_count or pages
-    if max_pages > 0 and pages > page + max_pages - 1 then pages = page + max_pages - 1 end
+    -- Cap against the *start* page, not the moving counter. `page` increments
+    -- below, so clamping to `page + max_pages - 1` would re-raise the ceiling by
+    -- one each iteration and defeat the cap entirely (it would walk every page).
+    if max_pages > 0 and pages > start_page + max_pages - 1 then
+      pages = start_page + max_pages - 1
+    end
     page = page + 1
   end
 
