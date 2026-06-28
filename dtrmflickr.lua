@@ -999,7 +999,14 @@ local function photoset_has_requested_photo(item, photo_id)
   for id in requested:gmatch("id='(.-)'") do
     if id == photo_id then return true end
   end
-  if item.has_requested_photos_marker or item.has_photo_marker then return true end
+  -- Membership is signalled ONLY by `<has_requested_photos />` (the documented,
+  -- live-verified rule in CLAUDE.md). `<has_photo />` is the `sort_groups=has_photo`
+  -- ordering hint, not a membership flag: `flickr.photosets.getList` with
+  -- `photo_ids` returns ALL of the account's sets (non-matching ones merely sorted
+  -- after), so treating `has_photo` as membership could falsely report a set the
+  -- photo is not in. `has_photo_marker` is still parsed (it may be useful for
+  -- sort-order reasoning) but must not, on its own, count as membership.
+  if item.has_requested_photos_marker then return true end
   return false
 end
 M.photoset_has_requested_photo = photoset_has_requested_photo
@@ -1007,7 +1014,11 @@ M.photoset_has_requested_photo = photoset_has_requested_photo
 function M.parse_page_info(body, container)
   container = container or "photosets"
   local attrs = tostring(body or ""):match("<" .. container .. "%s+([^>]*)>")
-  if not attrs then return 1, 1, nil end
+  -- pages = nil signals "could not find the <container> wrapper" so paged_call can
+  -- distinguish a malformed/unexpected body from a real single-page response.
+  -- (A real single page reports pages="1"; Flickr always emits the wrapper, even
+  -- for zero results: <photos page="1" pages="0" total="0" />.)
+  if not attrs then return 1, nil, nil end
   local page = tonumber(attrs:match('page="(.-)"') or attrs:match("page='(.-)'")) or 1
   local pages = tonumber(attrs:match('pages="(.-)"') or attrs:match("pages='(.-)'")) or 1
   local total = tonumber(attrs:match('total="(.-)"') or attrs:match("total='(.-)'"))
@@ -1045,6 +1056,15 @@ function M.paged_call(api_key, api_secret, account, method, args, container, opt
 
     bodies[#bodies + 1] = body
     local current_page, page_count, total = M.parse_page_info(body, container)
+    -- A `stat="ok"` body that lacks the <container> wrapper is malformed/unexpected
+    -- (page_count == nil). On the first page that means we have no idea how many
+    -- pages exist, so silently returning this one truncated body would let callers
+    -- (notably claim's candidate search) conclude "no match" from an incomplete
+    -- set. Fail loudly instead so the shared queue can retry. A missing wrapper on
+    -- a *later* page is tolerated (we keep the pages already fetched and stop).
+    if page_count == nil and #bodies == 1 then
+      return nil, "unparseable Flickr paged response (missing <" .. container .. "> wrapper)"
+    end
     page_infos[#page_infos + 1] = { page = current_page, pages = page_count, total = total }
     if opts.on_page then opts.on_page(body, page_infos[#page_infos], page) end
 
@@ -2346,8 +2366,13 @@ function M.new(opts)
     retryable = opts.retryable or default_retryable,
     recent_limit = math.max(0, tonumber(opts.recent_limit) or 25),
     stats = {
-      enqueued = 0, started = 0, succeeded = 0, coalesced = 0, stale = 0,
-      failed = 0, retried = 0, rate_limited = 0, waited_ms = 0, waits = 0,
+      -- `started` counts *attempts* (incremented once per try inside the retry
+      -- loop, so a job retried twice adds 3). `jobs_run` counts *jobs that
+      -- executed their fn at least once* (incremented once per job, before the
+      -- retry loop) — the number a "jobs run" UI should sum, free of retry
+      -- over-counting. Stale-cancelled jobs never run their fn and bump neither.
+      enqueued = 0, started = 0, jobs_run = 0, succeeded = 0, coalesced = 0,
+      stale = 0, failed = 0, retried = 0, rate_limited = 0, waited_ms = 0, waits = 0,
     },
   }, Queue)
 end
@@ -2449,6 +2474,9 @@ end
 
 function Queue:run_job(job)
   local attempt = 1
+  -- Count the job once here (before the retry loop) so `jobs_run` reflects jobs,
+  -- not attempts. `stats.started` below still counts every attempt.
+  self.stats.jobs_run = self.stats.jobs_run + 1
   while true do
     self:emit("started", job, { attempt = attempt })
     local now = self.now_ms()
