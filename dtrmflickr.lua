@@ -3245,6 +3245,89 @@ function M.plan_resume(records, active_nsid)
 end
 
 ----------------------------------------------------------------------
+-- Idempotency-aware resume safety.
+--
+-- `plan_resume` guarantees a *terminal* job is never re-run. But a non-terminal
+-- record is not automatically safe to re-run either: a non-idempotent Flickr
+-- call that had already *started* executing when the process was interrupted may
+-- already have reached Flickr. A lost-ack success is indistinguishable, from a
+-- persisted record, from a never-sent failure, so re-running it could create a
+-- duplicate photo / album — the exact hazard documented under "Non-idempotent
+-- jobs must opt out of retry" in queue-system.md.
+----------------------------------------------------------------------
+
+-- Methods that are NOT idempotent — re-running them can create a duplicate
+-- because they have no dedupe key. This is the same set the queue runs with
+-- `max_attempts = 1` (queue.lua / queue-system.md); keep the two in sync. Every
+-- other Flickr method here (post-upload setters, reads, album add/remove)
+-- converges on replay and is safe to re-run.
+local NON_IDEMPOTENT = {
+  ["flickr.upload"] = true,
+  ["flickr.photosets.create"] = true,
+}
+
+function M.is_idempotent(method)
+  return NON_IDEMPOTENT[tostring(method or "")] ~= true
+end
+
+-- Whether a persisted record is safe to AUTO re-run on resume without risking a
+-- duplicate:
+--   * terminal       -> false (already decided; lands in plan_resume's finished)
+--   * idempotent      -> true  (replay converges to the same state)
+--   * non-idempotent  -> true ONLY if it provably never started — state
+--                        `queued` (enqueued, `started` never fired). Any of
+--                        running/waiting/retrying means the `started` lifecycle
+--                        began, so the upload/create may already have reached
+--                        Flickr and re-running could duplicate it. This is
+--                        deliberately conservative: a non-idempotent job that
+--                        merely paced before its fn ran is also indeterminate
+--                        from a single persisted state, and "ask the user" is the
+--                        right bias when the alternative is a duplicate photo.
+function M.is_safely_resumable(rec)
+  if type(rec) ~= "table" then return false end
+  local state = rec.state
+  if not M.is_resumable(state) then return false end
+  if M.is_idempotent(rec.method) then return true end
+  return state == "queued"
+end
+
+-- Idempotency-aware resume planner. `plan_resume` guarantees a terminal job is
+-- never re-run; `plan_resume_safe` additionally guarantees a non-idempotent job
+-- that may already have executed is never *silently* re-run. Four lists:
+--   runnable  — resumable, owned, AND safe to auto re-run (`is_safely_resumable`)
+--   uncertain — resumable, owned, but non-idempotent and already started: it may
+--               or may not have completed on Flickr; surface for a user decision,
+--               never auto re-run (would risk a duplicate photo/album)
+--   orphaned  — resumable but other-account / unbound / logged out
+--   finished  — already terminal: skip, never re-run, regardless of owner
+-- Pure (no mutation). A logged-out active account (nil/"") sends every resumable
+-- record to `orphaned` (uncertain stays empty — an other-account upload is
+-- orphaned/cancelled regardless of how far it got).
+function M.plan_resume_safe(records, active_nsid)
+  active_nsid = active_nsid ~= nil and tostring(active_nsid) or ""
+  local runnable, uncertain, orphaned, finished = {}, {}, {}, {}
+  for _, rec in ipairs(records or {}) do
+    if type(rec) == "table" then
+      if M.is_terminal(rec.state) then
+        finished[#finished + 1] = rec
+      else
+        local owner = rec.nsid ~= nil and tostring(rec.nsid) or ""
+        if active_nsid ~= "" and owner == active_nsid then
+          if M.is_safely_resumable(rec) then
+            runnable[#runnable + 1] = rec
+          else
+            uncertain[#uncertain + 1] = rec
+          end
+        else
+          orphaned[#orphaned + 1] = rec
+        end
+      end
+    end
+  end
+  return runnable, uncertain, orphaned, finished
+end
+
+----------------------------------------------------------------------
 -- Serialization (durable string for a preference blob).
 --
 -- Line-based and self-describing. The first line is a version header; each
