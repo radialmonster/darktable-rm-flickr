@@ -2268,6 +2268,27 @@ local function sort_albums(items)
   end)
 end
 
+local function ordered_set_ids(set_ids)
+  local wanted = {}
+  for _, set_id in ipairs(set_ids or {}) do
+    wanted[tostring(set_id)] = true
+  end
+
+  local ordered, used = {}, {}
+  for _, item in ipairs(album_cache) do
+    local id = tostring(item and item.id or "")
+    if wanted[id] and not used[id] then
+      ordered[#ordered + 1] = id
+      used[id] = true
+    end
+  end
+  for _, set_id in ipairs(set_ids or {}) do
+    set_id = tostring(set_id)
+    if not used[set_id] then ordered[#ordered + 1] = set_id end
+  end
+  return ordered
+end
+
 local function album_label(item)
   local title = trim(item and item.title or "")
   local id = tostring(item and item.id or "")
@@ -2405,7 +2426,6 @@ local function refresh_album_list()
     dt.print_log(string.format("[dtrmflickr] album refresh failed: %s", tostring(err)))
     return nil, err
   end
-  sort_albums(sets)
   set_album_cache(sets)
   album_status_label.label = string.format(_("%d album(s) loaded"), #sets)
   dt.print(string.format(_("Flickr: loaded %d album(s)"), #sets))
@@ -2416,7 +2436,6 @@ local function refresh_album_cache_for_export(api_key, api_secret, account)
   if not account or not api_key or not api_secret then return nil, "missing account or API credentials" end
   local sets, err = rest.photosets_get_list(api_key, api_secret, account)
   if not sets then return nil, err end
-  sort_albums(sets)
   set_album_cache(sets)
   album_status_label.label = string.format(_("%d album(s) loaded"), #sets)
   return sets
@@ -2579,7 +2598,7 @@ end
 function panel_sets.update_current_choices(image, account_nsid)
   panel_sets.clear_current_choices()
   if not image or not account_nsid then return end
-  for _, set_id in ipairs(state.get_sets(image, account_nsid)) do
+  for _, set_id in ipairs(ordered_set_ids(state.get_sets(image, account_nsid))) do
     panel_sets.current_ids[#panel_sets.current_ids + 1] = set_id
     panel_sets.current_widget[#panel_sets.current_widget + 1] = panel_sets.title_for_id(set_id)
   end
@@ -2615,8 +2634,7 @@ end
 function panel_sets.format_memberships(sets)
   if not sets or #sets == 0 then return _("in albums: none") end
   local labels = {}
-  for _, set_id in ipairs(sets) do labels[#labels + 1] = panel_sets.title_for_id(set_id) end
-  table.sort(labels)
+  for _, set_id in ipairs(ordered_set_ids(sets)) do labels[#labels + 1] = panel_sets.title_for_id(set_id) end
   return _("in albums:") .. "\n" .. table.concat(labels, "\n")
 end
 
@@ -2977,7 +2995,7 @@ function panel_sets.add()
     local item, kind = panel_sets.resolve(part)
     if item and item.id and item.id ~= "" then
       local ok, err = rest.photosets_add_photo(api_key, api_secret, acc, item.id, photo_id)
-      if ok then
+      if ok or tostring(err or ""):find("%(3%): Photo already in set", 1, false) then
         state.add_set(image, acc.nsid, item.id)
         added = added + 1
       else
@@ -3026,8 +3044,7 @@ function panel_sets.create()
   local photoset_id, err = rest.photosets_create(api_key, api_secret, acc, title, photo_id)
   if photoset_id then
     state.add_set(image, acc.nsid, photoset_id)
-    album_cache[#album_cache + 1] = { id = photoset_id, title = title, photos = "1" }
-    sort_albums(album_cache)
+    table.insert(album_cache, 1, { id = photoset_id, title = title, photos = "1" })
     panel_sets.new_entry.text = ""
     panel_sets_label.label = panel_sets.format_memberships(state.get_sets(image, acc.nsid))
     panel_sets.update_current_choices(image, acc.nsid)
@@ -3050,10 +3067,11 @@ function panel_sets.remove_selected()
   end
 
   local ok, err = rest.photosets_remove_photo(api_key, api_secret, acc, set_id, photo_id)
-  if ok then state.remove_set(image, acc.nsid, set_id) end
+  local already_absent = tostring(err or ""):find("%(3%): Photo not in set", 1, false) ~= nil
+  if ok or already_absent then state.remove_set(image, acc.nsid, set_id) end
   panel_sets_label.label = panel_sets.format_memberships(state.get_sets(image, acc.nsid))
   panel_sets.update_current_choices(image, acc.nsid)
-  if not ok then
+  if not ok and not already_absent then
     panel_sets.status_label.label = _("album remove failed")
     dt.print(string.format(_("Flickr: album remove failed: %s"), tostring(err)))
   else
@@ -3955,6 +3973,7 @@ script_data.__test = {
   set_album_cache = set_album_cache,
   find_album_match = find_album_match,
   sort_albums = sort_albums,
+  ordered_set_ids = ordered_set_ids,
   refresh_album_cache_for_export = refresh_album_cache_for_export,
   current_safety = current_safety,
   current_content_type = current_content_type,
