@@ -523,6 +523,7 @@ M.ACCESS_TOKEN_URL  = "https://www.flickr.com/services/oauth/access_token"
 -- helpers
 ----------------------------------------------------------------------
 local function urldecode(s)
+  s = tostring(s or "")
   s = s:gsub("+", " "):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
   return s
 end
@@ -613,7 +614,7 @@ function M.get_access_token(api_key, api_secret, req_token, req_secret, verifier
       secret   = r.oauth_token_secret,
       nsid     = r.user_nsid,
       username = r.username,
-      fullname = r.fullname and urldecode(r.fullname) or nil,
+      fullname = r.fullname,
     }
   end
   return nil, body
@@ -658,6 +659,18 @@ end
 
 local function xml_unescape(s)
   return tostring(s or "")
+    :gsub("&#x(%x+);", function(h)
+      local n = tonumber(h, 16)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
+    :gsub("&#(%d+);", function(d)
+      local n = tonumber(d, 10)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
     :gsub("&quot;", '"')
     :gsub("&apos;", "'")
     :gsub("&lt;", "<")
@@ -766,6 +779,18 @@ M.form_encode = form_encode
 
 local function xml_unescape(s)
   return tostring(s or "")
+    :gsub("&#x(%x+);", function(h)
+      local n = tonumber(h, 16)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
+    :gsub("&#(%d+);", function(d)
+      local n = tonumber(d, 10)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
     :gsub("&quot;", '"')
     :gsub("&apos;", "'")
     :gsub("&lt;", "<")
@@ -1301,6 +1326,18 @@ end
 
 local function xml_unescape(s)
   return tostring(s or "")
+    :gsub("&#x(%x+);", function(h)
+      local n = tonumber(h, 16)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
+    :gsub("&#(%d+);", function(d)
+      local n = tonumber(d, 10)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
     :gsub("&quot;", '"')
     :gsub("&apos;", "'")
     :gsub("&lt;", "<")
@@ -1541,10 +1578,7 @@ local function detect_transport()
     local _ok, detail = http.native_status()
     dt.print_log("[dtrmflickr] native HTTP unavailable: " .. tostring(detail))
   end
-  if pcall(require, "ssl.https") then
-    return "luasec", _("LuaSec (in-process HTTPS) detected")
-  end
-  return "curl", _("will shell out to curl for HTTPS (LuaSec not found)")
+  return "curl", _("will use curl or the Windows HTTP helper for HTTPS")
 end
 local TRANSPORT, TRANSPORT_MSG = detect_transport()
 
@@ -2752,6 +2786,18 @@ end
 
 local function xml_unescape(s)
   return tostring(s or "")
+    :gsub("&#x(%x+);", function(h)
+      local n = tonumber(h, 16)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
+    :gsub("&#(%d+);", function(d)
+      local n = tonumber(d, 10)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
     :gsub("&quot;", '"')
     :gsub("&apos;", "'")
     :gsub("&lt;", "<")
