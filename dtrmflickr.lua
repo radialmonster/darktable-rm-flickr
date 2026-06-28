@@ -2846,6 +2846,359 @@ end
 return M
 end
 
+package.preload["dtrmflickr.queue_jobs"] = function(...)
+-- queue_jobs.lua — explicit job lifecycle state + account-bound persistent records.
+--
+-- This is the offline-testable foundation for the resumable/queued-uploads work
+-- (issue #36). It has two independent, pure concerns and touches no darktable or
+-- network API, so it is unit-tested directly (see tests/test_queue_jobs.lua):
+--
+--   A. A lifecycle *state tracker* that consumes the queue's existing `on_event`
+--      stream (queue.lua already emits enqueued/started/waiting/retry/succeeded/
+--      failed/stale/coalesced) and collapses it into one explicit per-job state —
+--      queued | running | waiting | retrying | succeeded | failed | stale |
+--      cancelled — so a panel can show "what is each job doing right now" instead
+--      of only the terminal `recent_results`. The queue stays the scheduler; this
+--      is a passive observer.
+--
+--   B. Account-bound *persistent records* + (de)serialization. Each resumable job
+--      record carries its owning account nsid, so when jobs persist/defer across
+--      UI events or restarts the design-notes account-binding contract holds:
+--      a record whose owning nsid is not the currently active account is
+--      cancelled/skipped, never run against the wrong token (see the
+--      "Account-binding requirement for the async/persistent queue" note in
+--      docs/design-notes.md). The serialized string is what a future restart-
+--      resume would stash in a darktable preference blob and rebuild from.
+--
+-- What is intentionally NOT here (gated on an async/coroutine queue): the live
+-- in-panel grid, the actual preference read/write at load/save, and the
+-- resume-and-rerun execution. darktable storage callbacks are synchronous and
+-- the queue drains within a single call, so intermediate states are not
+-- observable in the panel today; this module is the data model those features
+-- will consume once the queue can defer work.
+
+local M = {}
+
+----------------------------------------------------------------------
+-- Shared state vocabulary.
+----------------------------------------------------------------------
+
+-- A job is in exactly one of these states. The first four are live/non-terminal
+-- (the job may still change); the last four are terminal (the job is done and
+-- will not move again on its own).
+M.STATES = {
+  queued = true, running = true, waiting = true, retrying = true,
+  succeeded = true, failed = true, stale = true, cancelled = true,
+}
+
+local TERMINAL = {
+  succeeded = true, failed = true, stale = true, cancelled = true,
+}
+
+function M.is_terminal(state)
+  return TERMINAL[tostring(state or "")] == true
+end
+
+function M.is_resumable(state)
+  -- A persisted job worth resuming is one that has not reached a terminal
+  -- outcome. `succeeded` work is done; `failed`/`stale`/`cancelled` are decided
+  -- and must not be silently retried by a resume (a failed upload may already
+  -- have created a photo — see the non-idempotent-retry note in queue-system.md).
+  return M.STATES[tostring(state or "")] == true and not TERMINAL[state]
+end
+
+----------------------------------------------------------------------
+-- A. Lifecycle state tracker (consumes queue `on_event` payloads).
+----------------------------------------------------------------------
+
+local Tracker = {}
+Tracker.__index = Tracker
+
+-- opts.limit bounds how many distinct jobs are remembered (oldest dropped),
+-- mirroring the queue's bounded `recent`. Default 200.
+function M.new_tracker(opts)
+  opts = opts or {}
+  return setmetatable({
+    jobs = {},       -- id -> record
+    order = {},      -- insertion order of ids (for a stable snapshot)
+    limit = math.max(1, tonumber(opts.limit) or 200),
+  }, Tracker)
+end
+
+local function tracker_record(self, id)
+  local rec = self.jobs[id]
+  if rec then return rec end
+  rec = { id = id, state = "queued" }
+  self.jobs[id] = rec
+  self.order[#self.order + 1] = id
+  -- Drop the oldest *terminal* job once over the cap so a long session cannot
+  -- grow unbounded, but never evict a live job (it would lose a job still in
+  -- flight). If every remembered job is still live we simply exceed the cap
+  -- rather than corrupt the in-flight view.
+  while #self.order > self.limit do
+    local evicted
+    for i = 1, #self.order do
+      local oid = self.order[i]
+      local r = self.jobs[oid]
+      if not r or M.is_terminal(r.state) then
+        table.remove(self.order, i)
+        self.jobs[oid] = nil
+        evicted = true
+        break
+      end
+    end
+    if not evicted then break end
+  end
+  return rec
+end
+
+-- Bind a job to its owning account nsid. The queue's event payload does not
+-- carry the nsid (the queue is account-agnostic), so the producer that enqueues
+-- the work calls this — directly, or by putting `nsid` on the `on_event`
+-- payload it forwards (observe reads `payload.nsid` too). Required for the
+-- account-binding contract to mean anything on a persisted record.
+function Tracker:bind_account(id, nsid)
+  if id == nil then return end
+  local rec = tracker_record(self, id)
+  if nsid ~= nil and nsid ~= "" then rec.nsid = tostring(nsid) end
+end
+
+-- Map one queue lifecycle event onto a job's explicit state. Unknown events are
+-- ignored (forward-compatible). Terminal states are sticky: a late stray event
+-- for an already-finished job never resurrects it.
+function Tracker:observe(payload)
+  if type(payload) ~= "table" then return end
+  local event = payload.event
+  if event == nil then return end
+
+  -- `coalesced` is about the *replaced* job, not payload.id (which is the
+  -- surviving newer job). Mark the replaced job cancelled and let the survivor
+  -- be tracked normally below.
+  if event == "coalesced" and payload.replaced_id ~= nil then
+    local replaced = tracker_record(self, payload.replaced_id)
+    if not M.is_terminal(replaced.state) then
+      replaced.state = "cancelled"
+      replaced.reason = "coalesced"
+    end
+  end
+
+  local id = payload.id
+  if id == nil then return end
+  local rec = tracker_record(self, id)
+  if payload.method ~= nil then rec.method = payload.method end
+  if payload.label ~= nil then rec.label = payload.label end
+  if payload.nsid ~= nil and payload.nsid ~= "" then rec.nsid = tostring(payload.nsid) end
+  if payload.attempt ~= nil then rec.attempts = tonumber(payload.attempt) or rec.attempts end
+
+  -- Once terminal, only the surviving job's own terminal events matter; ignore
+  -- the rest so a stale `started`/`waiting` cannot un-finish a job.
+  if M.is_terminal(rec.state) then return end
+
+  if event == "enqueued" then
+    rec.state = "queued"
+  elseif event == "started" then
+    rec.state = "running"
+  elseif event == "retry" then
+    rec.state = "retrying"
+    if payload.error ~= nil then rec.error = tostring(payload.error) end
+  elseif event == "waiting" then
+    -- A `pace` wait is ordinary throttling of a fresh job; any other wait
+    -- reason (retry/transient/rate-limit) is backing off before a retry. The
+    -- `retry` event (the decision) fires first for the latter, so this just
+    -- keeps the state consistent through the sleep.
+    if payload.why == "pace" then
+      rec.state = "waiting"
+    else
+      rec.state = "retrying"
+    end
+  elseif event == "succeeded" then
+    rec.state = "succeeded"
+    rec.error = nil
+  elseif event == "failed" then
+    rec.state = "failed"
+    if payload.error ~= nil then rec.error = tostring(payload.error) end
+  elseif event == "stale" then
+    rec.state = "stale"
+    if payload.error ~= nil then rec.error = tostring(payload.error) end
+  end
+end
+
+local function copy_record(rec)
+  local out = {}
+  for k, v in pairs(rec) do out[k] = v end
+  return out
+end
+
+-- Ordered list of shallow copies (insertion order), so callers can sort/render
+-- without mutating the tracker.
+function Tracker:snapshot()
+  local out = {}
+  for _, id in ipairs(self.order) do
+    local rec = self.jobs[id]
+    if rec then out[#out + 1] = copy_record(rec) end
+  end
+  return out
+end
+
+-- Only the live (non-terminal) jobs — the "what is happening now" view a panel
+-- would poll, and the set a restart would persist as resumable.
+function Tracker:active()
+  local out = {}
+  for _, id in ipairs(self.order) do
+    local rec = self.jobs[id]
+    if rec and not M.is_terminal(rec.state) then out[#out + 1] = copy_record(rec) end
+  end
+  return out
+end
+
+function Tracker:get(id)
+  local rec = self.jobs[id]
+  return rec and copy_record(rec) or nil
+end
+
+-- Account switch / logout: every non-terminal job whose owning account is not
+-- the now-active account is cancelled, implementing design requirement (2) —
+-- a deferred job must never run against the wrong token. `active_nsid == nil`
+-- or "" (logged out) cancels *all* non-terminal jobs. Returns the count
+-- cancelled. A job with no bound nsid is treated as orphaned and cancelled when
+-- there is an active account it cannot be confirmed to belong to.
+function Tracker:cancel_for_account_change(active_nsid)
+  active_nsid = active_nsid ~= nil and tostring(active_nsid) or ""
+  local cancelled = 0
+  for _, id in ipairs(self.order) do
+    local rec = self.jobs[id]
+    if rec and not M.is_terminal(rec.state) then
+      local owner = rec.nsid or ""
+      if active_nsid == "" or owner ~= active_nsid then
+        rec.state = "cancelled"
+        rec.reason = "account-changed"
+        cancelled = cancelled + 1
+      end
+    end
+  end
+  return cancelled
+end
+
+function Tracker:reset()
+  self.jobs = {}
+  self.order = {}
+end
+
+----------------------------------------------------------------------
+-- B. Account-bound persistent records.
+----------------------------------------------------------------------
+
+-- Split records into the ones that may run under the active account and the
+-- orphans that may not. Pure (no mutation): a record is runnable iff there IS an
+-- active account and the record's owning nsid matches it. A logged-out state
+-- (active_nsid nil/"") orphans everything. This is the read-only classification;
+-- `cancel_orphans` is the mutating sibling that stamps the orphans cancelled.
+function M.partition_by_account(records, active_nsid)
+  active_nsid = active_nsid ~= nil and tostring(active_nsid) or ""
+  local runnable, orphaned = {}, {}
+  for _, rec in ipairs(records or {}) do
+    local owner = rec and rec.nsid ~= nil and tostring(rec.nsid) or ""
+    if active_nsid ~= "" and owner == active_nsid then
+      runnable[#runnable + 1] = rec
+    else
+      orphaned[#orphaned + 1] = rec
+    end
+  end
+  return runnable, orphaned
+end
+
+-- Mutating partition: orphaned records get state "cancelled" / reason
+-- "account-changed" (so a persisted batch reloaded under a different account is
+-- visibly skipped, not silently run). Returns runnable, orphaned.
+function M.cancel_orphans(records, active_nsid)
+  local runnable, orphaned = M.partition_by_account(records, active_nsid)
+  for _, rec in ipairs(orphaned) do
+    if rec and not M.is_terminal(rec.state) then
+      rec.state = "cancelled"
+      rec.reason = "account-changed"
+    end
+  end
+  return runnable, orphaned
+end
+
+----------------------------------------------------------------------
+-- Serialization (durable string for a preference blob).
+--
+-- Line-based and self-describing. The first line is a version header; each
+-- following line is one record's fields joined by US (0x1F). Values are
+-- percent-escaped for the few bytes that would break the framing (%, the field
+-- and record separators), so arbitrary error text / filenames round-trip
+-- losslessly. Deserialize is tolerant: a missing/bad header or a malformed line
+-- yields no record rather than an error, so a corrupt blob degrades to "nothing
+-- to resume" instead of breaking load.
+----------------------------------------------------------------------
+
+local HEADER = "dtrmflickr-jobs 1"
+local FS = "\31"          -- field separator (unit separator)
+-- Fixed field order. Append-only for forward compatibility; never reorder.
+local FIELDS = { "nsid", "method", "state", "attempts", "image", "label", "error", "reason" }
+
+local function esc(v)
+  return (tostring(v == nil and "" or v)
+    :gsub("%%", "%%25")
+    :gsub("\n", "%%0A")
+    :gsub("\r", "%%0D")
+    :gsub("\31", "%%1F"))
+end
+
+local function unesc(v)
+  return (tostring(v or ""):gsub("%%(%x%x)", function(h)
+    return string.char(tonumber(h, 16))
+  end))
+end
+
+function M.serialize(records)
+  local lines = { HEADER }
+  for _, rec in ipairs(records or {}) do
+    if type(rec) == "table" then
+      local cells = {}
+      for i, field in ipairs(FIELDS) do
+        cells[i] = esc(rec[field])
+      end
+      lines[#lines + 1] = table.concat(cells, FS)
+    end
+  end
+  return table.concat(lines, "\n")
+end
+
+function M.deserialize(blob)
+  local out = {}
+  if type(blob) ~= "string" or blob == "" then return out end
+  local lines = {}
+  for line in (blob .. "\n"):gmatch("(.-)\n") do lines[#lines + 1] = line end
+  if lines[1] ~= HEADER then return out end
+  for i = 2, #lines do
+    local line = lines[i]
+    if line ~= "" then
+      local cells = {}
+      for cell in (line .. FS):gmatch("(.-)" .. FS) do cells[#cells + 1] = cell end
+      local rec = {}
+      for j, field in ipairs(FIELDS) do rec[field] = unesc(cells[j] or "") end
+      -- Normalize: empty strings back to nil (except the two required keys), and
+      -- attempts back to a number. A record with no method is junk — skip it.
+      if rec.method == "" then
+        rec = nil
+      else
+        rec.attempts = tonumber(rec.attempts)
+        for _, field in ipairs(FIELDS) do
+          if field ~= "attempts" and rec[field] == "" then rec[field] = nil end
+        end
+        if rec.state == nil or M.STATES[rec.state] == nil then rec.state = "queued" end
+      end
+      if rec then out[#out + 1] = rec end
+    end
+  end
+  return out
+end
+
+return M
+end
+
 package.preload["dtrmflickr.settings"] = function(...)
 -- settings.lua — stable Flickr option tables and preference lookup helpers.
 
@@ -3530,7 +3883,15 @@ local clear_album_cache
 local effective_metadata_fingerprints
 local store_metadata_fingerprints
 local panel_sets
+-- Passive lifecycle observer: collapses the queue's event stream into one
+-- explicit per-job state (queued/running/waiting/retrying/done/failed) for a
+-- future live panel and for account-bound resume (issue #36). A global (not a
+-- main-chunk local) so it costs nothing against the local-variable limit. The
+-- queue stays the scheduler; this only watches.
+__dtrmflickr_jobs = require("dtrmflickr.queue_jobs").new_tracker()
+
 __dtrmflickr_queue = require("dtrmflickr.queue").new {
+  on_event = function(payload) __dtrmflickr_jobs:observe(payload) end,
   sleep_ms = function(ms)
     -- dt.control.sleep takes an int delay in MILLISECONDS (see
     -- docs/lua-api-manual/darktable/darktable.control.md). The queue already
@@ -3648,6 +4009,10 @@ local function save_token(acc)
     password = packed,
   })
   session_account = acc
+  -- Account-binding contract (issue #36 / design-notes): switching accounts
+  -- invalidates any non-terminal jobs owned by the previous account so a
+  -- deferred/persisted job can never run against the new account's token.
+  if __dtrmflickr_jobs then __dtrmflickr_jobs:cancel_for_account_change(acc.nsid) end
   dt.preferences.write(PLUGIN, "active_nsid", "string", acc.nsid)
   dt.preferences.write(PLUGIN, "active_username", "string", acc.username or acc.nsid)
   if not ok then return nil, _("darktable password storage refused the OAuth token; login is session-only") end
@@ -3677,6 +4042,8 @@ local function clear_token()
   end  -- no delete API; blank it
   session_account = nil
   clear_album_cache()
+  -- Logout invalidates every non-terminal job (no active token to run them).
+  if __dtrmflickr_jobs then __dtrmflickr_jobs:cancel_for_account_change(nil) end
   dt.preferences.write(PLUGIN, "active_nsid", "string", "")
   dt.preferences.write(PLUGIN, "active_username", "string", "")
 end
@@ -6394,6 +6761,8 @@ script_data.__test = {
   parse_photo_id_or_url = parse_photo_id_or_url,
   panel_content_type_index_from_search_value = panel_content_type_index_from_search_value,
   flickr_queue = __dtrmflickr_queue,
+  flickr_jobs = __dtrmflickr_jobs,
+  queue_jobs = require("dtrmflickr.queue_jobs"),
   flickr_call = __dtrmflickr_call,
   format_queue_status = format_queue_status,
   privacy_values = settings.privacy_values,
