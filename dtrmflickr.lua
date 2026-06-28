@@ -1343,7 +1343,8 @@ function M.image_tag_names(image)
 end
 
 function M.tag_matches_filter(tag_name, filter)
-  if not filter or filter == "" then return false end
+  filter = tostring(filter or ""):match("^%s*(.-)%s*$"):lower()
+  if filter == "" then return false end
   return tostring(tag_name or ""):lower():find(filter, 1, true) ~= nil
 end
 
