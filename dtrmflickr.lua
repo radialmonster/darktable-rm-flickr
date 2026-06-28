@@ -4448,9 +4448,14 @@ function panel_sets.create()
     return
   end
 
+  -- Do NOT auto-retry album creation. flickr.photosets.create is not idempotent
+  -- and has no dedupe key, so a transient timeout *after* Flickr created the set
+  -- (ack lost) is indistinguishable from "never created" — a retry would make a
+  -- second duplicate album with the same title. One attempt: a transient create
+  -- failure is reported and the user retries. (Same policy as flickr.upload.)
   local photoset_id, err = __dtrmflickr_call("flickr.photosets.create", function()
     return rest.photosets_create(api_key, api_secret, acc, title, photo_id)
-  end)
+  end, { max_attempts = 1 })
   if photoset_id then
     state.add_set(image, acc.nsid, photoset_id)
     table.insert(album_cache, 1, { id = photoset_id, title = title, photos = "1" })
@@ -4507,11 +4512,11 @@ local function load_remote_content_type(api_key, api_secret, acc, photo_id, date
   if acc then
     body, err = __dtrmflickr_call("flickr.photos.search", function()
       return rest.call(api_key, api_secret, acc, "flickr.photos.search", args)
-    end, { coalesce_key = "panel-refresh-content" })
+    end, { coalesce_key = "panel-refresh-content:" .. tostring(photo_id) })
   else
     body, err = __dtrmflickr_call("flickr.photos.search", function()
       return rest.public_call(api_key, "flickr.photos.search", args)
-    end, { coalesce_key = "panel-refresh-content" })
+    end, { coalesce_key = "panel-refresh-content:" .. tostring(photo_id) })
   end
   local search_value = parse_search_content_type(body, photo_id)
   return panel_content_type_index_from_search_value(search_value), search_value, err
@@ -4523,11 +4528,11 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   if acc then
     body, err = __dtrmflickr_call("flickr.photos.getInfo", function()
       return rest.call(api_key, api_secret, acc, "flickr.photos.getInfo", { photo_id = photo_id })
-    end, { coalesce_key = "panel-refresh" })
+    end, { coalesce_key = "panel-refresh:" .. tostring(photo_id) })
   else
     body, err = __dtrmflickr_call("flickr.photos.getInfo", function()
       return rest.public_call(api_key, "flickr.photos.getInfo", { photo_id = photo_id })
-    end, { coalesce_key = "panel-refresh" })
+    end, { coalesce_key = "panel-refresh:" .. tostring(photo_id) })
   end
   if not body then
     panel_reset_remote(string.format(_("Flickr: remote settings unavailable: %s"), tostring(err)))
@@ -4548,7 +4553,7 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   if acc then
     local perms_body = __dtrmflickr_call("flickr.photos.getPerms", function()
       return rest.photos_get_perms(api_key, api_secret, acc, photo_id)
-    end, { coalesce_key = "panel-refresh-perms" })
+    end, { coalesce_key = "panel-refresh-perms:" .. tostring(photo_id) })
     if perms_body then
       panel_comment_perm_widget.selected = panel_permission_index_from_id(remote_attr(perms_body, "permcomment")) or 0
       panel_addmeta_perm_widget.selected = panel_permission_index_from_id(remote_attr(perms_body, "permaddmeta")) or 0
@@ -4792,6 +4797,9 @@ local function sync_panel_tags()
       FLICKR_TAG_LIMIT, truncated_tags))
   end
 
+  -- setTags is a full *replace* of the tag set, which is idempotent for a fixed
+  -- input: replaying it on a lost-ack retry converges to the same tags. So,
+  -- unlike upload/photosets.create, it keeps the default retry/backoff.
   local ok, err = __dtrmflickr_call("flickr.photos.setTags", function()
     return rest.photos_set_tags(api_key, api_secret, acc, photo_id, tags)
   end)
@@ -5581,10 +5589,13 @@ local function finalize(storage, image_table, extra_data)
 
   if uploaded > 0 and album.mode == "create" then
     local first = extra_data.uploaded[1]
+    -- max_attempts = 1: photosets.create is non-idempotent (see panel_sets.create);
+    -- a lost-ack retry would create a duplicate album. addPhoto below stays
+    -- retryable because replaying it converges (Flickr returns "already in set").
     local created_id, err = __dtrmflickr_call("flickr.photosets.create", function()
       return rest.photosets_create(extra_data.api_key, extra_data.api_secret, extra_data.account,
         album.title, first.photo_id)
-    end)
+    end, { max_attempts = 1 })
     photoset_id = created_id
     if photoset_id then
       state.add_set(first.image, extra_data.account.nsid, photoset_id)
