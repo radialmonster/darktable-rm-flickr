@@ -2023,6 +2023,109 @@ end
 return M
 end
 
+package.preload["dtrmflickr.settings"] = function(...)
+-- settings.lua — stable Flickr option tables and preference lookup helpers.
+
+local M = {}
+
+M.privacy_values = {
+  { key = "private",            pref = "private",          is_public = 0, is_friend = 0, is_family = 0 },
+  { key = "friends",            pref = "friends",          is_public = 0, is_friend = 1, is_family = 0 },
+  { key = "family",             pref = "family",           is_public = 0, is_friend = 0, is_family = 1 },
+  { key = "friends_and_family", pref = "friends & family", is_public = 0, is_friend = 1, is_family = 1 },
+  { key = "public",             pref = "public",           is_public = 1, is_friend = 0, is_family = 0 },
+}
+
+M.safety_values = {
+  { key = "safe",       pref = "safe",       flickr_value = 1 },
+  { key = "moderate",   pref = "moderate",   flickr_value = 2 },
+  { key = "restricted", pref = "restricted", flickr_value = 3 },
+}
+
+M.content_type_values = {
+  { key = "photo",               pref = "photo",               flickr_value = 1 },
+  { key = "screenshot",          pref = "screenshot",          flickr_value = 2 },
+  { key = "illustration_art",    pref = "illustration/art",    flickr_value = 3 },
+  { key = "virtual_photography", pref = "virtual photography", flickr_value = 4 },
+}
+
+M.permission_values = {
+  { key = "only_you",          pref = "only you",          flickr_value = 0 },
+  { key = "friends_family",    pref = "friends & family",  flickr_value = 1 },
+  { key = "people_you_follow", pref = "people you follow", flickr_value = 2 },
+  { key = "any_member",        pref = "any Flickr member", flickr_value = 3 },
+}
+
+-- Flickr API license IDs. These are external stable IDs, not UI positions.
+M.license_values = {
+  { key = "all_rights_reserved", pref = "all rights reserved", flickr_value = 0 },
+  { key = "public_domain_work",  pref = "public domain work",  flickr_value = 10 },
+  { key = "cc0",                 pref = "CC0",                 flickr_value = 9 },
+  { key = "cc_by_4_0",           pref = "CC BY 4.0",           flickr_value = 11 },
+  { key = "cc_by_sa_4_0",        pref = "CC BY-SA 4.0",        flickr_value = 12 },
+  { key = "cc_by_nd_4_0",        pref = "CC BY-ND 4.0",        flickr_value = 13 },
+  { key = "cc_by_nc_4_0",        pref = "CC BY-NC 4.0",        flickr_value = 14 },
+  { key = "cc_by_nc_sa_4_0",     pref = "CC BY-NC-SA 4.0",     flickr_value = 15 },
+  { key = "cc_by_nc_nd_4_0",     pref = "CC BY-NC-ND 4.0",     flickr_value = 16 },
+}
+
+M.default_setting_specs = {
+  { name = "default_privacy", label = "privacy", values = M.privacy_values, default = "private" },
+  { name = "default_safety", label = "safety", values = M.safety_values, default = "safe" },
+  { name = "default_content_type", label = "content type", values = M.content_type_values, default = "photo" },
+  { name = "default_license", label = "license", values = M.license_values, default = "CC BY-NC-SA 4.0" },
+  { name = "default_comment_perm", label = "allow commenting", values = M.permission_values, default = "any Flickr member" },
+  { name = "default_addmeta_perm", label = "allow tags, notes, people", values = M.permission_values, default = "any Flickr member" },
+}
+
+M.default_setting_specs_by_name = {}
+for _, spec in ipairs(M.default_setting_specs) do
+  M.default_setting_specs_by_name[spec.name] = spec
+end
+
+M.sync_field_defaults = {
+  title = true,
+  description = true,
+  tags = true,
+  date_taken = true,
+  gps = false,
+  privacy = true,
+  safety = true,
+  content_type = true,
+  license = true,
+  permissions = true,
+}
+
+function M.index_from_pref(values, value, fallback)
+  for i, item in ipairs(values or {}) do
+    if item.pref == value then return i end
+  end
+  return fallback or 1
+end
+
+function M.privacy_index_from_pref(value)
+  return M.index_from_pref(M.privacy_values, value, 1)
+end
+
+function M.safety_index_from_pref(value)
+  return M.index_from_pref(M.safety_values, value, 1)
+end
+
+function M.content_type_index_from_pref(value)
+  return M.index_from_pref(M.content_type_values, value, 1)
+end
+
+function M.license_index_from_pref(value)
+  return M.index_from_pref(M.license_values, value, 8)
+end
+
+function M.permission_index_from_pref(value)
+  return M.index_from_pref(M.permission_values, value, 4)
+end
+
+return M
+end
+
 package.preload["dtrmflickr.dtrmflickr"] = function(...)
 --[[ dtrmflickr — Flickr export/storage for darktable
 
@@ -2063,6 +2166,7 @@ local rest = require "dtrmflickr.flickr_rest"
 local state = require "dtrmflickr.state"
 local metadata = require "dtrmflickr.metadata"
 local claim = require "dtrmflickr.claim"
+local settings = require "dtrmflickr.settings"
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -2256,83 +2360,6 @@ local function get_credentials()
   return key, secret
 end
 
-local privacy_values = {
-  { key = "private",            pref = "private",          is_public = 0, is_friend = 0, is_family = 0 },
-  { key = "friends",            pref = "friends",          is_public = 0, is_friend = 1, is_family = 0 },
-  { key = "family",             pref = "family",           is_public = 0, is_friend = 0, is_family = 1 },
-  { key = "friends_and_family", pref = "friends & family", is_public = 0, is_friend = 1, is_family = 1 },
-  { key = "public",             pref = "public",           is_public = 1, is_friend = 0, is_family = 0 },
-}
-
-local safety_values = {
-  { key = "safe",       pref = "safe",       flickr_value = 1 },
-  { key = "moderate",   pref = "moderate",   flickr_value = 2 },
-  { key = "restricted", pref = "restricted", flickr_value = 3 },
-}
-
-local content_type_values = {
-  { key = "photo",               pref = "photo",               flickr_value = 1 },
-  { key = "screenshot",          pref = "screenshot",          flickr_value = 2 },
-  { key = "illustration_art",    pref = "illustration/art",    flickr_value = 3 },
-  { key = "virtual_photography", pref = "virtual photography", flickr_value = 4 },
-}
-
-local permission_values = {
-  { key = "only_you",          pref = "only you",          flickr_value = 0 },
-  { key = "friends_family",    pref = "friends & family",  flickr_value = 1 },
-  { key = "people_you_follow", pref = "people you follow", flickr_value = 2 },
-  { key = "any_member",        pref = "any Flickr member", flickr_value = 3 },
-}
-
--- Flickr API license IDs. These are external stable IDs, not UI positions.
--- Do not renumber them when reordering labels; tests assert these exact values.
-local license_values = {
-  { key = "all_rights_reserved", pref = "all rights reserved", flickr_value = 0 },
-  { key = "public_domain_work",  pref = "public domain work",  flickr_value = 10 },
-  { key = "cc0",                 pref = "CC0",                 flickr_value = 9 },
-  { key = "cc_by_4_0",           pref = "CC BY 4.0",           flickr_value = 11 },
-  { key = "cc_by_sa_4_0",        pref = "CC BY-SA 4.0",        flickr_value = 12 },
-  { key = "cc_by_nd_4_0",        pref = "CC BY-ND 4.0",        flickr_value = 13 },
-  { key = "cc_by_nc_4_0",        pref = "CC BY-NC 4.0",        flickr_value = 14 },
-  { key = "cc_by_nc_sa_4_0",     pref = "CC BY-NC-SA 4.0",     flickr_value = 15 },
-  { key = "cc_by_nc_nd_4_0",     pref = "CC BY-NC-ND 4.0",     flickr_value = 16 },
-}
-
-local function privacy_index_from_pref(value)
-  for i, v in ipairs(privacy_values) do
-    if v.pref == value then return i end
-  end
-  return 1
-end
-
-local function safety_index_from_pref(value)
-  for i, v in ipairs(safety_values) do
-    if v.pref == value then return i end
-  end
-  return 1
-end
-
-local function content_type_index_from_pref(value)
-  for i, v in ipairs(content_type_values) do
-    if v.pref == value then return i end
-  end
-  return 1
-end
-
-local function license_index_from_pref(value)
-  for i, v in ipairs(license_values) do
-    if v.pref == value then return i end
-  end
-  return 8
-end
-
-local function permission_index_from_pref(value)
-  for i, v in ipairs(permission_values) do
-    if v.pref == value then return i end
-  end
-  return 4
-end
-
 local DEFAULT_SETTING_PREF_TYPE <const> = "string"
 
 local function read_stored_default_pref(name, default_value)
@@ -2347,56 +2374,21 @@ local function read_stored_default_pref(name, default_value)
   return value
 end
 
-local default_setting_specs = {
-  { name = "default_privacy", label = _("privacy"), values = privacy_values, default = "private" },
-  { name = "default_safety", label = _("safety"), values = safety_values, default = "safe" },
-  { name = "default_content_type", label = _("content type"), values = content_type_values, default = "photo" },
-  { name = "default_license", label = _("license"), values = license_values, default = "CC BY-NC-SA 4.0" },
-  { name = "default_comment_perm", label = _("allow commenting"), values = permission_values, default = "any Flickr member" },
-  { name = "default_addmeta_perm", label = _("allow tags, notes, people"), values = permission_values, default = "any Flickr member" },
-}
-
-local default_setting_specs_by_name = {}
-for _, spec in ipairs(default_setting_specs) do
-  default_setting_specs_by_name[spec.name] = spec
-end
-
-local function default_index_from_pref(spec, value)
-  for i, item in ipairs(spec.values) do
-    if item.pref == value then
-      return i
-    end
-  end
-  return 1
-end
-
 local function read_default_pref(name, default_value)
-  local spec = default_setting_specs_by_name[name]
+  local spec = settings.default_setting_specs_by_name[name]
   if not spec then return read_stored_default_pref(name, default_value) end
 
-  local index = default_index_from_pref(spec, read_stored_default_pref(name, default_value))
+  local index = settings.index_from_pref(spec.values, read_stored_default_pref(name, default_value), 1)
   local selected = spec.values[index]
   dt.preferences.write(PLUGIN, name, DEFAULT_SETTING_PREF_TYPE, selected.pref)
   return selected.pref
 end
 
-local sync_field_defaults = {
-  title = true,
-  description = true,
-  tags = true,
-  date_taken = true,
-  gps = false,
-  privacy = true,
-  safety = true,
-  content_type = true,
-  license = true,
-  permissions = true,
-}
 local sync_widgets = {}
 
 local function read_sync_pref(name)
   local value = dt.preferences.read(PLUGIN, "sync_" .. name, "bool")
-  if value == nil then return sync_field_defaults[name] == true end
+  if value == nil then return settings.sync_field_defaults[name] == true end
   return value == true
 end
 
@@ -2406,7 +2398,7 @@ end
 
 local function current_sync_fields()
   local fields = {}
-  for name in pairs(sync_field_defaults) do
+  for name in pairs(settings.sync_field_defaults) do
     local widget = sync_widgets[name]
     fields[name] = widget and widget.value == true or read_sync_pref(name)
     write_sync_pref(name, fields[name])
@@ -2416,7 +2408,7 @@ end
 
 local function master_sync_fields()
   local fields = {}
-  for name in pairs(sync_field_defaults) do
+  for name in pairs(settings.sync_field_defaults) do
     fields[name] = read_sync_pref(name)
   end
   return fields
@@ -2557,10 +2549,10 @@ dt.preferences.register(PLUGIN, "account_login", "lua",
   "info",
   account_widget,
   keep_label_pref)
-register_keyword_rule_preferences_reverse("keyword_license", _("license"), license_values)
-register_keyword_rule_preferences_reverse("keyword_content_type", _("content type"), content_type_values)
-register_keyword_rule_preferences_reverse("keyword_safety", _("safety"), safety_values)
-register_keyword_rule_preferences_reverse("keyword_privacy", _("privacy"), privacy_values)
+register_keyword_rule_preferences_reverse("keyword_license", _("license"), settings.license_values)
+register_keyword_rule_preferences_reverse("keyword_content_type", _("content type"), settings.content_type_values)
+register_keyword_rule_preferences_reverse("keyword_safety", _("safety"), settings.safety_values)
+register_keyword_rule_preferences_reverse("keyword_privacy", _("privacy"), settings.privacy_values)
 dt.preferences.register(PLUGIN, "skip_upload_keyword_filters", "string",
   _("Flickr: skip-upload keywords"), _("enter one keyword or comma-separated keywords; matching images are not uploaded to Flickr"), EMPTY_FILTER_PREF)
 dt.preferences.register(PLUGIN, "exclude_keyword_filters", "string",
@@ -2668,60 +2660,60 @@ local sync_gps_widget = sync_check_button("gps", _("GPS location"), _("send dark
 
 local function apply_default_privacy()
   local pref = read_default_pref("default_privacy", "private")
-  local index = privacy_index_from_pref(pref)
+  local index = settings.privacy_index_from_pref(pref)
   privacy_widget.selected = index
   dt.print_log(string.format("[dtrmflickr] default_privacy=%s -> privacy selected=%d (%s)",
-    tostring(pref), index, privacy_values[index].pref))
+    tostring(pref), index, settings.privacy_values[index].pref))
 end
 apply_default_privacy()
 
 local function apply_default_safety()
   local pref = read_default_pref("default_safety", "safe")
-  local index = safety_index_from_pref(pref)
+  local index = settings.safety_index_from_pref(pref)
   safety_widget.selected = index
   dt.print_log(string.format("[dtrmflickr] default_safety=%s -> safety selected=%d (%s)",
-    tostring(pref), index, safety_values[index].pref))
+    tostring(pref), index, settings.safety_values[index].pref))
 end
 apply_default_safety()
 
 local function apply_default_content_type()
   local pref = read_default_pref("default_content_type", "photo")
-  local index = content_type_index_from_pref(pref)
+  local index = settings.content_type_index_from_pref(pref)
   content_type_widget.selected = index
   dt.print_log(string.format("[dtrmflickr] default_content_type=%s -> content_type selected=%d (%s)",
-    tostring(pref), index, content_type_values[index].pref))
+    tostring(pref), index, settings.content_type_values[index].pref))
 end
 apply_default_content_type()
 
 local function apply_default_license()
   local pref = read_default_pref("default_license", "CC BY-NC-SA 4.0")
-  local index = license_index_from_pref(pref)
+  local index = settings.license_index_from_pref(pref)
   license_widget.selected = index
   dt.print_log(string.format("[dtrmflickr] default_license=%s -> license selected=%d (%s)",
-    tostring(pref), index, license_values[index].pref))
+    tostring(pref), index, settings.license_values[index].pref))
 end
 apply_default_license()
 
 local function apply_default_comment_perm()
   local pref = read_default_pref("default_comment_perm", "any Flickr member")
-  local index = permission_index_from_pref(pref)
+  local index = settings.permission_index_from_pref(pref)
   comment_perm_widget.selected = index
   dt.print_log(string.format("[dtrmflickr] default_comment_perm=%s -> commenting selected=%d (%s)",
-    tostring(pref), index, permission_values[index].pref))
+    tostring(pref), index, settings.permission_values[index].pref))
 end
 apply_default_comment_perm()
 
 local function apply_default_addmeta_perm()
   local pref = read_default_pref("default_addmeta_perm", "any Flickr member")
-  local index = permission_index_from_pref(pref)
+  local index = settings.permission_index_from_pref(pref)
   addmeta_perm_widget.selected = index
   dt.print_log(string.format("[dtrmflickr] default_addmeta_perm=%s -> addmeta selected=%d (%s)",
-    tostring(pref), index, permission_values[index].pref))
+    tostring(pref), index, settings.permission_values[index].pref))
 end
 apply_default_addmeta_perm()
 
 privacy_widget.changed_callback = function(widget)
-  local selected = privacy_values[widget.selected] or privacy_values[privacy_index_from_pref(widget.value)]
+  local selected = settings.privacy_values[widget.selected] or settings.privacy_values[settings.privacy_index_from_pref(widget.value)]
   if selected then
     dt.preferences.write(PLUGIN, "default_privacy", DEFAULT_SETTING_PREF_TYPE, selected.pref)
     dt.print_log(string.format("[dtrmflickr] privacy changed -> default_privacy=%s", selected.pref))
@@ -2729,7 +2721,7 @@ privacy_widget.changed_callback = function(widget)
 end
 
 safety_widget.changed_callback = function(widget)
-  local selected = safety_values[widget.selected] or safety_values[safety_index_from_pref(widget.value)]
+  local selected = settings.safety_values[widget.selected] or settings.safety_values[settings.safety_index_from_pref(widget.value)]
   if selected then
     dt.preferences.write(PLUGIN, "default_safety", DEFAULT_SETTING_PREF_TYPE, selected.pref)
     dt.print_log(string.format("[dtrmflickr] safety changed -> default_safety=%s", selected.pref))
@@ -2737,7 +2729,7 @@ safety_widget.changed_callback = function(widget)
 end
 
 content_type_widget.changed_callback = function(widget)
-  local selected = content_type_values[widget.selected] or content_type_values[content_type_index_from_pref(widget.value)]
+  local selected = settings.content_type_values[widget.selected] or settings.content_type_values[settings.content_type_index_from_pref(widget.value)]
   if selected then
     dt.preferences.write(PLUGIN, "default_content_type", DEFAULT_SETTING_PREF_TYPE, selected.pref)
     dt.print_log(string.format("[dtrmflickr] content_type changed -> default_content_type=%s", selected.pref))
@@ -2745,7 +2737,7 @@ content_type_widget.changed_callback = function(widget)
 end
 
 license_widget.changed_callback = function(widget)
-  local selected = license_values[widget.selected] or license_values[license_index_from_pref(widget.value)]
+  local selected = settings.license_values[widget.selected] or settings.license_values[settings.license_index_from_pref(widget.value)]
   if selected then
     dt.preferences.write(PLUGIN, "default_license", DEFAULT_SETTING_PREF_TYPE, selected.pref)
     dt.print_log(string.format("[dtrmflickr] license changed -> default_license=%s", selected.pref))
@@ -2753,7 +2745,7 @@ license_widget.changed_callback = function(widget)
 end
 
 comment_perm_widget.changed_callback = function(widget)
-  local selected = permission_values[widget.selected] or permission_values[permission_index_from_pref(widget.value)]
+  local selected = settings.permission_values[widget.selected] or settings.permission_values[settings.permission_index_from_pref(widget.value)]
   if selected then
     dt.preferences.write(PLUGIN, "default_comment_perm", DEFAULT_SETTING_PREF_TYPE, selected.pref)
     dt.print_log(string.format("[dtrmflickr] commenting changed -> default_comment_perm=%s", selected.pref))
@@ -2761,7 +2753,7 @@ comment_perm_widget.changed_callback = function(widget)
 end
 
 addmeta_perm_widget.changed_callback = function(widget)
-  local selected = permission_values[widget.selected] or permission_values[permission_index_from_pref(widget.value)]
+  local selected = settings.permission_values[widget.selected] or settings.permission_values[settings.permission_index_from_pref(widget.value)]
   if selected then
     dt.preferences.write(PLUGIN, "default_addmeta_perm", DEFAULT_SETTING_PREF_TYPE, selected.pref)
     dt.print_log(string.format("[dtrmflickr] addmeta changed -> default_addmeta_perm=%s", selected.pref))
@@ -3332,7 +3324,7 @@ local function panel_privacy_index_from_flags(is_public, is_friend, is_family)
 end
 
 local function panel_privacy_flags()
-  local selected = privacy_values[panel_privacy_widget.selected or 1] or privacy_values[1]
+  local selected = settings.privacy_values[panel_privacy_widget.selected or 1] or settings.privacy_values[1]
   return selected.is_public, selected.is_friend, selected.is_family
 end
 
@@ -3343,28 +3335,28 @@ local function panel_safety_index_from_remote(value)
   -- documented write API uses safety_level=1 for "safe". This normalizes only
   -- the display label; saved values still use the documented flickr_value above.
   if n == 0 or n == 1 then return 1 end
-  for i, item in ipairs(safety_values) do
+  for i, item in ipairs(settings.safety_values) do
     if item.flickr_value == n then return i end
   end
   return nil
 end
 
 local function panel_safety_value()
-  local selected = safety_values[panel_safety_widget.selected or 1] or safety_values[1]
+  local selected = settings.safety_values[panel_safety_widget.selected or 1] or settings.safety_values[1]
   return selected.flickr_value
 end
 
 local function panel_content_type_value()
   local index = panel_content_type_widget.selected or 0
   if index == 0 then return nil end
-  local selected = content_type_values[index]
+  local selected = settings.content_type_values[index]
   if not selected then return nil end
   return selected.flickr_value
 end
 
 local function panel_content_type_index_from_value(value)
   local id = tonumber(value)
-  for i, item in ipairs(content_type_values) do
+  for i, item in ipairs(settings.content_type_values) do
     if item.flickr_value == id then return i end
   end
   return nil
@@ -3389,33 +3381,33 @@ end
 local function panel_license_index_from_id(value)
   if value == nil or value == "" then return nil end
   local id = tonumber(value)
-  for i, item in ipairs(license_values) do
+  for i, item in ipairs(settings.license_values) do
     if item.flickr_value == id then return i end
   end
   return nil
 end
 
 local function panel_license_value()
-  local selected = license_values[panel_license_widget.selected or 1] or license_values[1]
+  local selected = settings.license_values[panel_license_widget.selected or 1] or settings.license_values[1]
   return selected.flickr_value
 end
 
 local function panel_permission_index_from_id(value)
   if value == nil or value == "" then return nil end
   local id = tonumber(value)
-  for i, item in ipairs(permission_values) do
+  for i, item in ipairs(settings.permission_values) do
     if item.flickr_value == id then return i end
   end
   return nil
 end
 
 local function panel_comment_perm_value()
-  local selected = permission_values[panel_comment_perm_widget.selected or 4] or permission_values[4]
+  local selected = settings.permission_values[panel_comment_perm_widget.selected or 4] or settings.permission_values[4]
   return selected.flickr_value
 end
 
 local function panel_addmeta_perm_value()
-  local selected = permission_values[panel_addmeta_perm_widget.selected or 4] or permission_values[4]
+  local selected = settings.permission_values[panel_addmeta_perm_widget.selected or 4] or settings.permission_values[4]
   return selected.flickr_value
 end
 
@@ -4383,8 +4375,8 @@ local supported_formats = { jpg = true, jpeg = true, tif = true, tiff = true, pn
 
 local function current_privacy()
   local index = privacy_widget.selected
-  if not index or index == 0 then index = privacy_index_from_pref(privacy_widget.value) end
-  local selected = privacy_values[index] or privacy_values[1]
+  if not index or index == 0 then index = settings.privacy_index_from_pref(privacy_widget.value) end
+  local selected = settings.privacy_values[index] or settings.privacy_values[1]
   return {
     pref = selected.pref,
     is_public = selected.is_public,
@@ -4395,8 +4387,8 @@ end
 
 local function current_safety()
   local index = safety_widget.selected
-  if not index or index == 0 then index = safety_index_from_pref(safety_widget.value) end
-  local selected = safety_values[index] or safety_values[1]
+  if not index or index == 0 then index = settings.safety_index_from_pref(safety_widget.value) end
+  local selected = settings.safety_values[index] or settings.safety_values[1]
   return {
     pref = selected.pref,
     flickr_value = selected.flickr_value,
@@ -4405,8 +4397,8 @@ end
 
 local function current_content_type()
   local index = content_type_widget.selected
-  if not index or index == 0 then index = content_type_index_from_pref(content_type_widget.value) end
-  local selected = content_type_values[index] or content_type_values[1]
+  if not index or index == 0 then index = settings.content_type_index_from_pref(content_type_widget.value) end
+  local selected = settings.content_type_values[index] or settings.content_type_values[1]
   return {
     pref = selected.pref,
     flickr_value = selected.flickr_value,
@@ -4415,8 +4407,8 @@ end
 
 local function current_license()
   local index = license_widget.selected
-  if not index or index == 0 then index = license_index_from_pref(license_widget.value) end
-  local selected = license_values[index] or license_values[1]
+  if not index or index == 0 then index = settings.license_index_from_pref(license_widget.value) end
+  local selected = settings.license_values[index] or settings.license_values[1]
   return {
     pref = selected.pref,
     flickr_value = selected.flickr_value,
@@ -4425,11 +4417,11 @@ end
 
 local function current_permissions()
   local comment_index = comment_perm_widget.selected
-  if not comment_index or comment_index == 0 then comment_index = permission_index_from_pref(comment_perm_widget.value) end
+  if not comment_index or comment_index == 0 then comment_index = settings.permission_index_from_pref(comment_perm_widget.value) end
   local addmeta_index = addmeta_perm_widget.selected
-  if not addmeta_index or addmeta_index == 0 then addmeta_index = permission_index_from_pref(addmeta_perm_widget.value) end
-  local comment = permission_values[comment_index] or permission_values[4]
-  local addmeta = permission_values[addmeta_index] or permission_values[4]
+  if not addmeta_index or addmeta_index == 0 then addmeta_index = settings.permission_index_from_pref(addmeta_perm_widget.value) end
+  local comment = settings.permission_values[comment_index] or settings.permission_values[4]
+  local addmeta = settings.permission_values[addmeta_index] or settings.permission_values[4]
   return {
     comment_pref = comment.pref,
     addmeta_pref = addmeta.pref,
@@ -4552,10 +4544,10 @@ local function keyword_rule_filters()
     filters[#filters + 1] = filter
   end
   local groups = {
-    { prefix = "keyword_privacy", values = privacy_values },
-    { prefix = "keyword_safety", values = safety_values },
-    { prefix = "keyword_content_type", values = content_type_values },
-    { prefix = "keyword_license", values = license_values },
+    { prefix = "keyword_privacy", values = settings.privacy_values },
+    { prefix = "keyword_safety", values = settings.safety_values },
+    { prefix = "keyword_content_type", values = settings.content_type_values },
+    { prefix = "keyword_license", values = settings.license_values },
   }
   for _, group in ipairs(groups) do
     for _, rule in ipairs(read_keyword_rules(group.prefix, group.values)) do
@@ -4727,13 +4719,13 @@ end
 
 local function apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
   local privacy_match, privacy_conflict = choose_keyword_match("privacy",
-    keyword_rule_matches(tag_names, read_keyword_rules("keyword_privacy", privacy_values)))
+    keyword_rule_matches(tag_names, read_keyword_rules("keyword_privacy", settings.privacy_values)))
   local safety_match, safety_conflict = choose_keyword_match("safety",
-    keyword_rule_matches(tag_names, read_keyword_rules("keyword_safety", safety_values)))
+    keyword_rule_matches(tag_names, read_keyword_rules("keyword_safety", settings.safety_values)))
   local content_type_match, content_type_conflict = choose_keyword_match("content type",
-    keyword_rule_matches(tag_names, read_keyword_rules("keyword_content_type", content_type_values)))
+    keyword_rule_matches(tag_names, read_keyword_rules("keyword_content_type", settings.content_type_values)))
   local license_match, license_conflict = choose_keyword_match("license",
-    keyword_rule_matches(tag_names, read_keyword_rules("keyword_license", license_values)))
+    keyword_rule_matches(tag_names, read_keyword_rules("keyword_license", settings.license_values)))
   local conflicts = {}
   if privacy_conflict then conflicts[#conflicts + 1] = privacy_conflict end
   if safety_conflict then conflicts[#conflicts + 1] = safety_conflict end
@@ -4859,7 +4851,7 @@ local function store(storage, image, format, filename, number, total, high_quali
   local private_rating_threshold, private_rating = rating_color_rules.should_force_private_by_rating(image)
   local private_label = rating_color_rules.should_force_private_by_color_label(image)
   if private_rating_threshold or private_label then
-    privacy = privacy_values[1]
+    privacy = settings.privacy_values[1]
     forced.privacy = true
     if private_rating_threshold then
       dt.print_log(string.format("[dtrmflickr] store: forcing private by rating file='%s' rating='%s' threshold='%s'",
@@ -5096,10 +5088,10 @@ script_data.__test = {
   panel_content_type_index_from_search_value = panel_content_type_index_from_search_value,
   flickr_queue = __dtrmflickr_queue,
   flickr_call = __dtrmflickr_call,
-  privacy_values = privacy_values,
-  safety_values = safety_values,
-  content_type_values = content_type_values,
-  license_values = license_values,
+  privacy_values = settings.privacy_values,
+  safety_values = settings.safety_values,
+  content_type_values = settings.content_type_values,
+  license_values = settings.license_values,
 }
 
 dt.register_storage(STORAGE, HUMAN, store, finalize, supported, initialize, storage_widget)
