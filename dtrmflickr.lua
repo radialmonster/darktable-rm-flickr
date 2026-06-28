@@ -168,8 +168,8 @@ package.preload["dtrmflickr.http"] = function(...)
 -- Step-0 decision: curl-primary on Unix-like systems (it is the only client
 -- that "just worked" across platforms without a build step; LuaSec needs a C
 -- toolchain). On Windows, REST GET/POST prefer an optional in-process WinHTTP
--- module. If that DLL is not installed or cannot be loaded, Windows REST calls
--- fail with a clear error instead of shelling out and flashing command windows.
+-- module. If that DLL is not installed or cannot be loaded, manual Windows
+-- REST calls fall back to a hidden WScript/MSXML helper.
 -- Uploads still fall back to curl because building multipart bodies in pure Lua
 -- is much more fragile than curl's battle-tested form encoder.
 --
@@ -302,11 +302,13 @@ local function vbs_quote(s)
 end
 
 local function launch_windows(command)
-  local ok, dt = pcall(require, "darktable")
-  if ok and dt and dt.control and dt.control.execute then
-    return dt.control.execute(command)
-  end
   return os.execute(command)
+end
+
+local function command_succeeded(ok, why, code)
+  if ok == true or ok == 0 then return true end
+  if type(ok) == "number" then return ok == 0 end
+  return false, why, code
 end
 
 local function batch_escape(s)
@@ -338,13 +340,17 @@ local function run_windows_hidden(cmd)
     'WScript.Quit code',
   }, "\r\n")
   if not write_file(vbs_path, script) then return nil, "could not write temporary script" end
-  launch_windows("wscript.exe //B //Nologo " .. shq(vbs_path))
+  local ok, why, code = launch_windows("wscript.exe //B //Nologo " .. shq(vbs_path))
   local out = read_file(out_path) or ""
   local err = read_file(err_path) or ""
   os.remove(vbs_path)
   if bat_path then os.remove(bat_path) end
   os.remove(out_path)
   os.remove(err_path)
+  if not command_succeeded(ok, why, code) then
+    local detail = err ~= "" and err or out
+    return nil, detail ~= "" and detail or ("command failed: " .. tostring(why or code or ok))
+  end
   return out ~= "" and out or err
 end
 
@@ -400,7 +406,7 @@ local function windows_http(method, url, body, content_type)
   }, "\r\n")
 
   if not write_file(vbs_path, script) then return nil, "could not write temporary HTTP script" end
-  launch_windows("wscript.exe //B //Nologo " .. shq(vbs_path))
+  local ok, why, code = launch_windows("wscript.exe //B //Nologo " .. shq(vbs_path))
 
   local out = read_file(out_path) or ""
   local err = read_file(err_path) or ""
@@ -408,6 +414,10 @@ local function windows_http(method, url, body, content_type)
   if body_path ~= "" then os.remove(body_path) end
   os.remove(out_path)
   os.remove(err_path)
+  if not command_succeeded(ok, why, code) then
+    local detail = err ~= "" and err or out
+    return nil, detail ~= "" and detail or ("HTTP helper failed: " .. tostring(why or code or ok))
+  end
   return out ~= "" and out or err
 end
 
@@ -416,7 +426,10 @@ function run(cmd)
   local p = io.popen(cmd .. " 2>&1")
   if not p then return nil, "io.popen failed" end
   local out = p:read("*a")
-  p:close()
+  local ok, why, code = p:close()
+  if not command_succeeded(ok, why, code) then
+    return nil, out ~= "" and out or ("command failed: " .. tostring(why or code or ok))
+  end
   return out
 end
 M.run = run
@@ -435,7 +448,7 @@ function M.get(url)
   if is_windows() and native_http_ok and native_http and native_http.request then
     return native_http.request("GET", url)
   end
-  if is_windows() then return nil, "Windows native HTTP unavailable: " .. tostring(native_http_error) end
+  if is_windows() then return windows_http("GET", url) end
   return run_curl_config({
     "silent",
     "show-error",
@@ -450,7 +463,7 @@ function M.post(url, body)
   if is_windows() and native_http_ok and native_http and native_http.request then
     return native_http.request("POST", url, body or "", "application/x-www-form-urlencoded")
   end
-  if is_windows() then return nil, "Windows native HTTP unavailable: " .. tostring(native_http_error) end
+  if is_windows() then return windows_http("POST", url, body or "", "application/x-www-form-urlencoded") end
   return run_curl_config({
     "silent",
     "show-error",
@@ -564,7 +577,8 @@ function M.get_request_token(api_key, api_secret)
   local params = base_params(api_key)
   params.oauth_callback = "oob"
   local url = signed_url("GET", M.REQUEST_TOKEN_URL, params, api_secret, "")
-  local body = M.http.get(url)
+  local body, err = M.http.get(url)
+  if not body then return nil, err end
   local r = parse_form(body)
   if r.oauth_token and r.oauth_token_secret then
     return r.oauth_token, r.oauth_token_secret
@@ -590,7 +604,8 @@ function M.get_access_token(api_key, api_secret, req_token, req_secret, verifier
   params.oauth_token    = req_token
   params.oauth_verifier = verifier
   local url = signed_url("GET", M.ACCESS_TOKEN_URL, params, api_secret, req_secret)
-  local body = M.http.get(url)
+  local body, err = M.http.get(url)
+  if not body then return nil, err end
   local r = parse_form(body)
   if r.oauth_token and r.oauth_token_secret then
     return {
@@ -698,7 +713,8 @@ function M.upload_photo(api_key, api_secret, account, filename, opts)
   add_if_present(params, "perm_addmeta", opts.perm_addmeta)
 
   params.oauth_signature = oauth.signature("POST", M.UPLOAD_URL, params, api_secret, account.secret)
-  local body = M.http.post_multipart(M.UPLOAD_URL, params, "photo", filename)
+  local body, transport_err = M.http.post_multipart(M.UPLOAD_URL, params, "photo", filename)
+  if not body then return nil, transport_err end
   return parse_upload_response(body)
 end
 
@@ -783,11 +799,14 @@ function M.call(api_key, api_secret, account, method, args)
   local params = base_params(api_key, account.token)
   params.method = method
   for k, v in pairs(args or {}) do
-    if v ~= nil and v ~= "" then params[k] = tostring(v) end
+    if k ~= "_allow_empty" and v ~= nil and (v ~= "" or (args._allow_empty and args._allow_empty[k])) then
+      params[k] = tostring(v)
+    end
   end
 
   params.oauth_signature = oauth.signature("POST", M.REST_URL, params, api_secret, account.secret)
-  local body = M.http.post(M.REST_URL, form_encode(params))
+  local body, transport_err = M.http.post(M.REST_URL, form_encode(params))
+  if not body then return nil, transport_err end
   if ok(body) then return body end
   return nil, parse_error(body)
 end
@@ -801,10 +820,13 @@ function M.public_call(api_key, method, args)
     method = method,
   }
   for k, v in pairs(args or {}) do
-    if v ~= nil and v ~= "" then params[k] = tostring(v) end
+    if k ~= "_allow_empty" and v ~= nil and (v ~= "" or (args._allow_empty and args._allow_empty[k])) then
+      params[k] = tostring(v)
+    end
   end
 
-  local body = M.http.post(M.REST_URL, form_encode(params))
+  local body, transport_err = M.http.post(M.REST_URL, form_encode(params))
+  if not body then return nil, transport_err end
   if ok(body) then return body end
   return nil, parse_error(body)
 end
@@ -920,7 +942,7 @@ end
 
 function M.photos_set_meta(api_key, api_secret, account, photo_id, title, description)
   if not photo_id or photo_id == "" then return nil, "missing photo id" end
-  if (title == nil or title == "") and (description == nil or description == "") then
+  if title == nil and description == nil then
     return nil, "missing title or description"
   end
 
@@ -928,6 +950,7 @@ function M.photos_set_meta(api_key, api_secret, account, photo_id, title, descri
     photo_id = photo_id,
     title = title,
     description = description,
+    _allow_empty = { title = true, description = true },
   })
   if not body then return nil, err end
   return true
@@ -1140,6 +1163,30 @@ function M.clear_sets(image, account_nsid)
   return removed
 end
 
+function M.clear_account(image, account_nsid)
+  local removed = M.clear_sets(image, account_nsid)
+  if M.clear_photo_id(image, account_nsid) then removed = removed + 1 end
+  return removed
+end
+
+function M.clear_other_accounts(image, keep_account_nsid)
+  local keep = tostring(keep_account_nsid)
+  local accounts = {}
+  local prefix = PREFIX .. "|"
+  for _, tag in ipairs(image_tags(image) or {}) do
+    local name = tag_name(tag)
+    if name and name:sub(1, #prefix) == prefix then
+      local account_nsid = name:sub(#prefix + 1):match("^([^|]+)|")
+      if account_nsid and account_nsid ~= keep then accounts[account_nsid] = true end
+    end
+  end
+  local removed = 0
+  for account_nsid in pairs(accounts) do
+    removed = removed + M.clear_account(image, account_nsid)
+  end
+  return removed
+end
+
 return M
 end
 
@@ -1168,7 +1215,7 @@ end
 
 local function flickr_coordinate(value, min_value, max_value)
   local n = tonumber(value)
-  if not n or n < min_value or n > max_value then return nil end
+  if not n or n ~= n or n < min_value or n > max_value then return nil end
   return string.format("%.6f", n)
 end
 
@@ -2790,7 +2837,7 @@ local function clear_panel_photo_id_link()
   local image = selection[1]
   local acc = load_token()
   local tag_account_nsid = state.get_any_photo_id(image)
-  local account_nsid = acc and acc.nsid or tag_account_nsid
+  local account_nsid = tag_account_nsid or (acc and acc.nsid)
   if not account_nsid or account_nsid == "" then
     dt.print(_("Flickr: selected image has no stored Flickr link to clear."))
     return
@@ -3145,13 +3192,13 @@ local function sync_panel_meta()
   end
 
   local sync = master_sync_fields()
-  local title = sync.title and metadata.image_title(image, image.filename) or nil
-  local description = sync.description and image.description or nil
+  local title = sync.title and (image and image.title or "") or nil
+  local description = sync.description and (image and image.description or "") or nil
   if not sync.title and not sync.description then
     dt.print(_("Flickr: title/description sync disabled in Lua Options."))
     return
   end
-  if (title == nil or title == "") and (description == nil or description == "") then
+  if title == nil and description == nil then
     dt.print(_("Flickr: selected image has no title or description to sync."))
     return
   end
@@ -3835,6 +3882,7 @@ script_data.metadata = {
 script_data.destroy_method = "hide"
 local function destroy()
   dt.destroy_storage(STORAGE)
+  if dt.destroy_event then dt.destroy_event(PLUGIN .. "_selection_changed", "selection-changed") end
   if dt.gui.libs and dt.gui.libs[PANEL] then dt.gui.libs[PANEL].visible = false end
 end
 local function restart()
