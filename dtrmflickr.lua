@@ -2337,24 +2337,29 @@ function Queue:run_job(job)
   end
 end
 
+function Queue:finish_job(job)
+  if job.stale and job.stale() then
+    self.stats.stale = self.stats.stale + 1
+    job.result = { nil, "stale Flickr queue job" }
+    self:record(job, "stale", { attempts = 0, error = job.result[2], waited_ms = job.waited_ms })
+    self:emit("stale", job, { error = job.result[2] })
+  else
+    job.result = self:run_job(job)
+  end
+  for _, replaced in ipairs(job.replaced_jobs or {}) do
+    replaced.result = job.result
+    if replaced.done then replaced.done(table.unpack(replaced.result or {})) end
+  end
+  if job.done then job.done(table.unpack(job.result or {})) end
+  return job.result
+end
+
 function Queue:drain()
   if self.running then return end
   self.running = true
   while #self.pending > 0 do
     local job = table.remove(self.pending, 1)
-    if job.stale and job.stale() then
-      self.stats.stale = self.stats.stale + 1
-      job.result = { nil, "stale Flickr queue job" }
-      self:record(job, "stale", { attempts = 0, error = job.result[2], waited_ms = job.waited_ms })
-      self:emit("stale", job, { error = job.result[2] })
-    else
-      job.result = self:run_job(job)
-    end
-    for _, replaced in ipairs(job.replaced_jobs or {}) do
-      replaced.result = job.result
-      if replaced.done then replaced.done(table.unpack(replaced.result or {})) end
-    end
-    if job.done then job.done(table.unpack(job.result or {})) end
+    self:finish_job(job)
   end
   self.running = false
 end
@@ -2362,6 +2367,15 @@ end
 function Queue:call(method, fn, opts)
   local job = self:enqueue(method, fn, opts)
   if opts and opts.done then job.done = opts.done end
+  if self.running then
+    for i, pending in ipairs(self.pending) do
+      if pending == job then
+        table.remove(self.pending, i)
+        local result = self:finish_job(job)
+        return table.unpack(result)
+      end
+    end
+  end
   self:drain()
   if job.result then return table.unpack(job.result) end
   return nil, "queued Flickr job has not run yet"
@@ -3748,6 +3762,7 @@ panel_sets = { filtering = false, current_ids = {} }
 panel_sets.status_label = dt.new_widget("label") { label = "" }
 panel_sets.publish_label = dt.new_widget("label") { label = "" }
 panel_sets.queue_label = dt.new_widget("label") { label = "" }
+panel_sets.queue_detail_label = dt.new_widget("label") { label = "" }
 local panel_remote_label = dt.new_widget("label") { label = "" }
 local panel_tags_label = dt.new_widget("label") { label = "" }
 panel_sets.current_widget = dt.new_widget("combobox") {
@@ -3845,11 +3860,28 @@ function panel_sets.refresh_queue_status()
   local summary = __dtrmflickr_queue and __dtrmflickr_queue:summary() or nil
   if not summary then
     panel_sets.queue_label.label = ""
+    if panel_sets.queue_detail_label then panel_sets.queue_detail_label.label = "" end
     return
   end
   panel_sets.queue_label.label = string.format(
     _("queue: %d ok, %d failed, %d retried, %d pending"),
     summary.succeeded or 0, summary.failed or 0, summary.retried or 0, summary.pending or 0)
+  if panel_sets.queue_detail_label and __dtrmflickr_queue.recent_results then
+    local recent = __dtrmflickr_queue:recent_results()
+    local last = recent[#recent]
+    if last then
+      local name = last.label or last.method or _("request")
+      local attempts = tonumber(last.attempts) or 0
+      local detail = string.format(_("last queue: %s %s"), tostring(name), tostring(last.status or ""))
+      if attempts > 1 then
+        detail = detail .. string.format(_(" after %d attempts"), attempts)
+      end
+      if last.error then detail = detail .. ": " .. tostring(last.error) end
+      panel_sets.queue_detail_label.label = detail
+    else
+      panel_sets.queue_detail_label.label = ""
+    end
+  end
 end
 
 function panel_sets.clear_choices()
@@ -4957,6 +4989,7 @@ local panel_widget = dt.new_widget("box") {
   panel_photo_label,
   panel_sets.publish_label,
   panel_sets.queue_label,
+  panel_sets.queue_detail_label,
   panel_sets_label,
   dt.new_widget("label") { label = _("albums") },
   dt.new_widget("box") {
