@@ -1010,8 +1010,15 @@ function M.parse_photosets(body)
         photos = attrs:match('photos="(.-)"') or attrs:match("photos='(.-)'"),
         videos = attrs:match('videos="(.-)"') or attrs:match("videos='(.-)'"),
         has_requested_photos = xml_unescape(requested),
-        has_requested_photos_marker = inner:find("<has_requested_photos%s*/>", 1) ~= nil,
-        has_photo_marker = inner:find("<has_photo%s*/>", 1) ~= nil,
+        -- Membership marker. Live responses always use the self-closing
+        -- `<has_requested_photos />`, but accept the equivalent empty paired form
+        -- `<has_requested_photos></has_requested_photos>` too, so a serialization
+        -- change can't silently drop a real membership (matches the "accept
+        -- defensive alternate shapes" rule in CLAUDE.md).
+        has_requested_photos_marker = (inner:find("<has_requested_photos%s*/>", 1)
+          or inner:find("<has_requested_photos%s*>%s*</has_requested_photos>", 1)) ~= nil,
+        has_photo_marker = (inner:find("<has_photo%s*/>", 1)
+          or inner:find("<has_photo%s*>%s*</has_photo>", 1)) ~= nil,
       }
     end
   end
@@ -2336,6 +2343,16 @@ local function default_retryable(err)
   if s:find("connection", 1, true) or s:find("network", 1, true) or s:find("curl", 1, true) then return true, "transient" end
   if s:find("write operation failed", 1, true) or s:find("(106)", 1, true) then return true, "transient" end
   if s:find("empty flickr", 1, true) then return true, "transient" end
+  -- A paged read whose first page lacks its <container> wrapper is a
+  -- malformed/truncated response. flickr_rest.paged_call surfaces it loudly
+  -- ("unparseable Flickr paged response (missing <...> wrapper)") *specifically*
+  -- so the read can be retried rather than silently returning an incomplete set
+  -- — but that purpose is only honoured if the message is actually classified
+  -- retryable here. Without this rule the queue failed it on the first attempt
+  -- and claim_existing_for_image concluded "no match" from partial data. Treat
+  -- it as transient so the whole paged read (and the claim that depends on it)
+  -- retries with backoff.
+  if s:find("unparseable", 1, true) and s:find("wrapper", 1, true) then return true, "transient" end
   return false
 end
 
@@ -2462,6 +2479,12 @@ function Queue:enqueue(method, fn, opts)
     label = opts.label,
     coalesce_key = opts.coalesce_key,
     stale = opts.stale,
+    -- Honour `done` here, not only in Queue:call. enqueue accepts the full opts
+    -- bag, so silently dropping `done` was a broken contract: a job enqueued via
+    -- Queue:enqueue(method, fn, { done = ... }) and later run by drain() would
+    -- never fire its callback. (Latent today — production code routes through
+    -- Queue:call — but the option must mean the same thing on both paths.)
+    done = opts.done,
     pace_ms = self:pace_for(method, opts),
     max_attempts = math.max(1, tonumber(opts.max_attempts or self.default_max_attempts) or 1),
     retry_base_ms = opts.retry_base_ms ~= nil and opts.retry_base_ms or self.retry_base_ms,
@@ -2611,7 +2634,8 @@ end
 
 function Queue:call(method, fn, opts)
   local job = self:enqueue(method, fn, opts)
-  if opts and opts.done then job.done = opts.done end
+  -- `done` is now wired in enqueue (so both enqueue and call honour it); the
+  -- surviving job after a coalesce already carries the newest job's `done`.
   if self.running then
     -- Reentrant call from inside a running job: run it now (synchronously,
     -- jumping the queue) and return its real result instead of leaving it
