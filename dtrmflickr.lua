@@ -2129,7 +2129,13 @@ local function tag_is_publishable_keyword(tag)
   return true
 end
 
-function M.image_keyword_tags(image, excluded_filters, tag_names, opts)
+-- Compute the publishable Flickr keyword leaf names for an image: plugin/state,
+-- darktable|..., private/category, and filter-excluded tags removed; hierarchical
+-- tags reduced to their leaf; duplicates collapsed case-insensitively; sorted
+-- alphabetically. Returns (names, truncated_count) where `truncated_count` is the
+-- number dropped by opts.max_tags. This is the single source of truth shared by
+-- the upload/setTags path (image_keyword_tags) and the reconciler UI.
+function M.image_keyword_names(image, excluded_filters, tag_names, opts)
   opts = opts or {}
   local tags = {}
   local seen = {}
@@ -2168,10 +2174,14 @@ function M.image_keyword_tags(image, excluded_filters, tag_names, opts)
     for i = 1, opts.max_tags do limited[i] = tags[i] end
     tags = limited
   end
+  return tags, math.max(0, original_count - #tags)
+end
 
+function M.image_keyword_tags(image, excluded_filters, tag_names, opts)
+  local tags, truncated = M.image_keyword_names(image, excluded_filters, tag_names, opts)
   local encoded = {}
   for _, tag in ipairs(tags) do encoded[#encoded + 1] = flickr_quote_tag(tag) end
-  return #encoded > 0 and table.concat(encoded, " ") or nil, math.max(0, original_count - #tags)
+  return #encoded > 0 and table.concat(encoded, " ") or nil, truncated
 end
 
 local function fingerprint_hash(value)
@@ -3948,6 +3958,13 @@ function M.image_keyword_tags(image, tag_names)
   return metadata.image_keyword_tags(image, M.keyword_rule_filters(), tag_names, { max_tags = FLICKR_TAG_LIMIT })
 end
 
+-- Publishable Flickr keyword leaf names (same filtering as image_keyword_tags,
+-- but the name list rather than the encoded `tags` string). Used by the
+-- lighttable tag reconciler.
+function M.image_keyword_names(image, tag_names)
+  return metadata.image_keyword_names(image, M.keyword_rule_filters(), tag_names, { max_tags = FLICKR_TAG_LIMIT })
+end
+
 return M
 end
 
@@ -4302,6 +4319,166 @@ end
 return M
 end
 
+package.preload["dtrmflickr.tag_reconcile"] = function(...)
+-- tag_reconcile.lua — pure diff / action-planning logic for the lighttable
+-- Flickr tag reconciler (issue #3).
+--
+-- This module is deliberately free of any `darktable` dependency so it can be
+-- unit-tested offline. The caller is responsible for collecting the two name
+-- lists:
+--   * local_names  — publishable darktable keyword leaf names (already filtered
+--                    through rules/metadata so plugin/state/never-sync tags and
+--                    private/category tags are excluded). See
+--                    metadata.image_keyword_tags / rules.image_keyword_tags.
+--   * remote_names — Flickr tag `raw` strings (parse_remote_tags in the main
+--                    module).
+--
+-- Matching is case-insensitive on the trimmed text, mirroring how the upload
+-- path de-dupes keywords (publish_tag_name lowercases its `seen` key) and how
+-- Flickr itself collapses tags. The display forms are preserved as typed.
+
+local M = {}
+
+-- Normalize a tag for COMPARISON only (never for display or for sending to
+-- Flickr). Lowercased + trimmed; embedded double quotes removed so a local
+-- keyword and its stored-on-Flickr form (which can't carry a `"`) compare equal.
+local function match_key(name)
+  return tostring(name or ""):gsub('"', ""):match("^%s*(.-)%s*$"):lower()
+end
+M.match_key = match_key
+
+-- Normalize a tag for SENDING to Flickr's space-delimited `tags` parameter.
+-- Per CLAUDE.md's live-tested rule: strip embedded double quotes, preserve
+-- backslashes literally, and quote the whole tag only when it contains
+-- whitespace. Returns nil for an empty/quote-only tag.
+local function encode_tag(name)
+  name = tostring(name or ""):gsub('"', ""):match("^%s*(.-)%s*$")
+  if name == "" then return nil end
+  if name:find("%s") then return '"' .. name .. '"' end
+  return name
+end
+M.encode_tag = encode_tag
+
+-- Join a list of tag names into a single Flickr `tags` string. Empty/quote-only
+-- entries are dropped; duplicates (case-insensitive) are collapsed, first form
+-- wins. Returns "" for an empty result (setTags treats "" as "clear all tags").
+function M.encode_tags(names)
+  local seen = {}
+  local out = {}
+  for _, name in ipairs(names or {}) do
+    local key = match_key(name)
+    local encoded = encode_tag(name)
+    if encoded and key ~= "" and not seen[key] then
+      seen[key] = true
+      out[#out + 1] = encoded
+    end
+  end
+  return table.concat(out, " ")
+end
+
+local function sorted_unique(names)
+  local seen = {}
+  local out = {}
+  for _, name in ipairs(names or {}) do
+    local key = match_key(name)
+    local trimmed = tostring(name or ""):match("^%s*(.-)%s*$")
+    if key ~= "" and not seen[key] then
+      seen[key] = true
+      out[#out + 1] = trimmed
+    end
+  end
+  table.sort(out, function(a, b)
+    local la, lb = a:lower(), b:lower()
+    if la == lb then return a < b end
+    return la < lb
+  end)
+  return out
+end
+
+-- Diff local keywords against remote Flickr tags.
+-- Returns a table:
+--   local_only  — sorted display names present locally but not on Flickr
+--   remote_only — sorted display names present on Flickr but not locally
+--   matching    — sorted { local_name, remote_name } pairs present in both
+-- All comparisons are case-insensitive; display forms are preserved. When a tag
+-- matches, the local display form is used in `matching[i].name` (so "add" round
+-- trips), with the remote form kept alongside for reference.
+function M.diff(local_names, remote_names)
+  local local_by_key = {}
+  for _, name in ipairs(sorted_unique(local_names)) do
+    local_by_key[match_key(name)] = name
+  end
+  local remote_by_key = {}
+  for _, name in ipairs(sorted_unique(remote_names)) do
+    remote_by_key[match_key(name)] = name
+  end
+
+  local result = { local_only = {}, remote_only = {}, matching = {} }
+  for _, name in ipairs(sorted_unique(local_names)) do
+    local key = match_key(name)
+    if remote_by_key[key] then
+      result.matching[#result.matching + 1] = { name = name, remote_name = remote_by_key[key] }
+    else
+      result.local_only[#result.local_only + 1] = name
+    end
+  end
+  for _, name in ipairs(sorted_unique(remote_names)) do
+    if not local_by_key[match_key(name)] then
+      result.remote_only[#result.remote_only + 1] = name
+    end
+  end
+  return result
+end
+
+-- ---- Action planners ---------------------------------------------------------
+-- Flickr's flickr.photos.setTags is a FULL REPLACE of the tag set, so every
+-- mutating action computes the COMPLETE intended tag set as a name list. The
+-- caller encodes it with M.encode_tags before calling setTags. Returning name
+-- lists (not the encoded string) keeps a single encode/dedup path and lets the
+-- caller inspect the result (e.g. to decide whether local keywords are fully
+-- published). The operations are idempotent: replaying the same plan converges
+-- to the same tags.
+
+-- "Add local-only keywords to Flickr": union of current remote tags + the
+-- local-only keywords (case-insensitive dedup, remote forms win). Existing
+-- remote tags are preserved.
+function M.plan_add_local_only(remote_names, local_only)
+  local merged = {}
+  for _, n in ipairs(remote_names or {}) do merged[#merged + 1] = n end
+  for _, n in ipairs(local_only or {}) do merged[#merged + 1] = n end
+  local seen, out = {}, {}
+  for _, n in ipairs(merged) do
+    local key = match_key(n)
+    if key ~= "" and not seen[key] then seen[key] = true; out[#out + 1] = n end
+  end
+  return out
+end
+
+-- "Remove selected Flickr tags": remote tags minus the chosen names.
+function M.plan_remove(remote_names, to_remove)
+  local remove_keys = {}
+  for _, n in ipairs(to_remove or {}) do remove_keys[match_key(n)] = true end
+  local kept = {}
+  for _, n in ipairs(remote_names or {}) do
+    if not remove_keys[match_key(n)] then kept[#kept + 1] = n end
+  end
+  return kept
+end
+
+-- "Replace Flickr tags from local keywords": the full local set, nothing else.
+function M.plan_replace(local_names)
+  return sorted_unique(local_names)
+end
+
+-- "Pull remote-only tags into darktable": the list of remote tag names that
+-- should be added as darktable keywords (the caller adds them via dt.tags).
+function M.plan_pull_remote_only(remote_only)
+  return sorted_unique(remote_only)
+end
+
+return M
+end
+
 package.preload["dtrmflickr.dtrmflickr"] = function(...)
 --[[ dtrmflickr — Flickr export/storage for darktable
 
@@ -4345,6 +4522,7 @@ local claim = require "dtrmflickr.claim"
 local settings = require "dtrmflickr.settings"
 local rules = require "dtrmflickr.rules"
 local report = require "dtrmflickr.report"
+local tag_reconcile = require "dtrmflickr.tag_reconcile"
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -5387,6 +5565,16 @@ panel_sets.queue_label = dt.new_widget("label") { label = "" }
 panel_sets.queue_detail_label = dt.new_widget("label") { label = "" }
 local panel_remote_label = dt.new_widget("label") { label = "" }
 local panel_tags_label = dt.new_widget("label") { label = "" }
+-- Tag reconciler (issue #3): side-by-side local-keyword vs Flickr-tag view plus
+-- explicit actions. All widgets/handlers/state live in this one table to keep the
+-- main chunk under Lua's per-function local limit (see CLAUDE.md).
+local panel_reconcile = { remote_tags = {}, local_names = {}, diff = nil }
+panel_reconcile.diff_label = dt.new_widget("label") { label = "" }
+panel_reconcile.remove_widget = dt.new_widget("combobox") {
+  label = _("remove Flickr tag"),
+  tooltip = _("a Flickr tag on this photo; choose one and click \"remove tag\" to delete it"),
+  selected = 0,
+}
 panel_sets.current_widget = dt.new_widget("combobox") {
   label = _("remove from album"),
   tooltip = _("recorded Flickr albums for this photo; choose one to remove"),
@@ -5611,6 +5799,7 @@ end
 local function panel_reset_remote(message)
   panel_remote_label.label = message or ""
   panel_tags_label.label = ""
+  if panel_reconcile.reset then panel_reconcile.reset() end
   panel_loading = true
   panel_privacy_widget.selected = 0
   panel_safety_widget.selected = 0
@@ -6156,6 +6345,7 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   panel_tags_label.label = #remote_tags > 0
     and string.format(_("Flickr tags: %s"), table.concat(remote_tags, ", "))
     or _("Flickr tags: none")
+  if panel_reconcile.refresh then panel_reconcile.refresh(panel_current.image, remote_tags) end
   panel_loading = false
   panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
   panel_privacy_widget.sensitive = acc ~= nil
@@ -6403,6 +6593,158 @@ local function sync_panel_tags()
     panel_remote_label.label = _("Flickr: keyword sync failed")
     dt.print(_("Flickr: keyword sync failed: ") .. tostring(err))
   end
+end
+
+----------------------------------------------------------------------
+-- Tag reconciler (issue #3): side-by-side local-keyword vs Flickr-tag view
+-- with explicit, confirmation-gated actions. The pure diff/plan logic lives in
+-- tag_reconcile.lua; this section is only the darktable wiring.
+----------------------------------------------------------------------
+function panel_reconcile.reset()
+  panel_reconcile.remote_tags = {}
+  panel_reconcile.local_names = {}
+  panel_reconcile.diff = nil
+  panel_reconcile.diff_label.label = ""
+  clear_widget_items(panel_reconcile.remove_widget)
+  panel_reconcile.remove_widget[1] = _("(no Flickr tags)")
+  panel_reconcile.remove_widget.selected = 1
+end
+
+local function reconcile_names_text(names)
+  return #names > 0 and table.concat(names, ", ") or _("none")
+end
+
+function panel_reconcile.refresh(image, remote_tags)
+  remote_tags = remote_tags or {}
+  panel_reconcile.remote_tags = remote_tags
+  local local_names = image and rules.image_keyword_names(image) or {}
+  panel_reconcile.local_names = local_names
+  local d = tag_reconcile.diff(local_names, remote_tags)
+  panel_reconcile.diff = d
+  local match_names = {}
+  for _, m in ipairs(d.matching) do match_names[#match_names + 1] = m.name end
+  panel_reconcile.diff_label.label = table.concat({
+    string.format(_("local-only (%d): %s"), #d.local_only, reconcile_names_text(d.local_only)),
+    string.format(_("Flickr-only (%d): %s"), #d.remote_only, reconcile_names_text(d.remote_only)),
+    string.format(_("matching (%d): %s"), #d.matching, reconcile_names_text(match_names)),
+  }, "\n")
+
+  clear_widget_items(panel_reconcile.remove_widget)
+  if #remote_tags == 0 then
+    panel_reconcile.remove_widget[1] = _("(no Flickr tags)")
+  else
+    panel_reconcile.remove_widget[1] = _("Select a Flickr tag to remove")
+    for i, name in ipairs(remote_tags) do panel_reconcile.remove_widget[i + 1] = name end
+  end
+  panel_reconcile.remove_widget.selected = 1
+end
+
+function panel_reconcile.target()
+  local acc, photo_id, image = panel_current.account, panel_current.photo_id, panel_current.image
+  if (panel_current.selection_count or 0) ~= 1 then
+    dt.print(_("Flickr: select exactly one image first.")); return nil
+  end
+  if not image or not photo_id then
+    dt.print(_("Flickr: select a published image first.")); return nil
+  end
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options first.")); return nil
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret.")); return nil
+  end
+  return api_key, api_secret, acc, photo_id, image
+end
+
+-- Push a complete intended tag set (name list) to Flickr via setTags (a full
+-- replace, hence idempotent). Then mark keyword-sync state by whether every local
+-- publishable keyword ends up present on Flickr, and reload the remote view.
+function panel_reconcile.apply(result_names, success_msg)
+  local api_key, api_secret, acc, photo_id, image = panel_reconcile.target()
+  if not api_key then return end
+  local tags = tag_reconcile.encode_tags(result_names)
+  local ok, err = __dtrmflickr_call("flickr.photos.setTags", function()
+    return rest.photos_set_tags(api_key, api_secret, acc, photo_id, tags)
+  end)
+  if ok then
+    state.set_metadata_published_at(image, acc.nsid)
+    local present = {}
+    for _, n in ipairs(result_names) do present[tag_reconcile.match_key(n)] = true end
+    local all_local_present = true
+    for _, n in ipairs(rules.image_keyword_names(image) or {}) do
+      if not present[tag_reconcile.match_key(n)] then all_local_present = false; break end
+    end
+    if all_local_present then
+      state.clear_reason(image, acc.nsid, "keywords")
+      store_metadata_fingerprints(image, acc.nsid,
+        effective_metadata_fingerprints(image, master_sync_fields()), { "keywords" })
+    else
+      state.mark_reason(image, acc.nsid, "keywords")
+    end
+    panel_sets.refresh_publish_state_label(image, acc, photo_id)
+    panel_remote_label.label = success_msg
+    dt.print(success_msg)
+    load_remote_settings(api_key, api_secret, acc, photo_id)
+  else
+    state.mark_reason(image, acc.nsid, "keywords")
+    panel_remote_label.label = _("Flickr: tag update failed")
+    dt.print(_("Flickr: tag update failed: ") .. tostring(err))
+  end
+end
+
+function panel_reconcile.add_local_only()
+  local d = panel_reconcile.diff
+  if not d then dt.print(_("Flickr: refresh the remote tags first.")); return end
+  if #d.local_only == 0 then dt.print(_("Flickr: no local-only keywords to add.")); return end
+  panel_reconcile.apply(
+    tag_reconcile.plan_add_local_only(panel_reconcile.remote_tags, d.local_only),
+    string.format(_("Flickr: added %d local-only keyword(s)"), #d.local_only))
+end
+
+function panel_reconcile.replace_from_local()
+  local d = panel_reconcile.diff
+  if not d then dt.print(_("Flickr: refresh the remote tags first.")); return end
+  panel_reconcile.apply(
+    tag_reconcile.plan_replace(panel_reconcile.local_names),
+    _("Flickr: tags replaced from local keywords"))
+end
+
+function panel_reconcile.remove_selected()
+  if not panel_reconcile.diff then dt.print(_("Flickr: refresh the remote tags first.")); return end
+  local index = panel_reconcile.remove_widget.selected or 0
+  local chosen = index > 1 and panel_reconcile.remote_tags[index - 1] or nil
+  if not chosen then dt.print(_("Flickr: choose a Flickr tag to remove first.")); return end
+  panel_reconcile.apply(
+    tag_reconcile.plan_remove(panel_reconcile.remote_tags, { chosen }),
+    string.format(_("Flickr: removed tag \"%s\""), chosen))
+end
+
+-- "Pull remote-only into darktable": attach the Flickr-only tags as darktable
+-- keywords on the selected image. No Flickr call; explicit and additive only.
+function panel_reconcile.pull_remote_only()
+  local d = panel_reconcile.diff
+  if not d then dt.print(_("Flickr: refresh the remote tags first.")); return end
+  if (panel_current.selection_count or 0) ~= 1 or not panel_current.image then
+    dt.print(_("Flickr: select exactly one image first.")); return
+  end
+  local names = tag_reconcile.plan_pull_remote_only(d.remote_only)
+  if #names == 0 then dt.print(_("Flickr: no Flickr-only tags to pull.")); return end
+  local image = panel_current.image
+  local added = 0
+  for _, name in ipairs(names) do
+    local tag = dt.tags.find and dt.tags.find(name) or nil
+    if not tag and dt.tags.create then tag = dt.tags.create(name) end
+    if tag then
+      if image.attach_tag then image:attach_tag(tag) else dt.tags.attach(tag, image) end
+      added = added + 1
+    end
+  end
+  panel_remote_label.label = string.format(_("Flickr: pulled %d tag(s) into darktable"), added)
+  dt.print(panel_remote_label.label)
+  -- Local keywords changed; recompute the diff against the same remote tags so
+  -- the panel reflects the new state without a remote round trip.
+  panel_reconcile.refresh(image, panel_reconcile.remote_tags)
 end
 
 local function publish_state_label(status, published_at, reasons)
@@ -6726,6 +7068,35 @@ local panel_widget = dt.new_widget("box") {
   dt.new_widget("button") {
     label = _("sync keywords"),
     clicked_callback = function() sync_panel_tags() end,
+  },
+  dt.new_widget("label") { label = _("tag reconciler") },
+  panel_reconcile.diff_label,
+  dt.new_widget("box") {
+    orientation = "horizontal",
+    dt.new_widget("button") {
+      label = _("add local-only to Flickr"),
+      tooltip = _("add darktable keywords that are not yet on Flickr, keeping existing Flickr tags"),
+      clicked_callback = function() panel_reconcile.add_local_only() end,
+    },
+    dt.new_widget("button") {
+      label = _("pull Flickr-only to darktable"),
+      tooltip = _("attach Flickr tags that are not yet local as darktable keywords"),
+      clicked_callback = function() panel_reconcile.pull_remote_only() end,
+    },
+  },
+  panel_reconcile.remove_widget,
+  dt.new_widget("box") {
+    orientation = "horizontal",
+    dt.new_widget("button") {
+      label = _("remove tag"),
+      tooltip = _("delete the chosen Flickr tag from this photo"),
+      clicked_callback = function() panel_reconcile.remove_selected() end,
+    },
+    dt.new_widget("button") {
+      label = _("replace Flickr tags from local"),
+      tooltip = _("replace ALL Flickr tags with the current local keyword set"),
+      clicked_callback = function() panel_reconcile.replace_from_local() end,
+    },
   },
   dt.new_widget("box") {
     orientation = "horizontal",
