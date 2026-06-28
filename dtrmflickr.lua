@@ -2362,6 +2362,267 @@ end
 return M
 end
 
+package.preload["dtrmflickr.rules"] = function(...)
+-- rules.lua — keyword, rating, and color-label driven upload controls.
+
+local dt = require "darktable"
+local metadata = require "dtrmflickr.metadata"
+local settings = require "dtrmflickr.settings"
+
+local M = {}
+
+local PLUGIN <const> = "dtrmflickr"
+local EMPTY_FILTER_PREF <const> = "<none>"
+local FLICKR_TAG_LIMIT <const> = 75
+
+local function _(msgid) return dt.gettext.gettext(msgid) end
+
+function M.split_filter_list(value)
+  local filters = {}
+  for item in tostring(value or ""):gmatch("[^,]+") do
+    item = item:match("^%s*(.-)%s*$")
+    if item ~= "" and item ~= EMPTY_FILTER_PREF then filters[#filters + 1] = item:lower() end
+  end
+  return filters
+end
+
+function M.read_keyword_rules(prefix, values)
+  local rules = {}
+  for _, item in ipairs(values) do
+    local filters = M.split_filter_list(dt.preferences.read(PLUGIN, prefix .. "_" .. item.key, "string"))
+    for _, filter in ipairs(filters) do
+      rules[#rules + 1] = { filter = filter, value = item }
+    end
+  end
+  return rules
+end
+
+function M.keyword_rule_matches(tag_names, rules)
+  local matches = {}
+  for _, rule in ipairs(rules or {}) do
+    for _, tag_name in ipairs(tag_names or {}) do
+      if metadata.tag_matches_filter(tag_name, rule.filter) then
+        matches[#matches + 1] = { value = rule.value, filter = rule.filter, tag = tag_name }
+        break
+      end
+    end
+  end
+  return matches
+end
+
+function M.keyword_rule_filters()
+  local filters = M.split_filter_list(dt.preferences.read(PLUGIN, "exclude_keyword_filters", "string"))
+  for _, filter in ipairs(M.split_filter_list(dt.preferences.read(PLUGIN, "skip_upload_keyword_filters", "string"))) do
+    filters[#filters + 1] = filter
+  end
+  local groups = {
+    { prefix = "keyword_privacy", values = settings.privacy_values },
+    { prefix = "keyword_safety", values = settings.safety_values },
+    { prefix = "keyword_content_type", values = settings.content_type_values },
+    { prefix = "keyword_license", values = settings.license_values },
+  }
+  for _, group in ipairs(groups) do
+    for _, rule in ipairs(M.read_keyword_rules(group.prefix, group.values)) do
+      filters[#filters + 1] = rule.filter
+    end
+  end
+  return filters
+end
+
+function M.first_matching_keyword_filter(tag_names, filters)
+  for _, filter in ipairs(filters or {}) do
+    for _, tag_name in ipairs(tag_names or {}) do
+      if metadata.tag_matches_filter(tag_name, filter) then
+        return filter, tag_name
+      end
+    end
+  end
+  return nil, nil
+end
+
+M.color_label_values = {
+  red = true, yellow = true, green = true, blue = true, purple = true,
+}
+
+function M.split_color_label_list(value)
+  local labels = {}
+  for item in tostring(value or ""):gmatch("[^,]+") do
+    item = item:match("^%s*(.-)%s*$"):lower()
+    if item ~= "" and item ~= EMPTY_FILTER_PREF and M.color_label_values[item] then
+      labels[#labels + 1] = item
+    end
+  end
+  return labels
+end
+
+function M.read_rating_threshold(pref_name)
+  local raw = dt.preferences.read(PLUGIN, pref_name, "string")
+  raw = tostring(raw or ""):match("^%s*(.-)%s*$")
+  if raw == "" then return nil end
+  local rating = tonumber(raw)
+  if not rating then return nil end
+  if rating < 0 then rating = 0 end
+  if rating > 5 then rating = 5 end
+  return math.floor(rating)
+end
+
+function M.image_rating(image)
+  local rating = tonumber(image and image.rating or nil)
+  if not rating then return 0 end
+  if rating < 0 then return -1 end
+  if rating > 5 then return 5 end
+  return math.floor(rating)
+end
+
+function M.first_matching_color_label(image, labels)
+  for _, label in ipairs(labels or {}) do
+    if image and image[label] == true then return label end
+  end
+  return nil
+end
+
+function M.should_skip_upload_by_rating(image)
+  local threshold = M.read_rating_threshold("skip_upload_min_rating")
+  if not threshold then return nil, nil end
+  local rating = M.image_rating(image)
+  if rating < threshold then return threshold, rating end
+  return nil, nil
+end
+
+function M.should_skip_upload_by_color_label(image)
+  return M.first_matching_color_label(image,
+    M.split_color_label_list(dt.preferences.read(PLUGIN, "skip_upload_color_labels", "string")))
+end
+
+function M.should_force_private_by_rating(image)
+  local threshold = M.read_rating_threshold("private_below_rating")
+  if not threshold then return nil, nil end
+  local rating = M.image_rating(image)
+  if rating < threshold then return threshold, rating end
+  return nil, nil
+end
+
+function M.should_force_private_by_color_label(image)
+  return M.first_matching_color_label(image,
+    M.split_color_label_list(dt.preferences.read(PLUGIN, "private_color_labels", "string")))
+end
+
+local privacy_restrictiveness = {
+  public = 1,
+  ["friends & family"] = 2,
+  friends = 3,
+  family = 3,
+  private = 4,
+}
+
+local function choose_keyword_match(kind, matches)
+  if #matches == 0 then return nil, nil end
+  local chosen = matches[1].value
+  if kind == "privacy" then
+    for i = 2, #matches do
+      local candidate = matches[i].value
+      if (privacy_restrictiveness[candidate.pref] or 0) > (privacy_restrictiveness[chosen.pref] or 0) then
+        chosen = candidate
+      end
+    end
+  elseif kind == "safety" then
+    for i = 2, #matches do
+      local candidate = matches[i].value
+      if (candidate.flickr_value or 0) > (chosen.flickr_value or 0) then
+        chosen = candidate
+      end
+    end
+  end
+
+  local seen = {}
+  local values = {}
+  local filters = {}
+  local tags = {}
+  local has_conflict = false
+  for _, match in ipairs(matches) do
+    local pref = tostring(match.value.pref or "")
+    if not seen[pref] then
+      seen[pref] = true
+      values[#values + 1] = pref
+      if pref ~= chosen.pref then has_conflict = true end
+    end
+    if match.filter and match.filter ~= "" then filters[match.filter] = true end
+    if match.tag and match.tag ~= "" then tags[match.tag] = true end
+  end
+  if #values < 2 or not has_conflict then return chosen, nil end
+
+  local filter_list = {}
+  for filter in pairs(filters) do filter_list[#filter_list + 1] = filter end
+  table.sort(filter_list)
+  local tag_list = {}
+  for tag in pairs(tags) do tag_list[#tag_list + 1] = tag end
+  table.sort(tag_list)
+
+  return chosen, {
+    kind = kind,
+    values = values,
+    used = chosen.pref,
+    filters = table.concat(filter_list, ", "),
+    tags = table.concat(tag_list, ", "),
+  }
+end
+
+function M.record_keyword_conflict(extra_data, conflict)
+  if not extra_data or not conflict then return end
+  extra_data.keyword_conflicts = extra_data.keyword_conflicts or {}
+  extra_data.keyword_conflict_seen = extra_data.keyword_conflict_seen or {}
+  local key = table.concat({ conflict.kind or "", conflict.used or "", conflict.filters or "", conflict.tags or "" }, "|")
+  if extra_data.keyword_conflict_seen[key] then return end
+  extra_data.keyword_conflict_seen[key] = true
+  extra_data.keyword_conflicts[#extra_data.keyword_conflicts + 1] = conflict
+  local msg = _("Flickr: keyword rule conflicts found; using safest/first matching rule")
+  if not extra_data.keyword_conflict_toast_shown then
+    if dt.print_toast then dt.print_toast(msg) else dt.print(msg) end
+    extra_data.keyword_conflict_toast_shown = true
+  end
+end
+
+function M.format_keyword_conflict(conflict)
+  local where = conflict.tags ~= "" and conflict.tags or conflict.filters
+  return string.format(_("Flickr keyword conflict: %s '%s' matched %s; used %s"),
+    conflict.kind or "rule", where or "?", table.concat(conflict.values or {}, ", "), conflict.used or "?")
+end
+
+function M.apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
+  local privacy_match, privacy_conflict = choose_keyword_match("privacy",
+    M.keyword_rule_matches(tag_names, M.read_keyword_rules("keyword_privacy", settings.privacy_values)))
+  local safety_match, safety_conflict = choose_keyword_match("safety",
+    M.keyword_rule_matches(tag_names, M.read_keyword_rules("keyword_safety", settings.safety_values)))
+  local content_type_match, content_type_conflict = choose_keyword_match("content type",
+    M.keyword_rule_matches(tag_names, M.read_keyword_rules("keyword_content_type", settings.content_type_values)))
+  local license_match, license_conflict = choose_keyword_match("license",
+    M.keyword_rule_matches(tag_names, M.read_keyword_rules("keyword_license", settings.license_values)))
+  local conflicts = {}
+  if privacy_conflict then conflicts[#conflicts + 1] = privacy_conflict end
+  if safety_conflict then conflicts[#conflicts + 1] = safety_conflict end
+  if content_type_conflict then conflicts[#conflicts + 1] = content_type_conflict end
+  if license_conflict then conflicts[#conflicts + 1] = license_conflict end
+  return
+    privacy_match or privacy,
+    safety_match or safety,
+    content_type_match or content_type,
+    license_match or license,
+    {
+      privacy = privacy_match ~= nil,
+      safety = safety_match ~= nil,
+      content_type = content_type_match ~= nil,
+      license = license_match ~= nil,
+    },
+    conflicts
+end
+
+function M.image_keyword_tags(image, tag_names)
+  return metadata.image_keyword_tags(image, M.keyword_rule_filters(), tag_names, { max_tags = FLICKR_TAG_LIMIT })
+end
+
+return M
+end
+
 package.preload["dtrmflickr.dtrmflickr"] = function(...)
 --[[ dtrmflickr — Flickr export/storage for darktable
 
@@ -2403,6 +2664,7 @@ local state = require "dtrmflickr.state"
 local metadata = require "dtrmflickr.metadata"
 local claim = require "dtrmflickr.claim"
 local settings = require "dtrmflickr.settings"
+local rules = require "dtrmflickr.rules"
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -2442,7 +2704,6 @@ local session_account = nil
 local EMPTY_FILTER_PREF <const> = "<none>"
 local FLICKR_TAG_LIMIT <const> = 75
 local clear_album_cache
-local image_keyword_tags
 local effective_metadata_fingerprints
 local store_metadata_fingerprints
 __dtrmflickr_queue = require("dtrmflickr.queue").new {
@@ -4286,7 +4547,7 @@ local function sync_panel_tags()
     return
   end
 
-  local tags, truncated_tags = image_keyword_tags(image)
+  local tags, truncated_tags = rules.image_keyword_tags(image)
   tags = tags or ""
   if truncated_tags and truncated_tags > 0 then
     dt.print(string.format(_("Flickr: selected image has more than %d publishable keywords; skipped %d extra tag(s)"),
@@ -4781,255 +5042,6 @@ local function initialize(storage, format, images, high_quality, extra_data)
   return nil
 end
 
-local function split_filter_list(value)
-  local filters = {}
-  for item in tostring(value or ""):gmatch("[^,]+") do
-    item = item:match("^%s*(.-)%s*$")
-    if item ~= "" and item ~= EMPTY_FILTER_PREF then filters[#filters + 1] = item:lower() end
-  end
-  return filters
-end
-
-local function read_keyword_rules(prefix, values)
-  local rules = {}
-  for _, item in ipairs(values) do
-    local filters = split_filter_list(dt.preferences.read(PLUGIN, prefix .. "_" .. item.key, "string"))
-    for _, filter in ipairs(filters) do
-      rules[#rules + 1] = { filter = filter, value = item }
-    end
-  end
-  return rules
-end
-
-local function keyword_rule_matches(tag_names, rules)
-  local matches = {}
-  for _, rule in ipairs(rules or {}) do
-    for _, tag_name in ipairs(tag_names or {}) do
-      if metadata.tag_matches_filter(tag_name, rule.filter) then
-        matches[#matches + 1] = { value = rule.value, filter = rule.filter, tag = tag_name }
-        break
-      end
-    end
-  end
-  return matches
-end
-
-local function first_keyword_rule_match(tag_names, rules)
-  local matches = keyword_rule_matches(tag_names, rules)
-  return matches[1] and matches[1].value or nil
-end
-
-local function keyword_rule_filters()
-  local filters = split_filter_list(dt.preferences.read(PLUGIN, "exclude_keyword_filters", "string"))
-  for _, filter in ipairs(split_filter_list(dt.preferences.read(PLUGIN, "skip_upload_keyword_filters", "string"))) do
-    filters[#filters + 1] = filter
-  end
-  local groups = {
-    { prefix = "keyword_privacy", values = settings.privacy_values },
-    { prefix = "keyword_safety", values = settings.safety_values },
-    { prefix = "keyword_content_type", values = settings.content_type_values },
-    { prefix = "keyword_license", values = settings.license_values },
-  }
-  for _, group in ipairs(groups) do
-    for _, rule in ipairs(read_keyword_rules(group.prefix, group.values)) do
-      filters[#filters + 1] = rule.filter
-    end
-  end
-  return filters
-end
-
-local function first_matching_keyword_filter(tag_names, filters)
-  for _, filter in ipairs(filters or {}) do
-    for _, tag_name in ipairs(tag_names or {}) do
-      if metadata.tag_matches_filter(tag_name, filter) then
-        return filter, tag_name
-      end
-    end
-  end
-  return nil, nil
-end
-
-local rating_color_rules = {}
-rating_color_rules.color_label_values = {
-  red = true, yellow = true, green = true, blue = true, purple = true,
-}
-
-function rating_color_rules.split_color_label_list(value)
-  local labels = {}
-  for item in tostring(value or ""):gmatch("[^,]+") do
-    item = item:match("^%s*(.-)%s*$"):lower()
-    if item ~= "" and item ~= EMPTY_FILTER_PREF and rating_color_rules.color_label_values[item] then
-      labels[#labels + 1] = item
-    end
-  end
-  return labels
-end
-
-function rating_color_rules.read_rating_threshold(pref_name)
-  local raw = dt.preferences.read(PLUGIN, pref_name, "string")
-  raw = tostring(raw or ""):match("^%s*(.-)%s*$")
-  if raw == "" then return nil end
-  local rating = tonumber(raw)
-  if not rating then return nil end
-  if rating < 0 then rating = 0 end
-  if rating > 5 then rating = 5 end
-  return math.floor(rating)
-end
-
-function rating_color_rules.image_rating(image)
-  local rating = tonumber(image and image.rating or nil)
-  if not rating then return 0 end
-  if rating < 0 then return -1 end
-  if rating > 5 then return 5 end
-  return math.floor(rating)
-end
-
-function rating_color_rules.first_matching_color_label(image, labels)
-  for _, label in ipairs(labels or {}) do
-    if image and image[label] == true then return label end
-  end
-  return nil
-end
-
-function rating_color_rules.should_skip_upload_by_rating(image)
-  local threshold = rating_color_rules.read_rating_threshold("skip_upload_min_rating")
-  if not threshold then return nil, nil end
-  local rating = rating_color_rules.image_rating(image)
-  if rating < threshold then return threshold, rating end
-  return nil, nil
-end
-
-function rating_color_rules.should_skip_upload_by_color_label(image)
-  return rating_color_rules.first_matching_color_label(image,
-    rating_color_rules.split_color_label_list(dt.preferences.read(PLUGIN, "skip_upload_color_labels", "string")))
-end
-
-function rating_color_rules.should_force_private_by_rating(image)
-  local threshold = rating_color_rules.read_rating_threshold("private_below_rating")
-  if not threshold then return nil, nil end
-  local rating = rating_color_rules.image_rating(image)
-  if rating < threshold then return threshold, rating end
-  return nil, nil
-end
-
-function rating_color_rules.should_force_private_by_color_label(image)
-  return rating_color_rules.first_matching_color_label(image,
-    rating_color_rules.split_color_label_list(dt.preferences.read(PLUGIN, "private_color_labels", "string")))
-end
-
-local privacy_restrictiveness = {
-  public = 1,
-  ["friends & family"] = 2,
-  friends = 3,
-  family = 3,
-  private = 4,
-}
-
-local function choose_keyword_match(kind, matches)
-  if #matches == 0 then return nil, nil end
-  local chosen = matches[1].value
-  if kind == "privacy" then
-    for i = 2, #matches do
-      local candidate = matches[i].value
-      if (privacy_restrictiveness[candidate.pref] or 0) > (privacy_restrictiveness[chosen.pref] or 0) then
-        chosen = candidate
-      end
-    end
-  elseif kind == "safety" then
-    for i = 2, #matches do
-      local candidate = matches[i].value
-      if (candidate.flickr_value or 0) > (chosen.flickr_value or 0) then
-        chosen = candidate
-      end
-    end
-  end
-
-  local seen = {}
-  local values = {}
-  local filters = {}
-  local tags = {}
-  local has_conflict = false
-  for _, match in ipairs(matches) do
-    local pref = tostring(match.value.pref or "")
-    if not seen[pref] then
-      seen[pref] = true
-      values[#values + 1] = pref
-      if pref ~= chosen.pref then has_conflict = true end
-    end
-    if match.filter and match.filter ~= "" then filters[match.filter] = true end
-    if match.tag and match.tag ~= "" then tags[match.tag] = true end
-  end
-  if #values < 2 or not has_conflict then return chosen, nil end
-
-  local filter_list = {}
-  for filter in pairs(filters) do filter_list[#filter_list + 1] = filter end
-  table.sort(filter_list)
-  local tag_list = {}
-  for tag in pairs(tags) do tag_list[#tag_list + 1] = tag end
-  table.sort(tag_list)
-
-  return chosen, {
-    kind = kind,
-    values = values,
-    used = chosen.pref,
-    filters = table.concat(filter_list, ", "),
-    tags = table.concat(tag_list, ", "),
-  }
-end
-
-local function record_keyword_conflict(extra_data, conflict)
-  if not extra_data or not conflict then return end
-  extra_data.keyword_conflicts = extra_data.keyword_conflicts or {}
-  extra_data.keyword_conflict_seen = extra_data.keyword_conflict_seen or {}
-  local key = table.concat({ conflict.kind or "", conflict.used or "", conflict.filters or "", conflict.tags or "" }, "|")
-  if extra_data.keyword_conflict_seen[key] then return end
-  extra_data.keyword_conflict_seen[key] = true
-  extra_data.keyword_conflicts[#extra_data.keyword_conflicts + 1] = conflict
-  local msg = _("Flickr: keyword rule conflicts found; using safest/first matching rule")
-  if not extra_data.keyword_conflict_toast_shown then
-    if dt.print_toast then dt.print_toast(msg) else dt.print(msg) end
-    extra_data.keyword_conflict_toast_shown = true
-  end
-end
-
-local function format_keyword_conflict(conflict)
-  local where = conflict.tags ~= "" and conflict.tags or conflict.filters
-  return string.format(_("Flickr keyword conflict: %s '%s' matched %s; used %s"),
-    conflict.kind or "rule", where or "?", table.concat(conflict.values or {}, ", "), conflict.used or "?")
-end
-
-local function apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
-  local privacy_match, privacy_conflict = choose_keyword_match("privacy",
-    keyword_rule_matches(tag_names, read_keyword_rules("keyword_privacy", settings.privacy_values)))
-  local safety_match, safety_conflict = choose_keyword_match("safety",
-    keyword_rule_matches(tag_names, read_keyword_rules("keyword_safety", settings.safety_values)))
-  local content_type_match, content_type_conflict = choose_keyword_match("content type",
-    keyword_rule_matches(tag_names, read_keyword_rules("keyword_content_type", settings.content_type_values)))
-  local license_match, license_conflict = choose_keyword_match("license",
-    keyword_rule_matches(tag_names, read_keyword_rules("keyword_license", settings.license_values)))
-  local conflicts = {}
-  if privacy_conflict then conflicts[#conflicts + 1] = privacy_conflict end
-  if safety_conflict then conflicts[#conflicts + 1] = safety_conflict end
-  if content_type_conflict then conflicts[#conflicts + 1] = content_type_conflict end
-  if license_conflict then conflicts[#conflicts + 1] = license_conflict end
-  return
-    privacy_match or privacy,
-    safety_match or safety,
-    content_type_match or content_type,
-    license_match or license,
-    {
-      privacy = privacy_match ~= nil,
-      safety = safety_match ~= nil,
-      content_type = content_type_match ~= nil,
-      license = license_match ~= nil,
-    },
-    conflicts
-end
-
-function image_keyword_tags(image, tag_names)
-  return metadata.image_keyword_tags(image, keyword_rule_filters(), tag_names, { max_tags = FLICKR_TAG_LIMIT })
-end
-
 function effective_metadata_fingerprints(image, sync, opts)
   opts = opts or {}
   sync = sync or master_sync_fields()
@@ -5041,15 +5053,15 @@ function effective_metadata_fingerprints(image, sync, opts)
   local tag_names = opts.tag_names or metadata.image_tag_names(image)
   local forced = opts.forced or {}
   if not opts.skip_keyword_overrides then
-    privacy, safety, content_type, license, forced = apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
-    local private_rating_threshold = rating_color_rules.should_force_private_by_rating(image)
-    local private_label = rating_color_rules.should_force_private_by_color_label(image)
+    privacy, safety, content_type, license, forced = rules.apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
+    local private_rating_threshold = rules.should_force_private_by_rating(image)
+    local private_label = rules.should_force_private_by_color_label(image)
     if private_rating_threshold or private_label then
       privacy = settings.privacy_values[1]
       forced.privacy = true
     end
   end
-  local tags = sync.tags and (opts.tags ~= nil and opts.tags or image_keyword_tags(image, tag_names)) or nil
+  local tags = sync.tags and (opts.tags ~= nil and opts.tags or rules.image_keyword_tags(image, tag_names)) or nil
   local lat, lon = nil, nil
   if sync.gps then lat, lon = metadata.image_location(image) end
   return metadata.fingerprints_from_values({
@@ -5081,8 +5093,8 @@ function store_metadata_fingerprints(image, account_nsid, fingerprints, fields)
 end
 
 local function should_skip_upload_by_keyword(tag_names)
-  return first_matching_keyword_filter(tag_names,
-    split_filter_list(dt.preferences.read(PLUGIN, "skip_upload_keyword_filters", "string")))
+  return rules.first_matching_keyword_filter(tag_names,
+    rules.split_filter_list(dt.preferences.read(PLUGIN, "skip_upload_keyword_filters", "string")))
 end
 
 local function record_tag_limit_warning(extra_data, image, truncated_count)
@@ -5145,7 +5157,7 @@ local function store(storage, image, format, filename, number, total, high_quali
       tostring(filename), tostring(skip_tag or ""), tostring(skip_filter or "")))
     return
   end
-  local skip_rating_threshold, skip_rating = rating_color_rules.should_skip_upload_by_rating(image)
+  local skip_rating_threshold, skip_rating = rules.should_skip_upload_by_rating(image)
   if skip_rating_threshold then
     extra_data.skipped = extra_data.skipped or {}
     extra_data.skipped[#extra_data.skipped + 1] = {
@@ -5161,7 +5173,7 @@ local function store(storage, image, format, filename, number, total, high_quali
       tostring(filename), tostring(skip_rating), tostring(skip_rating_threshold)))
     return
   end
-  local skip_label = rating_color_rules.should_skip_upload_by_color_label(image)
+  local skip_label = rules.should_skip_upload_by_color_label(image)
   if skip_label then
     extra_data.skipped = extra_data.skipped or {}
     extra_data.skipped[#extra_data.skipped + 1] = {
@@ -5177,10 +5189,10 @@ local function store(storage, image, format, filename, number, total, high_quali
     return
   end
   local forced, conflicts
-  privacy, safety, content_type, license, forced, conflicts = apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
-  for _, conflict in ipairs(conflicts or {}) do record_keyword_conflict(extra_data, conflict) end
-  local private_rating_threshold, private_rating = rating_color_rules.should_force_private_by_rating(image)
-  local private_label = rating_color_rules.should_force_private_by_color_label(image)
+  privacy, safety, content_type, license, forced, conflicts = rules.apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
+  for _, conflict in ipairs(conflicts or {}) do rules.record_keyword_conflict(extra_data, conflict) end
+  local private_rating_threshold, private_rating = rules.should_force_private_by_rating(image)
+  local private_label = rules.should_force_private_by_color_label(image)
   if private_rating_threshold or private_label then
     privacy = settings.privacy_values[1]
     forced.privacy = true
@@ -5195,7 +5207,7 @@ local function store(storage, image, format, filename, number, total, high_quali
   end
   local tags, truncated_tags = nil, 0
   if sync.tags then
-    tags, truncated_tags = image_keyword_tags(image)
+    tags, truncated_tags = rules.image_keyword_tags(image)
     record_tag_limit_warning(extra_data, image, truncated_tags)
   end
   dt.print(string.format(_("Flickr: uploading %d/%d — %s"), number, total, image.filename or "?"))
@@ -5360,7 +5372,7 @@ local function finalize(storage, image_table, extra_data)
   end
 
   for _, conflict in ipairs(extra_data.keyword_conflicts or {}) do
-    dt.print(format_keyword_conflict(conflict))
+    dt.print(rules.format_keyword_conflict(conflict))
   end
 
   dt.print(string.format(_("Flickr: finished — %d uploaded, %d skipped, %d failed, %d post-upload error(s), %d album error(s), %d total"),
@@ -5417,15 +5429,15 @@ script_data.__test = {
   current_content_type = current_content_type,
   current_license = current_license,
   image_tag_names = metadata.image_tag_names,
-  apply_keyword_overrides = apply_keyword_overrides,
-  format_keyword_conflict = format_keyword_conflict,
-  read_rating_threshold = rating_color_rules.read_rating_threshold,
-  split_color_label_list = rating_color_rules.split_color_label_list,
-  should_skip_upload_by_rating = rating_color_rules.should_skip_upload_by_rating,
-  should_skip_upload_by_color_label = rating_color_rules.should_skip_upload_by_color_label,
-  should_force_private_by_rating = rating_color_rules.should_force_private_by_rating,
-  should_force_private_by_color_label = rating_color_rules.should_force_private_by_color_label,
-  image_keyword_tags = image_keyword_tags,
+  apply_keyword_overrides = rules.apply_keyword_overrides,
+  format_keyword_conflict = rules.format_keyword_conflict,
+  read_rating_threshold = rules.read_rating_threshold,
+  split_color_label_list = rules.split_color_label_list,
+  should_skip_upload_by_rating = rules.should_skip_upload_by_rating,
+  should_skip_upload_by_color_label = rules.should_skip_upload_by_color_label,
+  should_force_private_by_rating = rules.should_force_private_by_rating,
+  should_force_private_by_color_label = rules.should_force_private_by_color_label,
+  image_keyword_tags = rules.image_keyword_tags,
   effective_metadata_fingerprints = effective_metadata_fingerprints,
   image_date_taken = metadata.image_date_taken,
   image_location = metadata.image_location,
