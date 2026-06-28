@@ -1350,7 +1350,7 @@ end
 
 local function flickr_quote_tag(tag)
   tag = tostring(tag or "")
-  if tag:find("[%s\"\\]") then return '"' .. tag:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"' end
+  if tag:find("%s") then return '"' .. tag .. '"' end
   return tag
 end
 
@@ -1358,6 +1358,7 @@ local function publish_tag_name(name)
   name = tostring(name or ""):match("^%s*(.-)%s*$")
   local leaf = name:match("([^|]+)$")
   leaf = leaf and leaf:match("^%s*(.-)%s*$") or name
+  leaf = leaf:gsub('"', ""):match("^%s*(.-)%s*$")
   return leaf ~= "" and leaf or nil
 end
 
