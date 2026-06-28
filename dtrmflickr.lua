@@ -2165,15 +2165,32 @@ end
 local Queue = {}
 Queue.__index = Queue
 
+local function copy_list(list)
+  local out = {}
+  for i, item in ipairs(list or {}) do
+    if type(item) == "table" then
+      local copied = {}
+      for k, v in pairs(item) do copied[k] = v end
+      out[i] = copied
+    else
+      out[i] = item
+    end
+  end
+  return out
+end
+
 function M.new(opts)
   opts = opts or {}
   return setmetatable({
     pending = {},
     running = false,
     last_started = {},
+    recent = {},
+    sequence = 0,
     now_ms = opts.now_ms or monotonic_ms,
     sleep_ms = opts.sleep_ms,
     on_wait = opts.on_wait,
+    on_event = opts.on_event,
     default_pace_ms = opts.default_pace_ms or 0,
     method_pace_ms = opts.method_pace_ms or {},
     default_max_attempts = opts.default_max_attempts or 1,
@@ -2181,11 +2198,43 @@ function M.new(opts)
     retry_max_ms = opts.retry_max_ms or 0,
     rate_limit_base_ms = opts.rate_limit_base_ms,
     retryable = opts.retryable or default_retryable,
+    recent_limit = math.max(0, tonumber(opts.recent_limit) or 25),
     stats = {
       enqueued = 0, started = 0, succeeded = 0, coalesced = 0, stale = 0,
       failed = 0, retried = 0, rate_limited = 0, waited_ms = 0,
     },
   }, Queue)
+end
+
+function Queue:emit(event, job, fields)
+  local cb = (job and job.on_event) or self.on_event
+  if not cb then return end
+  local payload = {
+    event = event,
+    id = job and job.id or nil,
+    method = job and job.method or nil,
+    label = job and job.label or nil,
+    pending = #self.pending,
+    running = self.running,
+  }
+  for k, v in pairs(fields or {}) do payload[k] = v end
+  pcall(cb, payload)
+end
+
+function Queue:record(job, status, fields)
+  if self.recent_limit <= 0 then return end
+  local entry = {
+    id = job.id,
+    method = job.method,
+    label = job.label,
+    status = status,
+    attempts = fields and fields.attempts or nil,
+    error = fields and fields.error or nil,
+    waited_ms = fields and fields.waited_ms or nil,
+    finished_ms = self.now_ms(),
+  }
+  self.recent[#self.recent + 1] = entry
+  while #self.recent > self.recent_limit do table.remove(self.recent, 1) end
 end
 
 function Queue:pace_for(method, opts)
@@ -2196,9 +2245,12 @@ end
 function Queue:enqueue(method, fn, opts)
   assert(type(fn) == "function", "queue job must be a function")
   opts = opts or {}
+  self.sequence = self.sequence + 1
   local job = {
+    id = self.sequence,
     method = tostring(method or "flickr.unknown"),
     fn = fn,
+    label = opts.label,
     coalesce_key = opts.coalesce_key,
     stale = opts.stale,
     pace_ms = self:pace_for(method, opts),
@@ -2209,7 +2261,10 @@ function Queue:enqueue(method, fn, opts)
     retryable = opts.retryable or self.retryable,
     jitter_ms = opts.jitter_ms,
     on_wait = opts.on_wait or self.on_wait,
+    on_event = opts.on_event or self.on_event,
+    waited_ms = 0,
   }
+  self.stats.enqueued = self.stats.enqueued + 1
 
   if job.coalesce_key then
     for i, pending in ipairs(self.pending) do
@@ -2218,13 +2273,14 @@ function Queue:enqueue(method, fn, opts)
         job.replaced_jobs[#job.replaced_jobs + 1] = pending
         self.pending[i] = job
         self.stats.coalesced = self.stats.coalesced + 1
+        self:emit("coalesced", job, { replaced_id = pending.id })
         return job
       end
     end
   end
 
   self.pending[#self.pending + 1] = job
-  self.stats.enqueued = self.stats.enqueued + 1
+  self:emit("enqueued", job)
   return job
 end
 
@@ -2232,6 +2288,7 @@ function Queue:wait(job, ms, why, attempt)
   ms = math.floor(tonumber(ms) or 0)
   if ms <= 0 then return end
   self.stats.waited_ms = self.stats.waited_ms + ms
+  if job then job.waited_ms = (job.waited_ms or 0) + ms end
   if job and job.on_wait then job.on_wait(ms, why, job.method, attempt) end
   sleep_ms(self.sleep_ms, ms)
 end
@@ -2239,6 +2296,7 @@ end
 function Queue:run_job(job)
   local attempt = 1
   while true do
+    self:emit("started", job, { attempt = attempt })
     local now = self.now_ms()
     local last = self.last_started[job.method]
     if last and job.pace_ms > 0 then
@@ -2253,6 +2311,8 @@ function Queue:run_job(job)
       table.remove(result, 1)
       if result[1] ~= nil then
         self.stats.succeeded = self.stats.succeeded + 1
+        self:record(job, "succeeded", { attempts = attempt, waited_ms = job.waited_ms })
+        self:emit("succeeded", job, { attempt = attempt })
         return result
       end
     end
@@ -2265,10 +2325,13 @@ function Queue:run_job(job)
     if retry then
       self.stats.retried = self.stats.retried + 1
       if reason == "rate-limit" then self.stats.rate_limited = self.stats.rate_limited + 1 end
+      self:emit("retry", job, { attempt = attempt, reason = reason, error = err })
       self:wait(job, backoff_delay_ms(job, attempt, reason), reason or "retry", attempt)
       attempt = attempt + 1
     else
       self.stats.failed = self.stats.failed + 1
+      self:record(job, "failed", { attempts = attempt, error = err, waited_ms = job.waited_ms })
+      self:emit("failed", job, { attempt = attempt, error = err })
       return { nil, err }
     end
   end
@@ -2282,6 +2345,8 @@ function Queue:drain()
     if job.stale and job.stale() then
       self.stats.stale = self.stats.stale + 1
       job.result = { nil, "stale Flickr queue job" }
+      self:record(job, "stale", { attempts = 0, error = job.result[2], waited_ms = job.waited_ms })
+      self:emit("stale", job, { error = job.result[2] })
     else
       job.result = self:run_job(job)
     end
@@ -2304,6 +2369,18 @@ end
 
 function Queue:pending_count()
   return #self.pending
+end
+
+function Queue:recent_results()
+  return copy_list(self.recent)
+end
+
+function Queue:summary()
+  local copy = {}
+  for k, v in pairs(self.stats) do copy[k] = v end
+  copy.pending = #self.pending
+  copy.running = self.running
+  return copy
 end
 
 return M
@@ -2756,6 +2833,7 @@ local FLICKR_TAG_LIMIT <const> = 75
 local clear_album_cache
 local effective_metadata_fingerprints
 local store_metadata_fingerprints
+local panel_sets
 __dtrmflickr_queue = require("dtrmflickr.queue").new {
   sleep_ms = function(ms)
     if dt.control and dt.control.sleep then dt.control.sleep(ms / 1000) end
@@ -2782,7 +2860,9 @@ __dtrmflickr_queue = require("dtrmflickr.queue").new {
 }
 
 function __dtrmflickr_call(method, fn, opts)
-  return __dtrmflickr_queue:call(method, fn, opts)
+  local results = table.pack(__dtrmflickr_queue:call(method, fn, opts))
+  if panel_sets and panel_sets.refresh_queue_status then panel_sets.refresh_queue_status() end
+  return table.unpack(results, 1, results.n)
 end
 
 local function keep_label_pref(widget)
@@ -3664,9 +3744,10 @@ local panel_file_label = dt.new_widget("label") { label = "" }
 local panel_account_label = dt.new_widget("label") { label = "" }
 local panel_photo_label = dt.new_widget("label") { label = "" }
 local panel_sets_label = dt.new_widget("label") { label = "" }
-local panel_sets = { filtering = false, current_ids = {} }
+panel_sets = { filtering = false, current_ids = {} }
 panel_sets.status_label = dt.new_widget("label") { label = "" }
 panel_sets.publish_label = dt.new_widget("label") { label = "" }
+panel_sets.queue_label = dt.new_widget("label") { label = "" }
 local panel_remote_label = dt.new_widget("label") { label = "" }
 local panel_tags_label = dt.new_widget("label") { label = "" }
 panel_sets.current_widget = dt.new_widget("combobox") {
@@ -3758,6 +3839,17 @@ end
 local function join_values(values)
   if not values or #values == 0 then return "" end
   return table.concat(values, ", ")
+end
+
+function panel_sets.refresh_queue_status()
+  local summary = __dtrmflickr_queue and __dtrmflickr_queue:summary() or nil
+  if not summary then
+    panel_sets.queue_label.label = ""
+    return
+  end
+  panel_sets.queue_label.label = string.format(
+    _("queue: %d ok, %d failed, %d retried, %d pending"),
+    summary.succeeded or 0, summary.failed or 0, summary.retried or 0, summary.pending or 0)
 end
 
 function panel_sets.clear_choices()
@@ -4855,6 +4947,7 @@ panel_sets.set_link_button = dt.new_widget("button") {
   label = _("set link"),
   clicked_callback = function() set_panel_photo_id_link() end,
 }
+panel_sets.refresh_queue_status()
 
 local panel_widget = dt.new_widget("box") {
   orientation = "vertical",
@@ -4863,6 +4956,7 @@ local panel_widget = dt.new_widget("box") {
   panel_account_label,
   panel_photo_label,
   panel_sets.publish_label,
+  panel_sets.queue_label,
   panel_sets_label,
   dt.new_widget("label") { label = _("albums") },
   dt.new_widget("box") {
