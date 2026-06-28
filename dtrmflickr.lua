@@ -4551,13 +4551,17 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   panel_content_type_widget.selected = content_type_index or 0
   local perms_unavailable = false
   if acc then
-    local perms_body = __dtrmflickr_call("flickr.photos.getPerms", function()
+    local perms_body, perms_err = __dtrmflickr_call("flickr.photos.getPerms", function()
       return rest.photos_get_perms(api_key, api_secret, acc, photo_id)
     end, { coalesce_key = "panel-refresh-perms:" .. tostring(photo_id) })
     if perms_body then
       panel_comment_perm_widget.selected = panel_permission_index_from_id(remote_attr(perms_body, "permcomment")) or 0
       panel_addmeta_perm_widget.selected = panel_permission_index_from_id(remote_attr(perms_body, "permaddmeta")) or 0
     else
+      -- Capture and log the reason so a real perms failure is diagnosable,
+      -- matching the getInfo/search read sites; the controls still disable.
+      dt.print_log("[dtrmflickr] getPerms unavailable for photo " ..
+        tostring(photo_id) .. ": " .. tostring(perms_err))
       panel_comment_perm_widget.selected = 0
       panel_addmeta_perm_widget.selected = 0
       perms_unavailable = true
