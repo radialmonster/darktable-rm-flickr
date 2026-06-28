@@ -2374,8 +2374,21 @@ function Queue:run_job(job)
   end
 end
 
+-- A `stale`/`done` callback is user/UI code (it reaches into darktable widgets),
+-- so it can raise. Never let one of those throws abort the batch or — worse —
+-- leave the queue wedged with running=true. Run them under pcall.
+local function safe_call(fn, ...)
+  if not fn then return end
+  pcall(fn, ...)
+end
+
 function Queue:finish_job(job)
-  if job.stale and job.stale() then
+  local is_stale = false
+  if job.stale then
+    local ok, res = pcall(job.stale)
+    is_stale = ok and res and true or false
+  end
+  if is_stale then
     self.stats.stale = self.stats.stale + 1
     job.result = table.pack(nil, "stale Flickr queue job")
     self:record(job, "stale", { attempts = 0, error = job.result[2], waited_ms = job.waited_ms })
@@ -2385,20 +2398,25 @@ function Queue:finish_job(job)
   end
   for _, replaced in ipairs(job.replaced_jobs or {}) do
     replaced.result = job.result
-    if replaced.done then replaced.done(unpack_result(replaced.result)) end
+    safe_call(replaced.done, unpack_result(replaced.result))
   end
-  if job.done then job.done(unpack_result(job.result)) end
+  safe_call(job.done, unpack_result(job.result))
   return job.result
 end
 
 function Queue:drain()
   if self.running then return end
   self.running = true
-  while #self.pending > 0 do
-    local job = table.remove(self.pending, 1)
-    self:finish_job(job)
-  end
+  -- Guarantee running is cleared even if a job somehow raises past run_job's
+  -- pcall, so a single failure can never permanently wedge the scheduler.
+  local ok, err = pcall(function()
+    while #self.pending > 0 do
+      local job = table.remove(self.pending, 1)
+      self:finish_job(job)
+    end
+  end)
   self.running = false
+  if not ok then error(err) end
 end
 
 function Queue:call(method, fn, opts)
@@ -2891,7 +2909,12 @@ local store_metadata_fingerprints
 local panel_sets
 __dtrmflickr_queue = require("dtrmflickr.queue").new {
   sleep_ms = function(ms)
-    if dt.control and dt.control.sleep then dt.control.sleep(ms / 1000) end
+    -- dt.control.sleep takes an int delay in MILLISECONDS (see
+    -- docs/lua-api-manual/darktable/darktable.control.md). The queue already
+    -- hands us milliseconds, so pass them straight through — do NOT divide by
+    -- 1000 (that turned a 5000 ms rate-limit backoff into a 5 ms no-op and
+    -- defeated pacing/retry/throttle waits entirely).
+    if dt.control and dt.control.sleep then dt.control.sleep(math.floor(tonumber(ms) or 0)) end
   end,
   on_wait = function(ms, why, method, attempt)
     if why == "rate-limit" then
