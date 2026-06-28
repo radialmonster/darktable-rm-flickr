@@ -61,6 +61,7 @@ The Export `Flickr` section controls the current export. The lighttable `Flickr`
 - Supports Flickr privacy, safety, content type, license, commenting, and tag/notes/people permissions
 - Sends title, description, keywords, date taken, and GPS when enabled
 - Skips darktable keywords marked private when publishing Flickr tags
+- Can skip uploads entirely when configured darktable keyword filters match
 - Adds photos to an existing Flickr album or creates a new one
 - Adds a lighttable `Flickr` panel for selected published photos
 - Can sync title/description and selected Flickr settings without re-exporting

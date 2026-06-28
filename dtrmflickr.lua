@@ -1748,7 +1748,7 @@ local function register_keyword_rule_preferences_reverse(prefix, label, values)
 end
 
 local keyword_rules_help_widget = dt.new_widget("label") {
-  label = _("enter one keyword, or comma-separated keywords\nconflicts are shown during export\nprivacy/safety use the safest match\ncontent/license use the first match"),
+  label = _("enter one keyword, or comma-separated keywords\nskip-upload keywords leave matching images local\nconflicts are shown during export\nprivacy/safety use the safest match\ncontent/license use the first match"),
 }
 
 local settings_help_widget = dt.new_widget("label") {
@@ -2129,6 +2129,8 @@ register_keyword_rule_preferences_reverse("keyword_license", _("license"), licen
 register_keyword_rule_preferences_reverse("keyword_content_type", _("content type"), content_type_values)
 register_keyword_rule_preferences_reverse("keyword_safety", _("safety"), safety_values)
 register_keyword_rule_preferences_reverse("keyword_privacy", _("privacy"), privacy_values)
+dt.preferences.register(PLUGIN, "skip_upload_keyword_filters", "string",
+  _("Flickr: skip-upload keywords"), _("enter one keyword or comma-separated keywords; matching images are not uploaded to Flickr"), EMPTY_FILTER_PREF)
 dt.preferences.register(PLUGIN, "exclude_keyword_filters", "string",
   _("Flickr: never-sync keywords"), _("enter one keyword or comma-separated keywords; matching photo keywords are not sent to Flickr"), EMPTY_FILTER_PREF)
 dt.preferences.register(PLUGIN, "keyword_rules_help", "lua",
@@ -3796,6 +3798,7 @@ end
 local function initialize(storage, format, images, high_quality, extra_data)
   extra_data.uploaded = {}
   extra_data.failed   = {}
+  extra_data.skipped  = {}
   extra_data.account  = load_token()
   extra_data.api_key, extra_data.api_secret = get_credentials()
   extra_data.privacy = current_privacy()
@@ -3864,6 +3867,9 @@ end
 
 local function keyword_rule_filters()
   local filters = split_filter_list(dt.preferences.read(PLUGIN, "exclude_keyword_filters", "string"))
+  for _, filter in ipairs(split_filter_list(dt.preferences.read(PLUGIN, "skip_upload_keyword_filters", "string"))) do
+    filters[#filters + 1] = filter
+  end
   local groups = {
     { prefix = "keyword_privacy", values = privacy_values },
     { prefix = "keyword_safety", values = safety_values },
@@ -3876,6 +3882,17 @@ local function keyword_rule_filters()
     end
   end
   return filters
+end
+
+local function first_matching_keyword_filter(tag_names, filters)
+  for _, filter in ipairs(filters or {}) do
+    for _, tag_name in ipairs(tag_names or {}) do
+      if metadata.tag_matches_filter(tag_name, filter) then
+        return filter, tag_name
+      end
+    end
+  end
+  return nil, nil
 end
 
 local privacy_restrictiveness = {
@@ -3991,6 +4008,11 @@ local function image_keyword_tags(image, tag_names)
   return metadata.image_keyword_tags(image, keyword_rule_filters(), tag_names, { max_tags = FLICKR_TAG_LIMIT })
 end
 
+local function should_skip_upload_by_keyword(tag_names)
+  return first_matching_keyword_filter(tag_names,
+    split_filter_list(dt.preferences.read(PLUGIN, "skip_upload_keyword_filters", "string")))
+end
+
 local function record_tag_limit_warning(extra_data, image, truncated_count)
   if not extra_data or not truncated_count or truncated_count <= 0 then return end
   extra_data.tag_limit_warnings = extra_data.tag_limit_warnings or {}
@@ -4036,6 +4058,21 @@ local function store(storage, image, format, filename, number, total, high_quali
   local permissions = extra_data.permissions or current_permissions()
   local sync = extra_data.sync or current_sync_fields()
   local tag_names = metadata.image_tag_names(image)
+  local skip_filter, skip_tag = should_skip_upload_by_keyword(tag_names)
+  if skip_filter then
+    extra_data.skipped = extra_data.skipped or {}
+    extra_data.skipped[#extra_data.skipped + 1] = {
+      image = image,
+      filename = filename,
+      filter = skip_filter,
+      tag = skip_tag,
+    }
+    dt.print(string.format(_("Flickr: skipped %s because keyword '%s' matched skip-upload rule '%s'"),
+      image and image.filename or "image", tostring(skip_tag or ""), tostring(skip_filter or "")))
+    dt.print_log(string.format("[dtrmflickr] store: skipped by keyword file='%s' tag='%s' filter='%s'",
+      tostring(filename), tostring(skip_tag or ""), tostring(skip_filter or "")))
+    return
+  end
   local forced, conflicts
   privacy, safety, content_type, license, forced, conflicts = apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
   for _, conflict in ipairs(conflicts or {}) do record_keyword_conflict(extra_data, conflict) end
@@ -4096,6 +4133,7 @@ local function finalize(storage, image_table, extra_data)
   for _img in pairs(image_table) do total = total + 1 end
   local uploaded = #(extra_data.uploaded or {})
   local failed = #(extra_data.failed or {})
+  local skipped = #(extra_data.skipped or {})
   local post_errors = #(extra_data.post_errors or {})
   local keyword_conflicts = #(extra_data.keyword_conflicts or {})
   local tag_limit_warnings = #(extra_data.tag_limit_warnings or {})
@@ -4153,8 +4191,8 @@ local function finalize(storage, image_table, extra_data)
     dt.print(format_keyword_conflict(conflict))
   end
 
-  dt.print(string.format(_("Flickr: finished — %d uploaded, %d failed, %d post-upload error(s), %d album error(s), %d total"),
-    uploaded, failed, post_errors, album_errors, total))
+  dt.print(string.format(_("Flickr: finished — %d uploaded, %d skipped, %d failed, %d post-upload error(s), %d album error(s), %d total"),
+    uploaded, skipped, failed, post_errors, album_errors, total))
   if keyword_conflicts > 0 then
     dt.print(string.format(_("Flickr: %d keyword rule conflict(s); see messages above"), keyword_conflicts))
   end
@@ -4162,8 +4200,8 @@ local function finalize(storage, image_table, extra_data)
     dt.print(string.format(_("Flickr: %d image(s) had keywords truncated to Flickr's %d-tag limit"),
       tag_limit_warnings, FLICKR_TAG_LIMIT))
   end
-  dt.print_log(string.format("[dtrmflickr] finalize: uploaded=%d failed=%d post_errors=%d album_errors=%d keyword_conflicts=%d tag_limit_warnings=%d total=%d",
-    uploaded, failed, post_errors, album_errors, keyword_conflicts, tag_limit_warnings, total))
+  dt.print_log(string.format("[dtrmflickr] finalize: uploaded=%d skipped=%d failed=%d post_errors=%d album_errors=%d keyword_conflicts=%d tag_limit_warnings=%d total=%d",
+    uploaded, skipped, failed, post_errors, album_errors, keyword_conflicts, tag_limit_warnings, total))
 end
 
 ----------------------------------------------------------------------
