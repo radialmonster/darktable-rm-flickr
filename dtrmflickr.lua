@@ -1172,6 +1172,10 @@ local function reason_tag(account_nsid, reason)
   return table.concat({ PREFIX, tostring(account_nsid), "reason", tostring(reason) }, "|")
 end
 
+local function fingerprint_tag(account_nsid, field, fingerprint)
+  return table.concat({ PREFIX, tostring(account_nsid), "fingerprint", tostring(field), tostring(fingerprint) }, "|")
+end
+
 local function valid_component(value)
   value = tostring(value or "")
   return value ~= "" and value:find("|", 1, true) == nil
@@ -1385,6 +1389,14 @@ local metadata_reasons = {
   permissions = true,
 }
 
+local function known_metadata_reasons()
+  local reasons = {}
+  for reason in pairs(metadata_reasons) do reasons[#reasons + 1] = reason end
+  table.sort(reasons)
+  return reasons
+end
+M.metadata_reasons = known_metadata_reasons
+
 function M.is_metadata_reason(reason)
   return metadata_reasons[tostring(reason or "")] == true
 end
@@ -1409,6 +1421,69 @@ function M.clear_metadata_reasons(image, account_nsid)
     if M.clear_reason(image, account_nsid, reason) then removed = removed + 1 end
   end
   return removed
+end
+
+local function fingerprint_prefix(account_nsid, field)
+  return PREFIX .. "|" .. tostring(account_nsid) .. "|fingerprint|" .. tostring(field) .. "|"
+end
+
+function M.get_fingerprint(image, account_nsid, field)
+  local prefix = fingerprint_prefix(account_nsid, field)
+  local latest
+  for _, tag in ipairs(image_tags(image) or {}) do
+    local name = tag_name(tag)
+    local value = name and name:sub(1, #prefix) == prefix and name:sub(#prefix + 1) or nil
+    if valid_component(value) then latest = value end
+  end
+  return latest
+end
+
+function M.clear_fingerprint(image, account_nsid, field)
+  assert_component("account id", account_nsid)
+  assert_component("fingerprint field", field)
+  local prefix = fingerprint_prefix(account_nsid, field)
+  local removed = 0
+  for _, tag in ipairs(image_tags(image) or {}) do
+    local name = tag_name(tag)
+    if name and name:sub(1, #prefix) == prefix then
+      detach(image, tag)
+      removed = removed + 1
+    end
+  end
+  return removed
+end
+
+function M.set_fingerprint(image, account_nsid, field, fingerprint)
+  assert_component("account id", account_nsid)
+  assert_component("fingerprint field", field)
+  assert_component("fingerprint", fingerprint)
+  M.clear_fingerprint(image, account_nsid, field)
+  attach(image, ensure_tag(fingerprint_tag(account_nsid, field, fingerprint)))
+  return fingerprint
+end
+
+function M.set_fingerprints(image, account_nsid, fingerprints)
+  local changed = 0
+  for field, fingerprint in pairs(fingerprints or {}) do
+    if fingerprint ~= nil then
+      M.set_fingerprint(image, account_nsid, field, fingerprint)
+      changed = changed + 1
+    end
+  end
+  return changed
+end
+
+function M.metadata_fingerprint_reasons(image, account_nsid, fingerprints)
+  local reasons = {}
+  for _, reason in ipairs(known_metadata_reasons()) do
+    local current = fingerprints and fingerprints[reason] or nil
+    if current ~= nil then
+      local previous = M.get_fingerprint(image, account_nsid, reason)
+      if previous and previous ~= tostring(current) then reasons[#reasons + 1] = reason end
+    end
+  end
+  table.sort(reasons)
+  return reasons
 end
 
 function M.get_reasons(image, account_nsid)
@@ -1457,7 +1532,8 @@ function M.needs_republish(image, account_nsid)
   return false
 end
 
-function M.evaluate_publish_state(image, account_nsid)
+function M.evaluate_publish_state(image, account_nsid, opts)
+  opts = opts or {}
   local photo_id = M.get_photo_id(image, account_nsid)
   if not photo_id then return "unpublished", nil, nil end
 
@@ -1478,6 +1554,11 @@ function M.evaluate_publish_state(image, account_nsid)
     newest_handled_at = metadata_published_at
   end
   if changed_at and newest_handled_at and stamp_is_newer(changed_at, newest_handled_at) then
+    local metadata_requeue = M.metadata_fingerprint_reasons(image, account_nsid, opts.metadata_fingerprints)
+    if #metadata_requeue > 0 then
+      for _, reason in ipairs(metadata_requeue) do M.mark_reason(image, account_nsid, reason) end
+      return "needs-republish", published_at, photo_id, M.get_reasons(image, account_nsid)
+    end
     M.mark_needs_republish(image, account_nsid)
     return "needs-republish", published_at, photo_id, M.get_reasons(image, account_nsid)
   end
@@ -1505,6 +1586,7 @@ function M.clear_photo_id(image, account_nsid)
   if old_tag then detach(image, old_tag) end
   M.clear_published_at(image, account_nsid)
   M.clear_needs_republish(image, account_nsid)
+  for _, reason in ipairs(known_metadata_reasons()) do M.clear_fingerprint(image, account_nsid, reason) end
   return true
 end
 
@@ -1726,6 +1808,39 @@ function M.image_keyword_tags(image, excluded_filters, tag_names, opts)
   local encoded = {}
   for _, tag in ipairs(tags) do encoded[#encoded + 1] = flickr_quote_tag(tag) end
   return #encoded > 0 and table.concat(encoded, " ") or nil, math.max(0, original_count - #tags)
+end
+
+local function fingerprint_hash(value)
+  local s = tostring(value == nil and "" or value)
+  local h = 2166136261
+  for i = 1, #s do
+    h = (h ~ s:byte(i)) * 16777619 % 4294967296
+  end
+  return string.format("%08x", h)
+end
+
+local function fingerprint_parts(parts)
+  return fingerprint_hash(table.concat(parts or {}, "\31"))
+end
+
+function M.fingerprints_from_values(values)
+  values = values or {}
+  local privacy = values.privacy or {}
+  local safety = values.safety or {}
+  local content_type = values.content_type or {}
+  local license = values.license or {}
+  local permissions = values.permissions or {}
+  return {
+    keywords = fingerprint_hash(values.tags or ""),
+    title_description = fingerprint_parts({ values.title or "", values.description or "" }),
+    gps = fingerprint_parts({ values.lat or "", values.lon or "" }),
+    date_taken = fingerprint_hash(values.date_taken or ""),
+    visibility = fingerprint_parts({ privacy.is_public or "", privacy.is_friend or "", privacy.is_family or "" }),
+    safety = fingerprint_hash(safety.flickr_value or ""),
+    content_type = fingerprint_hash(content_type.flickr_value or ""),
+    license = fingerprint_hash(license.flickr_value or ""),
+    permissions = fingerprint_parts({ permissions.perm_comment or "", permissions.perm_addmeta or "" }),
+  }
 end
 
 return M
@@ -2309,6 +2424,9 @@ local session_account = nil
 local EMPTY_FILTER_PREF <const> = "<none>"
 local FLICKR_TAG_LIMIT <const> = 75
 local clear_album_cache
+local image_keyword_tags
+local effective_metadata_fingerprints
+local store_metadata_fingerprints
 __dtrmflickr_queue = require("dtrmflickr.queue").new {
   sleep_ms = function(ms)
     if dt.control and dt.control.sleep then dt.control.sleep(ms / 1000) end
@@ -3972,6 +4090,7 @@ local function save_panel_settings()
 
   local errors = {}
   local skipped = {}
+  local saved_fields = {}
   local sync = master_sync_fields()
   local is_public, is_friend, is_family = panel_privacy_flags()
   local wants_privacy = panel_dirty.privacy
@@ -3993,6 +4112,8 @@ local function save_panel_settings()
     else
       if update_privacy then state.clear_reason(panel_current.image, acc.nsid, "visibility") end
       if update_comment_perm or update_addmeta_perm then state.clear_reason(panel_current.image, acc.nsid, "permissions") end
+      if update_privacy then saved_fields[#saved_fields + 1] = "visibility" end
+      if update_comment_perm or update_addmeta_perm then saved_fields[#saved_fields + 1] = "permissions" end
     end
   end
   if wants_privacy and not sync.privacy then skipped[#skipped + 1] = "privacy" end
@@ -4009,6 +4130,7 @@ local function save_panel_settings()
       errors[#errors + 1] = "safety: " .. tostring(err)
     else
       state.clear_reason(panel_current.image, acc.nsid, "safety")
+      saved_fields[#saved_fields + 1] = "safety"
     end
   elseif panel_dirty.safety then
     skipped[#skipped + 1] = "safety"
@@ -4024,6 +4146,7 @@ local function save_panel_settings()
         errors[#errors + 1] = "content type: " .. tostring(err)
       else
         state.clear_reason(panel_current.image, acc.nsid, "content_type")
+        saved_fields[#saved_fields + 1] = "content_type"
       end
     else
       errors[#errors + 1] = "content type: choose a value first"
@@ -4041,6 +4164,7 @@ local function save_panel_settings()
       errors[#errors + 1] = "license: " .. tostring(err)
     else
       state.clear_reason(panel_current.image, acc.nsid, "license")
+      saved_fields[#saved_fields + 1] = "license"
     end
   elseif panel_dirty.license then
     skipped[#skipped + 1] = "license"
@@ -4050,10 +4174,18 @@ local function save_panel_settings()
     panel_remote_label.label = _("Flickr: save failed")
     dt.print(_("Flickr: save failed: ") .. table.concat(errors, "; "))
   elseif #skipped > 0 then
+    if #saved_fields > 0 then
+      state.set_metadata_published_at(panel_current.image, acc.nsid)
+      store_metadata_fingerprints(panel_current.image, acc.nsid,
+        effective_metadata_fingerprints(panel_current.image, sync), saved_fields)
+      panel_sets.refresh_publish_state_label(panel_current.image, acc, photo_id)
+    end
     panel_remote_label.label = _("Flickr: settings skipped by Lua sync options")
     dt.print(_("Flickr: settings skipped by Lua sync options: ") .. table.concat(skipped, ", "))
   else
     state.set_metadata_published_at(panel_current.image, acc.nsid)
+    store_metadata_fingerprints(panel_current.image, acc.nsid,
+      effective_metadata_fingerprints(panel_current.image, sync), saved_fields)
     panel_sets.refresh_publish_state_label(panel_current.image, acc, photo_id)
     panel_remote_label.label = _("Flickr: settings saved")
     dt.print(_("Flickr: settings saved."))
@@ -4099,6 +4231,8 @@ local function sync_panel_meta()
   if ok then
     state.set_metadata_published_at(image, acc.nsid)
     state.clear_reason(image, acc.nsid, "title_description")
+    store_metadata_fingerprints(image, acc.nsid,
+      effective_metadata_fingerprints(image, master_sync_fields()), { "title_description" })
     panel_sets.refresh_publish_state_label(image, acc, photo_id)
     panel_remote_label.label = _("Flickr: title/description synced")
     dt.print(_("Flickr: title/description synced."))
@@ -4109,8 +4243,6 @@ local function sync_panel_meta()
     dt.print(_("Flickr: metadata sync failed: ") .. tostring(err))
   end
 end
-
-local image_keyword_tags
 
 local function sync_panel_tags()
   local acc, photo_id, image = panel_current.account, panel_current.photo_id, panel_current.image
@@ -4149,6 +4281,8 @@ local function sync_panel_tags()
   if ok then
     state.set_metadata_published_at(image, acc.nsid)
     state.clear_reason(image, acc.nsid, "keywords")
+    store_metadata_fingerprints(image, acc.nsid,
+      effective_metadata_fingerprints(image, master_sync_fields()), { "keywords" })
     panel_sets.refresh_publish_state_label(image, acc, photo_id)
     panel_remote_label.label = _("Flickr: keywords synced")
     dt.print(_("Flickr: keywords synced."))
@@ -4194,7 +4328,9 @@ function panel_sets.refresh_publish_state_label(image, acc, photo_id)
     panel_sets.publish_label.label = _("publish state: log in to evaluate")
     return "unknown"
   end
-  local status, published_at, _photo_id, reasons = state.evaluate_publish_state(image, acc.nsid)
+  local status, published_at, _photo_id, reasons = state.evaluate_publish_state(image, acc.nsid, {
+    metadata_fingerprints = effective_metadata_fingerprints and effective_metadata_fingerprints(image, master_sync_fields()) or nil,
+  })
   panel_sets.publish_label.label = publish_state_label(status, published_at, reasons)
   return status, published_at, reasons
 end
@@ -4249,8 +4385,11 @@ function panel_sets.scan_selected_publish_state()
     return
   end
   local counts = { ["needs-republish"] = 0, current = 0, unknown = 0, unpublished = 0 }
+  local sync = master_sync_fields()
   for _, image in ipairs(selection) do
-    local status = state.evaluate_publish_state(image, acc.nsid)
+    local status = state.evaluate_publish_state(image, acc.nsid, {
+      metadata_fingerprints = effective_metadata_fingerprints and effective_metadata_fingerprints(image, sync) or nil,
+    })
     counts[status] = (counts[status] or 0) + 1
   end
   refresh_panel(true, false)
@@ -4873,6 +5012,52 @@ function image_keyword_tags(image, tag_names)
   return metadata.image_keyword_tags(image, keyword_rule_filters(), tag_names, { max_tags = FLICKR_TAG_LIMIT })
 end
 
+function effective_metadata_fingerprints(image, sync, opts)
+  opts = opts or {}
+  sync = sync or master_sync_fields()
+  local privacy = opts.privacy or current_privacy()
+  local safety = opts.safety or current_safety()
+  local content_type = opts.content_type or current_content_type()
+  local license = opts.license or current_license()
+  local permissions = opts.permissions or current_permissions()
+  local tag_names = opts.tag_names or metadata.image_tag_names(image)
+  local forced = opts.forced or {}
+  if not opts.skip_keyword_overrides then
+    privacy, safety, content_type, license, forced = apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
+    local private_rating_threshold = rating_color_rules.should_force_private_by_rating(image)
+    local private_label = rating_color_rules.should_force_private_by_color_label(image)
+    if private_rating_threshold or private_label then
+      privacy = settings.privacy_values[1]
+      forced.privacy = true
+    end
+  end
+  local tags = sync.tags and (opts.tags ~= nil and opts.tags or image_keyword_tags(image, tag_names)) or nil
+  local lat, lon = nil, nil
+  if sync.gps then lat, lon = metadata.image_location(image) end
+  return metadata.fingerprints_from_values({
+    title = sync.title and metadata.image_title(image, image and image.filename or "") or nil,
+    description = sync.description and image and image.description or nil,
+    tags = tags,
+    date_taken = sync.date_taken and metadata.image_date_taken(image) or nil,
+    lat = lat,
+    lon = lon,
+    privacy = (sync.privacy or forced.privacy) and privacy or nil,
+    safety = (sync.safety or forced.safety) and safety or nil,
+    content_type = (sync.content_type or forced.content_type) and content_type or nil,
+    license = (sync.license or forced.license) and license or nil,
+    permissions = sync.permissions and permissions or nil,
+  })
+end
+
+function store_metadata_fingerprints(image, account_nsid, fingerprints, fields)
+  if not image or not account_nsid or not fingerprints then return 0 end
+  local selected = {}
+  for _, field in ipairs(fields or state.metadata_reasons()) do
+    if fingerprints[field] ~= nil then selected[field] = fingerprints[field] end
+  end
+  return state.set_fingerprints(image, account_nsid, selected)
+end
+
 local function should_skip_upload_by_keyword(tag_names)
   return first_matching_keyword_filter(tag_names,
     split_filter_list(dt.preferences.read(PLUGIN, "skip_upload_keyword_filters", "string")))
@@ -5010,6 +5195,7 @@ local function store(storage, image, format, filename, number, total, high_quali
     state.set_photo_id(image, extra_data.account.nsid, photo_id)
     state.set_image_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
     local post_failed = false
+    local failed_metadata_fields = {}
     if sync.license or forced.license then
       local license_ok, license_err = __dtrmflickr_call("flickr.photos.licenses.setLicense", function()
         return rest.photos_licenses_set_license(extra_data.api_key, extra_data.api_secret,
@@ -5017,6 +5203,7 @@ local function store(storage, image, format, filename, number, total, high_quali
       end)
       if not license_ok then
         post_failed = true
+        failed_metadata_fields.license = true
         state.mark_reason(image, extra_data.account.nsid, "license")
         record_post_error(extra_data, image, photo_id, "license", license_err)
       else
@@ -5032,6 +5219,7 @@ local function store(storage, image, format, filename, number, total, high_quali
       end)
       if not dates_ok then
         post_failed = true
+        failed_metadata_fields.date_taken = true
         state.mark_reason(image, extra_data.account.nsid, "date_taken")
         record_post_error(extra_data, image, photo_id, "date", dates_err)
       else
@@ -5048,16 +5236,33 @@ local function store(storage, image, format, filename, number, total, high_quali
       end)
       if not geo_ok then
         post_failed = true
+        failed_metadata_fields.gps = true
         state.mark_reason(image, extra_data.account.nsid, "gps")
         record_post_error(extra_data, image, photo_id, "location", geo_err)
       else
         state.clear_reason(image, extra_data.account.nsid, "gps")
       end
     end
+    local upload_fingerprints = effective_metadata_fingerprints(image, sync, {
+      privacy = privacy,
+      safety = safety,
+      content_type = content_type,
+      license = license,
+      permissions = permissions,
+      tag_names = tag_names,
+      tags = tags,
+      forced = forced,
+      skip_keyword_overrides = true,
+    })
     if post_failed then
-      state.set_metadata_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
+      local published_fields = {}
+      for _, field in ipairs(state.metadata_reasons()) do
+        if not failed_metadata_fields[field] then published_fields[#published_fields + 1] = field end
+      end
+      store_metadata_fingerprints(image, extra_data.account.nsid, upload_fingerprints, published_fields)
     else
       state.set_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
+      store_metadata_fingerprints(image, extra_data.account.nsid, upload_fingerprints)
     end
     extra_data.uploaded[#extra_data.uploaded + 1] = { image = image, filename = filename, photo_id = photo_id }
     dt.print(string.format(_("Flickr: uploaded %s as photo %s"), image.filename or "image", photo_id))
