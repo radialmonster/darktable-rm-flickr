@@ -5455,6 +5455,13 @@ local function store(storage, image, format, filename, number, total, high_quali
     record_tag_limit_warning(extra_data, image, truncated_tags)
   end
   dt.print(string.format(_("Flickr: uploading %d/%d — %s"), number, total, image.filename or "?"))
+  -- Do NOT auto-retry the upload itself. Flickr's upload endpoint is not
+  -- idempotent and exposes no dedupe key, so a transient timeout *after* the
+  -- pixels reached Flickr would create a duplicate photo on retry. We cannot
+  -- tell "never sent" from "sent but the ack was lost" from the error string,
+  -- so the safe choice is one attempt: a transient upload failure fails just
+  -- this image (reported, the batch continues) and the user re-exports it. The
+  -- idempotent post-upload REST calls below keep their normal retry/backoff.
   local photo_id, err = __dtrmflickr_call("flickr.upload", function()
     return upload.upload_photo(extra_data.api_key, extra_data.api_secret, extra_data.account, filename, {
       title = sync.title and metadata.image_title(image, filename) or nil,
@@ -5468,7 +5475,7 @@ local function store(storage, image, format, filename, number, total, high_quali
       perm_comment = sync.permissions and permissions.perm_comment or nil,
       perm_addmeta = sync.permissions and permissions.perm_addmeta or nil,
     })
-  end)
+  end, { max_attempts = 1 })
   if photo_id then
     state.set_photo_id(image, extra_data.account.nsid, photo_id)
     state.set_image_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
