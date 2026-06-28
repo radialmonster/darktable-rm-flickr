@@ -948,6 +948,48 @@ function M.parse_page_info(body, container)
   return page, pages, total
 end
 
+function M.paged_call(api_key, api_secret, account, method, args, container, opts)
+  opts = opts or {}
+  args = args or {}
+  if not method or method == "" then return nil, "missing Flickr REST method" end
+
+  local bodies, page_infos = {}, {}
+  local page = tonumber(opts.start_page or args.page) or 1
+  local per_page = tonumber(opts.per_page or args.per_page) or 500
+  local max_pages = tonumber(opts.max_pages) or 0
+  local pages = page
+
+  while page <= pages do
+    if opts.cancelled and opts.cancelled(page) then
+      return nil, "cancelled Flickr paged request"
+    end
+
+    local page_args = {}
+    for k, v in pairs(args) do page_args[k] = v end
+    page_args.page = page
+    page_args.per_page = per_page
+
+    local body, err
+    if opts.public or not (account and account.token and account.secret) then
+      body, err = M.public_call(api_key, method, page_args)
+    else
+      body, err = M.call(api_key, api_secret, account, method, page_args)
+    end
+    if not body then return nil, err end
+
+    bodies[#bodies + 1] = body
+    local current_page, page_count, total = M.parse_page_info(body, container)
+    page_infos[#page_infos + 1] = { page = current_page, pages = page_count, total = total }
+    if opts.on_page then opts.on_page(body, page_infos[#page_infos], page) end
+
+    pages = page_count or pages
+    if max_pages > 0 and pages > page + max_pages - 1 then pages = page + max_pages - 1 end
+    page = page + 1
+  end
+
+  return bodies, page_infos
+end
+
 function M.photosets_get_list(api_key, api_secret, account, user_id, opts)
   if type(user_id) == "table" and opts == nil then
     opts = user_id
@@ -957,32 +999,22 @@ function M.photosets_get_list(api_key, api_secret, account, user_id, opts)
   local nsid = user_id or opts.user_id or (account and account.nsid) or nil
   if not nsid or nsid == "" then return nil, "missing user id" end
 
-  local all_sets, bodies = {}, {}
-  local page, pages = 1, 1
-  repeat
-    local args = {
-      user_id = nsid,
-      per_page = 500,
-      page = page,
-    }
-    if opts.photo_ids and opts.photo_ids ~= "" then
-      args.photo_ids = opts.photo_ids
-      args.sort_groups = opts.sort_groups or "has_photo"
-    end
-    local body, err
-    if account and account.token and account.secret then
-      body, err = M.call(api_key, api_secret, account, "flickr.photosets.getList", args)
-    else
-      body, err = M.public_call(api_key, "flickr.photosets.getList", args)
-    end
-    if not body then return nil, err end
+  local args = { user_id = nsid }
+  if opts.photo_ids and opts.photo_ids ~= "" then
+    args.photo_ids = opts.photo_ids
+    args.sort_groups = opts.sort_groups or "has_photo"
+  end
 
-    bodies[#bodies + 1] = body
-    for _, item in ipairs(M.parse_photosets(body)) do all_sets[#all_sets + 1] = item end
-    local _current_page, page_count = M.parse_page_info(body, "photosets")
-    pages = page_count or pages
-    page = page + 1
-  until page > pages
+  local all_sets = {}
+  local bodies, err = M.paged_call(api_key, api_secret, account, "flickr.photosets.getList", args, "photosets", {
+    per_page = opts.per_page or 500,
+    public = not (account and account.token and account.secret),
+    cancelled = opts.cancelled,
+    on_page = function(body)
+      for _, item in ipairs(M.parse_photosets(body)) do all_sets[#all_sets + 1] = item end
+    end,
+  })
+  if not bodies then return nil, err end
 
   return all_sets, table.concat(bodies, "\n")
 end
@@ -1061,6 +1093,18 @@ function M.photos_search(api_key, api_secret, account, args)
   local body, err = M.call(api_key, api_secret, account, "flickr.photos.search", args)
   if not body then return nil, err end
   return body
+end
+
+function M.photos_search_all(api_key, api_secret, account, args, opts)
+  opts = opts or {}
+  args = args or {}
+  args.user_id = args.user_id or (account and account.nsid) or "me"
+  return M.paged_call(api_key, api_secret, account, "flickr.photos.search", args, "photos", {
+    per_page = opts.per_page or args.per_page or 250,
+    max_pages = opts.max_pages,
+    cancelled = opts.cancelled,
+    on_page = opts.on_page,
+  })
 end
 
 function M.photos_set_perms(api_key, api_secret, account, photo_id, is_public, is_friend, is_family, perm_comment, perm_addmeta)
@@ -2005,15 +2049,15 @@ local function search_existing_candidates(api_key, api_secret, acc, image)
     args.user_id = acc.nsid
     args.media = "photos"
     args.extras = "date_taken,date_upload,original_format"
-    args.per_page = 50
-    args.page = 1
-    local body, err = rest.photos_search(api_key, api_secret, acc, args)
-    if not body then
+    local bodies, err = rest.photos_search_all(api_key, api_secret, acc, args, { per_page = 50 })
+    if not bodies then
       errors[#errors + 1] = tostring(err)
       return
     end
-    for _, photo in ipairs(M.parse_search_photos(body)) do
-      add_candidate(candidates, photo, reason)
+    for _, body in ipairs(bodies) do
+      for _, photo in ipairs(M.parse_search_photos(body)) do
+        add_candidate(candidates, photo, reason)
+      end
     end
   end
 
@@ -2170,6 +2214,8 @@ function Queue:enqueue(method, fn, opts)
   if job.coalesce_key then
     for i, pending in ipairs(self.pending) do
       if pending.coalesce_key == job.coalesce_key then
+        job.replaced_jobs = pending.replaced_jobs or {}
+        job.replaced_jobs[#job.replaced_jobs + 1] = pending
         self.pending[i] = job
         self.stats.coalesced = self.stats.coalesced + 1
         return job
@@ -2238,6 +2284,10 @@ function Queue:drain()
       job.result = { nil, "stale Flickr queue job" }
     else
       job.result = self:run_job(job)
+    end
+    for _, replaced in ipairs(job.replaced_jobs or {}) do
+      replaced.result = job.result
+      if replaced.done then replaced.done(table.unpack(replaced.result or {})) end
     end
     if job.done then job.done(table.unpack(job.result or {})) end
   end
