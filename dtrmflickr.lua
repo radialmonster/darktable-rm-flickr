@@ -4076,9 +4076,11 @@ end
 -- widget update so it can be unit-tested without darktable widgets. It surfaces
 -- the throttle/wait information the queue already tracks but the panel used to
 -- discard: the cumulative `rate_limited` count (so the user sees when Flickr is
--- throttling the batch, not just the ok/failed totals) and the last job's
--- `waited_ms` (so a job that visibly paused on backoff is distinguishable from
--- one that ran straight through). Returns (label, detail).
+-- throttling the batch, not just the ok/failed totals), the cumulative
+-- `waited_ms` across all waits (so a slow batch reads as "Flickr is pacing us"
+-- rather than "stuck"), and the last job's `waited_ms` (so a job that visibly
+-- paused on backoff is distinguishable from one that ran straight through).
+-- Returns (label, detail).
 local function format_queue_status(summary, recent)
   if not summary then return "", "" end
   local label = string.format(
@@ -4086,6 +4088,14 @@ local function format_queue_status(summary, recent)
     summary.succeeded or 0, summary.failed or 0, summary.retried or 0, summary.pending or 0)
   if (tonumber(summary.rate_limited) or 0) > 0 then
     label = label .. string.format(_(" - throttled %dx"), summary.rate_limited)
+  end
+  -- Surface the cumulative time the queue has spent sleeping on pacing/backoff
+  -- (the queue tracks `waited_ms` across all waits but the panel used to discard
+  -- it). On a large throttled batch this tells the user how much wall-clock the
+  -- backoff has actually cost, distinguishing "slow because Flickr is pacing us"
+  -- from "stuck". Only shown once there has been a measurable wait.
+  if (tonumber(summary.waited_ms) or 0) >= 100 then
+    label = label .. string.format(_(" - waited %.1fs total"), summary.waited_ms / 1000)
   end
   local detail = ""
   local last = recent and recent[#recent] or nil
