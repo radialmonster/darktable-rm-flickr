@@ -1937,9 +1937,10 @@ package.preload["dtrmflickr.queue"] = function(...)
 -- queue.lua — small serial scheduler for Flickr API work.
 --
 -- darktable Lua callbacks are synchronous, but keeping every Flickr operation
--- behind one scheduler gives us one place for pacing, coalescing, and stale UI
--- checks. Jobs normally run immediately; if a callback enqueues more work while
--- the queue is active, duplicate coalesced pending jobs are replaced.
+-- behind one scheduler gives us one place for pacing, retries/backoff,
+-- coalescing, and stale UI checks. Jobs normally run immediately; if a callback
+-- enqueues more work while the queue is active, duplicate coalesced pending jobs
+-- are replaced.
 
 local M = {}
 
@@ -1949,6 +1950,39 @@ end
 
 local function sleep_ms(sleep_fn, ms)
   if sleep_fn and ms and ms > 0 then sleep_fn(ms) end
+end
+
+local function default_retryable(err)
+  local s = tostring(err or ""):lower()
+  if s == "" then return false end
+  if s:find("rate", 1, true) and s:find("limit", 1, true) then return true, "rate-limit" end
+  if s:find("too many", 1, true) or s:find("throttle", 1, true) then return true, "rate-limit" end
+  if s:find("http 429", 1, true) or s:find("(429)", 1, true) then return true, "rate-limit" end
+  if s:find("temporar", 1, true) or s:find("timed out", 1, true) or s:find("timeout", 1, true) then return true, "transient" end
+  if s:find("connection", 1, true) or s:find("network", 1, true) or s:find("curl", 1, true) then return true, "transient" end
+  if s:find("write operation failed", 1, true) or s:find("(106)", 1, true) then return true, "transient" end
+  if s:find("empty flickr", 1, true) then return true, "transient" end
+  return false
+end
+
+local function backoff_delay_ms(job, attempt, reason)
+  local base = tonumber(job.retry_base_ms) or 0
+  if reason == "rate-limit" and job.rate_limit_base_ms then
+    base = tonumber(job.rate_limit_base_ms) or base
+  end
+  if base <= 0 then return 0 end
+  local delay = base * (2 ^ math.max(0, attempt - 1))
+  local max_delay = tonumber(job.retry_max_ms) or 0
+  if max_delay > 0 and delay > max_delay then delay = max_delay end
+  local jitter = job.jitter_ms
+  if type(jitter) == "function" then
+    delay = delay + (tonumber(jitter(delay, attempt, reason)) or 0)
+  elseif jitter then
+    local amount = tonumber(jitter) or 0
+    if amount > 0 then delay = delay + math.random(0, amount) end
+  end
+  if delay < 0 then delay = 0 end
+  return math.floor(delay)
 end
 
 local Queue = {}
@@ -1962,9 +1996,18 @@ function M.new(opts)
     last_started = {},
     now_ms = opts.now_ms or monotonic_ms,
     sleep_ms = opts.sleep_ms,
+    on_wait = opts.on_wait,
     default_pace_ms = opts.default_pace_ms or 0,
     method_pace_ms = opts.method_pace_ms or {},
-    stats = { enqueued = 0, started = 0, coalesced = 0, stale = 0, failed = 0 },
+    default_max_attempts = opts.default_max_attempts or 1,
+    retry_base_ms = opts.retry_base_ms or 0,
+    retry_max_ms = opts.retry_max_ms or 0,
+    rate_limit_base_ms = opts.rate_limit_base_ms,
+    retryable = opts.retryable or default_retryable,
+    stats = {
+      enqueued = 0, started = 0, succeeded = 0, coalesced = 0, stale = 0,
+      failed = 0, retried = 0, rate_limited = 0, waited_ms = 0,
+    },
   }, Queue)
 end
 
@@ -1982,6 +2025,13 @@ function Queue:enqueue(method, fn, opts)
     coalesce_key = opts.coalesce_key,
     stale = opts.stale,
     pace_ms = self:pace_for(method, opts),
+    max_attempts = math.max(1, tonumber(opts.max_attempts or self.default_max_attempts) or 1),
+    retry_base_ms = opts.retry_base_ms ~= nil and opts.retry_base_ms or self.retry_base_ms,
+    retry_max_ms = opts.retry_max_ms ~= nil and opts.retry_max_ms or self.retry_max_ms,
+    rate_limit_base_ms = opts.rate_limit_base_ms ~= nil and opts.rate_limit_base_ms or self.rate_limit_base_ms,
+    retryable = opts.retryable or self.retryable,
+    jitter_ms = opts.jitter_ms,
+    on_wait = opts.on_wait or self.on_wait,
   }
 
   if job.coalesce_key then
@@ -1999,6 +2049,52 @@ function Queue:enqueue(method, fn, opts)
   return job
 end
 
+function Queue:wait(job, ms, why, attempt)
+  ms = math.floor(tonumber(ms) or 0)
+  if ms <= 0 then return end
+  self.stats.waited_ms = self.stats.waited_ms + ms
+  if job and job.on_wait then job.on_wait(ms, why, job.method, attempt) end
+  sleep_ms(self.sleep_ms, ms)
+end
+
+function Queue:run_job(job)
+  local attempt = 1
+  while true do
+    local now = self.now_ms()
+    local last = self.last_started[job.method]
+    if last and job.pace_ms > 0 then
+      self:wait(job, job.pace_ms - (now - last), "pace", attempt)
+    end
+    self.last_started[job.method] = self.now_ms()
+    self.stats.started = self.stats.started + 1
+
+    local result = { pcall(job.fn, attempt) }
+    local ok = result[1]
+    if ok then
+      table.remove(result, 1)
+      if result[1] ~= nil then
+        self.stats.succeeded = self.stats.succeeded + 1
+        return result
+      end
+    end
+
+    local err = ok and result[2] or result[2]
+    local retry, reason = false, nil
+    if attempt < job.max_attempts and job.retryable then
+      retry, reason = job.retryable(err, job.method, attempt)
+    end
+    if retry then
+      self.stats.retried = self.stats.retried + 1
+      if reason == "rate-limit" then self.stats.rate_limited = self.stats.rate_limited + 1 end
+      self:wait(job, backoff_delay_ms(job, attempt, reason), reason or "retry", attempt)
+      attempt = attempt + 1
+    else
+      self.stats.failed = self.stats.failed + 1
+      return { nil, err }
+    end
+  end
+end
+
 function Queue:drain()
   if self.running then return end
   self.running = true
@@ -2008,21 +2104,7 @@ function Queue:drain()
       self.stats.stale = self.stats.stale + 1
       job.result = { nil, "stale Flickr queue job" }
     else
-      local now = self.now_ms()
-      local last = self.last_started[job.method]
-      if last and job.pace_ms > 0 then
-        sleep_ms(self.sleep_ms, job.pace_ms - (now - last))
-      end
-      self.last_started[job.method] = self.now_ms()
-      self.stats.started = self.stats.started + 1
-      local result = { pcall(job.fn) }
-      if result[1] then
-        table.remove(result, 1)
-        job.result = result
-      else
-        self.stats.failed = self.stats.failed + 1
-        job.result = { nil, result[2] }
-      end
+      job.result = self:run_job(job)
     end
     if job.done then job.done(table.unpack(job.result or {})) end
   end
@@ -2231,6 +2313,19 @@ __dtrmflickr_queue = require("dtrmflickr.queue").new {
   sleep_ms = function(ms)
     if dt.control and dt.control.sleep then dt.control.sleep(ms / 1000) end
   end,
+  on_wait = function(ms, why, method, attempt)
+    if why == "rate-limit" then
+      dt.print(string.format(_("Flickr: waiting %.1fs due to API limit before retrying %s"),
+        (tonumber(ms) or 0) / 1000, tostring(method or "request")))
+    elseif why == "transient" then
+      dt.print_log(string.format("[dtrmflickr] retrying %s after %.1fs transient wait (attempt %d)",
+        tostring(method or "request"), (tonumber(ms) or 0) / 1000, tonumber(attempt) or 1))
+    end
+  end,
+  default_max_attempts = 3,
+  retry_base_ms = 1000,
+  rate_limit_base_ms = 5000,
+  retry_max_ms = 30000,
   method_pace_ms = {
     ["flickr.photos.getInfo"] = 250,
     ["flickr.photos.getPerms"] = 250,
