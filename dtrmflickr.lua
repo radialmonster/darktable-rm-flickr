@@ -6885,6 +6885,17 @@ local function initialize(storage, format, images, high_quality, extra_data)
     end
   end
   extra_data.album = current_album()
+  -- Show a progress bar in darktable's background-jobs area for the whole batch
+  -- (issue #2). darktable calls store() once per image in order, so the bar can
+  -- fill as images complete; the per-image dt.print toast scrolls away on a
+  -- large batch, this persists. No cancel button: darktable drives the export
+  -- loop in C and we cannot abort it mid-batch from Lua, so offering a cancel
+  -- would falsely imply we could stop the upload.
+  extra_data.progress_total = #images
+  if dt.gui and dt.gui.create_job then
+    extra_data.progress_job = dt.gui.create_job(
+      string.format(_("Flickr: uploading %d image(s)"), #images), true)
+  end
   dt.print_log(string.format("[dtrmflickr] initialize: %d image(s), transport=%s, %s",
     #images, TRANSPORT, extra_data.account and ("nsid=" .. tostring(extra_data.account.nsid)) or "NOT logged in"))
   return nil
@@ -6968,6 +6979,12 @@ local function record_post_error(extra_data, image, photo_id, action, err)
 end
 
 local function store(storage, image, format, filename, number, total, high_quality, extra_data)
+  -- Advance the batch progress bar to "images before this one are done". Placed
+  -- before the early-return guards (skip/credential) so the bar still moves for
+  -- images that never upload. finalize() fills it to 100% and destroys it.
+  if extra_data.progress_job and extra_data.progress_job.valid and total and total > 0 then
+    extra_data.progress_job.percent = (number - 1) / total
+  end
   if not extra_data.account then
     local err = _("not logged in to Flickr")
     extra_data.failed[#extra_data.failed + 1] = { image = image, filename = filename, error = err }
@@ -7279,6 +7296,13 @@ local function finalize(storage, image_table, extra_data)
   for _, line in ipairs(report.result_table_lines(extra_data, { translate = _, owner = report_owner })) do
     dt.print_log("[dtrmflickr] " .. line)
   end
+  -- Fill the batch progress bar and remove it from the background-jobs area.
+  -- Guarded against an absent/invalidated job (older darktable, or a cancel).
+  if extra_data.progress_job and extra_data.progress_job.valid then
+    extra_data.progress_job.percent = 1
+    extra_data.progress_job.valid = false
+  end
+  extra_data.progress_job = nil
 end
 
 ----------------------------------------------------------------------
