@@ -1400,7 +1400,9 @@ function M.image_keyword_tags(image, excluded_filters, tag_names, opts)
   local seen = {}
   local source_tags = {}
   if tag_names then
-    for _, name in ipairs(tag_names) do source_tags[#source_tags + 1] = { name = name } end
+    for _, name in ipairs(tag_names) do
+      source_tags[#source_tags + 1] = (dt.tags and dt.tags.find and dt.tags.find(name)) or { name = name }
+    end
   else
     source_tags = image_tags(image)
   end
