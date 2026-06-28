@@ -3951,6 +3951,52 @@ end
 return M
 end
 
+package.preload["dtrmflickr.urls"] = function(...)
+-- urls.lua — pure builders for public Flickr web URLs.
+--
+-- Flickr's web URLs follow a stable, documented shape keyed on the *owner*
+-- (the account's NSID, e.g. "12037949754@N01", or a path_alias if the user set
+-- one) and the numeric photo/photoset id:
+--
+--   photo   https://www.flickr.com/photos/<owner>/<photo_id>
+--   album   https://www.flickr.com/photos/<owner>/albums/<set_id>
+--
+-- The NSID's "@" and the alias are already URL-path-safe (Flickr serves these
+-- literally and redirects an NSID to the alias when one exists), so no escaping
+-- is needed. These functions are pure and nil-safe so they can be unit-tested
+-- offline (see tests/test_urls.lua) and reused both by the end-of-batch report
+-- (issue #37) and the lighttable panel's open/copy actions (issue #38).
+
+local M = {}
+
+M.BASE = "https://www.flickr.com"
+
+-- Trim and stringify a component; return nil for an absent/blank value so the
+-- builders can fail closed (no half-formed ".../photos//123" URLs).
+local function clean(value)
+  if value == nil then return nil end
+  local s = tostring(value):gsub("^%s+", ""):gsub("%s+$", "")
+  if s == "" then return nil end
+  return s
+end
+
+-- Public photo page URL, or nil if either component is missing.
+function M.photo_url(owner, photo_id)
+  local o, p = clean(owner), clean(photo_id)
+  if not o or not p then return nil end
+  return string.format("%s/photos/%s/%s", M.BASE, o, p)
+end
+
+-- Public album (photoset) page URL, or nil if either component is missing.
+function M.photoset_url(owner, set_id)
+  local o, s = clean(owner), clean(set_id)
+  if not o or not s then return nil end
+  return string.format("%s/photos/%s/albums/%s", M.BASE, o, s)
+end
+
+return M
+end
+
 package.preload["dtrmflickr.report"] = function(...)
 -- report.lua — pure formatters for end-of-batch result reporting.
 --
@@ -3962,6 +4008,8 @@ package.preload["dtrmflickr.report"] = function(...)
 -- buckets that `store` accumulates in `extra_data` into concise, named detail
 -- lines without bloating the main module or touching darktable widgets, so they
 -- are unit-tested offline (see tests/test_report.lua).
+
+local urls = require "dtrmflickr.urls"
 
 local M = {}
 
@@ -4078,7 +4126,11 @@ M.skip_reason = skip_reason
 -- row's `failed_actions` (matched by photo_id, falling back to the same image
 -- object). `failed_actions` is always a list (empty when the upload was clean),
 -- so a row with #failed_actions > 0 is a "partial" success.
-function M.result_rows(extra_data)
+--
+-- `owner` (optional) is the active account's NSID/path_alias. When supplied,
+-- each uploaded row gets a `url` field with its public Flickr photo page URL
+-- (issue #37). Omit it (as the offline tests do) and rows carry no `url`.
+function M.result_rows(extra_data, owner)
   extra_data = extra_data or {}
   local rows = {}
 
@@ -4113,6 +4165,7 @@ function M.result_rows(extra_data)
       photo_id = up.photo_id,
       failed_actions = actions or {},
       attempts = tonumber(up.attempts),
+      url = owner and urls.photo_url(owner, up.photo_id) or nil,
     }
   end
   for _, sk in ipairs(extra_data.skipped or {}) do
@@ -4151,15 +4204,18 @@ local function attempts_suffix(row)
 end
 M.attempts_suffix = attempts_suffix
 
--- The right-hand detail column for a result row.
+-- The right-hand detail column for a result row. When an uploaded row carries a
+-- `url` (owner was known — issue #37), the public Flickr photo page URL is
+-- appended so the result table doubles as a copyable link list.
 local function row_detail(row)
   if row.kind == "uploaded" then
     local photo = row.photo_id and ("photo " .. tostring(row.photo_id)) or "uploaded"
+    local url_suffix = (row.url and row.url ~= "") and ("  " .. row.url) or ""
     if row.failed_actions and #row.failed_actions > 0 then
-      return string.format("%s (%s update failed)%s", photo,
-        table.concat(row.failed_actions, ", "), attempts_suffix(row))
+      return string.format("%s (%s update failed)%s%s", photo,
+        table.concat(row.failed_actions, ", "), attempts_suffix(row), url_suffix)
     end
-    return photo .. attempts_suffix(row)
+    return photo .. attempts_suffix(row) .. url_suffix
   elseif row.kind == "skipped" then
     return row.reason or "skipped"
   else
@@ -4177,7 +4233,7 @@ function M.result_table_lines(extra_data, opts)
   opts = opts or {}
   local tr = opts.translate
   if type(tr) ~= "function" then tr = function(s) return s end end
-  local rows = M.result_rows(extra_data)
+  local rows = M.result_rows(extra_data, opts.owner)
   if #rows == 0 then return {} end
 
   local status_w, name_w = 0, 0
@@ -4194,6 +4250,51 @@ function M.result_table_lines(extra_data, opts)
   local fmt = string.format("  %%-%ds  %%-%ds  %%s", status_w, name_w)
   for _, c in ipairs(cells) do
     lines[#lines + 1] = string.format(fmt, c.status, c.name, c.detail)
+  end
+  return lines
+end
+
+-- Compact "resulting Flickr URL" lines for the panel toast (issue #37). The
+-- per-image result table above is the full record and goes to the log; this is
+-- the user-facing "here's where it landed" line per uploaded photo. Needs the
+-- active account's `owner` (NSID/path_alias) to build the URL — without it (or
+-- with no uploads) it returns an empty list and the caller prints nothing.
+--
+-- `opts.max` caps how many URL lines are emitted before collapsing the rest
+-- into a single "(+N more — see log)" line, so a large batch does not flood the
+-- transient toast; the full set is always in the result table the caller logs.
+function M.uploaded_url_lines(extra_data, opts)
+  opts = opts or {}
+  local tr = opts.translate
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  local owner = opts.owner
+  local lines = {}
+  if not owner or owner == "" then return lines end
+  local uploaded = (extra_data and extra_data.uploaded) or {}
+
+  -- Only uploads that actually have a usable URL count toward the cap. For the
+  -- user-facing toast prefer the original image filename (recognizable, e.g.
+  -- "IMG_1234.cr2") over the export temp path that `name_of` favours.
+  local linkable = {}
+  for _, up in ipairs(uploaded) do
+    local url = urls.photo_url(owner, up.photo_id)
+    if url then
+      local img = type(up) == "table" and up.image
+      local name = (type(img) == "table" and img.filename and img.filename ~= "")
+        and img.filename or name_of(up)
+      linkable[#linkable + 1] = { name = name, url = url }
+    end
+  end
+
+  local max = tonumber(opts.max) or 10
+  if max < 1 then max = 1 end
+  local n = #linkable
+  local shown = math.min(n, max)
+  for i = 1, shown do
+    lines[#lines + 1] = string.format(tr("Flickr: %s -> %s"), linkable[i].name, linkable[i].url)
+  end
+  if n > shown then
+    lines[#lines + 1] = string.format(tr("Flickr: (+%d more — see log for all URLs)"), n - shown)
   end
   return lines
 end
@@ -7155,6 +7256,13 @@ local function finalize(storage, image_table, extra_data)
   for _, line in ipairs(report.finalize_detail_lines(extra_data, { translate = _ })) do
     dt.print(line)
   end
+  -- Show where each upload landed: the public Flickr photo URL (issue #37).
+  -- Capped to keep the transient toast readable; the full set is in the
+  -- per-image result table logged below.
+  local report_owner = extra_data.account and extra_data.account.nsid
+  for _, line in ipairs(report.uploaded_url_lines(extra_data, { translate = _, owner = report_owner })) do
+    dt.print(line)
+  end
   if keyword_conflicts > 0 then
     dt.print(string.format(_("Flickr: %d keyword rule conflict(s); see messages above"), keyword_conflicts))
   end
@@ -7168,7 +7276,7 @@ local function finalize(storage, image_table, extra_data)
   -- log rather than the transient panel toast: it is the complete record for a
   -- large batch, where a multi-line grid in a toast would be unreadable. The
   -- compact named lines above are the panel-facing summary.
-  for _, line in ipairs(report.result_table_lines(extra_data, { translate = _ })) do
+  for _, line in ipairs(report.result_table_lines(extra_data, { translate = _, owner = report_owner })) do
     dt.print_log("[dtrmflickr] " .. line)
   end
 end
