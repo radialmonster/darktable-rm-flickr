@@ -1289,6 +1289,9 @@ local state = require "dtrmflickr.state"
 
 local M = {}
 
+local TAG_FLAG_CATEGORY <const> = 1
+local TAG_FLAG_PRIVATE <const> = 2
+
 function M.image_title(image, filename)
   if image and image.title and image.title ~= "" then return image.title end
   if image and image.filename and image.filename ~= "" then return image.filename end
@@ -1357,6 +1360,38 @@ local function publish_tag_name(name)
   return leaf ~= "" and leaf or nil
 end
 
+local function tag_flags(tag)
+  return tonumber(tag and tag.flags or 0) or 0
+end
+
+local function tag_is_private_or_category(tag)
+  local flags = tag_flags(tag)
+  return (flags & (TAG_FLAG_PRIVATE | TAG_FLAG_CATEGORY)) ~= 0
+end
+
+local function has_private_category_parent(name)
+  name = tostring(name or "")
+  local parent = name:match("^(.*)|[^|]+$")
+  while parent and parent ~= "" do
+    local parent_tag = dt.tags and dt.tags.find and dt.tags.find(parent) or nil
+    local flags = tag_flags(parent_tag)
+    if (flags & (TAG_FLAG_PRIVATE | TAG_FLAG_CATEGORY)) == (TAG_FLAG_PRIVATE | TAG_FLAG_CATEGORY) then
+      return true
+    end
+    parent = parent:match("^(.*)|[^|]+$")
+  end
+  return false
+end
+
+local function tag_is_publishable_keyword(tag)
+  local name = tag and tag.name or nil
+  if not name or name == "" then return false end
+  if state.is_plugin_tag(name) or name:match("^darktable|") ~= nil then return false end
+  if tag_is_private_or_category(tag) then return false end
+  if has_private_category_parent(name) then return false end
+  return true
+end
+
 function M.image_keyword_tags(image, excluded_filters, tag_names, opts)
   opts = opts or {}
   local tags = {}
@@ -1372,8 +1407,7 @@ function M.image_keyword_tags(image, excluded_filters, tag_names, opts)
   for _, tag in ipairs(source_tags) do
     local name = tag and tag.name or nil
     if name and name ~= "" then
-      local excluded = state.is_plugin_tag(name) or name:match("^darktable|") ~= nil
-      if ((tonumber(tag.flags or 0) or 0) & 2) ~= 0 then excluded = true end
+      local excluded = not tag_is_publishable_keyword(tag)
       for _, filter in ipairs(excluded_filters or {}) do
         if M.tag_matches_filter(name, filter) then excluded = true; break end
       end
