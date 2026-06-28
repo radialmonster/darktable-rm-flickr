@@ -2642,6 +2642,18 @@ function M.new(opts)
     rate_limit_base_ms = opts.rate_limit_base_ms,
     retryable = opts.retryable or default_retryable,
     recent_limit = math.max(0, tonumber(opts.recent_limit) or 25),
+    -- Async pump hooks (issue #54). All optional and injected so the queue stays
+    -- offline-importable: `spawn` runs the pump loop off the UI thread
+    -- (dt.control.dispatch), `pump_yield` releases the control thread between
+    -- ticks (dt.control.sleep), `should_stop` aborts the loop on shutdown
+    -- (dt.control.ending). `pump_batch` jobs are drained per tick (default 1) and
+    -- `pump_tick_ms` is slept between ticks (default 0 — yield only).
+    spawn = opts.spawn,
+    pump_yield = opts.pump_yield,
+    should_stop = opts.should_stop,
+    pump_batch = math.max(1, math.floor(tonumber(opts.pump_batch) or 1)),
+    pump_tick_ms = math.max(0, math.floor(tonumber(opts.pump_tick_ms) or 0)),
+    pump_running = false,
     stats = {
       -- `started` counts *attempts* (incremented once per try inside the retry
       -- loop, so a job retried twice adds 3). `jobs_run` counts *jobs that
@@ -2858,6 +2870,104 @@ function Queue:drain()
   if not ok then error(err) end
 end
 
+-- ============ Async pump (issue #54) ============
+--
+-- drain() runs every pending job to a terminal state within one call. That is
+-- correct for the export store/finalize path, which is itself a synchronous
+-- darktable callback that must return each job's result inline. But it means a
+-- job never sits observably in running/waiting/retrying between event-loop
+-- turns, so a restart, a panel poll, or a persistence hook can never see
+-- in-flight work — the reason the lifecycle tracker and durable resume store
+-- exist as a data model but cannot run live (see docs/queue-system.md).
+--
+-- The async pump closes that gap: it drains a BOUNDED number of jobs per tick
+-- and yields control back to darktable between ticks, so (a) a long batch never
+-- freezes the UI for its whole duration, and (b) intermediate lifecycle states
+-- are observable between ticks (a panel polling `__dtrmflickr_jobs` sees the
+-- still-`queued` remainder while the just-run jobs are terminal). The
+-- success/failure + retry/backoff contract and idempotency guarantees are
+-- unchanged — the pump reuses finish_job/run_job exactly like drain().
+
+-- Run up to `max_jobs` pending jobs to a terminal state, then return control.
+-- Returns (jobs_run, pending_remaining). Honours the same `running` reentrancy
+-- guard as drain(): a reentrant Queue:call from inside a running job runs
+-- immediately (it sees running=true and jumps the queue) rather than being
+-- double-processed here. A no-op (returns 0) if a drain is already in progress.
+function Queue:drain_step(max_jobs)
+  if self.running then return 0, #self.pending end
+  max_jobs = math.max(1, math.floor(tonumber(max_jobs) or 1))
+  local ran = 0
+  self.running = true
+  -- Mirror drain()'s guarantee: clear `running` even if a job escapes run_job's
+  -- pcall, so one failure can never wedge the scheduler with running=true.
+  local ok, err = pcall(function()
+    while ran < max_jobs and #self.pending > 0 do
+      local job = table.remove(self.pending, 1)
+      self:finish_job(job)
+      ran = ran + 1
+    end
+  end)
+  self.running = false
+  if not ok then error(err) end
+  return ran, #self.pending
+end
+
+-- The pump loop body. Drains `pump_batch` jobs per tick and yields the control
+-- thread between ticks (via `pump_yield`) until the queue empties or
+-- `should_stop` signals shutdown. Idempotent: a second call while a pump is
+-- already running returns immediately, so two pumps can never race the same
+-- pending list. Stopping on `should_stop` leaves the remaining jobs pending —
+-- that is correct; the durable resume store (issues #55/#57) persists and
+-- replays them, so the pump must not force them to terminal on shutdown.
+function Queue:pump()
+  if self.pump_running then return end
+  self.pump_running = true
+  local ok, err = pcall(function()
+    while #self.pending > 0 do
+      if self.should_stop and self.should_stop() then break end
+      self:drain_step(self.pump_batch)
+      -- Only yield when more work remains, so the final tick does not sleep for
+      -- nothing. The yield releases the control thread (dt.control.sleep) so
+      -- darktable stays responsive and the intermediate states are observable.
+      if #self.pending > 0 and self.pump_yield then self.pump_yield(self.pump_tick_ms) end
+    end
+  end)
+  self.pump_running = false
+  if not ok then error(err) end
+end
+
+-- Enqueue work to run asynchronously and make sure a pump is draining it. Use
+-- this (instead of Queue:call) for work that should defer across darktable
+-- callbacks rather than block the caller for the whole batch. The result is
+-- delivered through the job's `done` callback (and the lifecycle events), not
+-- returned — an async caller cannot block on an inline return value.
+--
+-- If `spawn` is configured the pump runs off the UI thread; otherwise it runs
+-- inline here (still yielding between ticks via `pump_yield` if present, or just
+-- draining straight through if not) so a missing spawn degrades to a synchronous
+-- drain rather than silently stranding the job in `pending` forever.
+function Queue:submit_async(method, fn, opts)
+  local job = self:enqueue(method, fn, opts)
+  self:ensure_pump()
+  return job
+end
+
+-- Start the pump if one is not already running. Dispatched via `spawn` when
+-- available (dt.control.dispatch), else run inline.
+function Queue:ensure_pump()
+  if self.pump_running then return end
+  if #self.pending == 0 then return end
+  if self.spawn then
+    self.spawn(function() self:pump() end)
+  else
+    self:pump()
+  end
+end
+
+function Queue:pumping()
+  return self.pump_running == true
+end
+
 function Queue:call(method, fn, opts)
   local job = self:enqueue(method, fn, opts)
   -- `done` is now wired in enqueue (so both enqueue and call honour it); the
@@ -2917,6 +3027,7 @@ function Queue:summary()
   for k, v in pairs(self.stats) do copy[k] = v end
   copy.pending = #self.pending
   copy.running = self.running
+  copy.pumping = self.pump_running
   return copy
 end
 
@@ -4191,6 +4302,23 @@ __dtrmflickr_queue = require("dtrmflickr.queue").new {
     -- 1000 (that turned a 5000 ms rate-limit backoff into a 5 ms no-op and
     -- defeated pacing/retry/throttle waits entirely).
     if dt.control and dt.control.sleep then dt.control.sleep(math.floor(tonumber(ms) or 0)) end
+  end,
+  -- Async pump wiring (issue #54). These let the queue defer work across
+  -- darktable callbacks: `spawn` runs the pump loop off the UI thread,
+  -- `pump_yield` releases the control thread between ticks, and `should_stop`
+  -- aborts the loop when darktable is shutting down (leaving any remaining jobs
+  -- pending for the durable resume store to replay — issues #55/#57). No
+  -- production caller submits async work yet (the export path stays synchronous
+  -- via Queue:call); this completes the darktable integration surface the
+  -- resumable-upload children build on.
+  spawn = function(fn)
+    if dt.control and dt.control.dispatch then dt.control.dispatch(fn) else fn() end
+  end,
+  pump_yield = function(ms)
+    if dt.control and dt.control.sleep then dt.control.sleep(math.floor(tonumber(ms) or 0)) end
+  end,
+  should_stop = function()
+    return dt.control and dt.control.ending == true
   end,
   on_wait = function(ms, why, method, attempt)
     if why == "rate-limit" then
