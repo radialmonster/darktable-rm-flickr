@@ -4044,32 +4044,46 @@ local function join_values(values)
   return table.concat(values, ", ")
 end
 
-function panel_sets.refresh_queue_status()
-  local summary = __dtrmflickr_queue and __dtrmflickr_queue:summary() or nil
-  if not summary then
-    panel_sets.queue_label.label = ""
-    if panel_sets.queue_detail_label then panel_sets.queue_detail_label.label = "" end
-    return
-  end
-  panel_sets.queue_label.label = string.format(
+-- Pure formatter for the panel's two queue-status lines. Kept separate from the
+-- widget update so it can be unit-tested without darktable widgets. It surfaces
+-- the throttle/wait information the queue already tracks but the panel used to
+-- discard: the cumulative `rate_limited` count (so the user sees when Flickr is
+-- throttling the batch, not just the ok/failed totals) and the last job's
+-- `waited_ms` (so a job that visibly paused on backoff is distinguishable from
+-- one that ran straight through). Returns (label, detail).
+local function format_queue_status(summary, recent)
+  if not summary then return "", "" end
+  local label = string.format(
     _("queue: %d ok, %d failed, %d retried, %d pending"),
     summary.succeeded or 0, summary.failed or 0, summary.retried or 0, summary.pending or 0)
-  if panel_sets.queue_detail_label and __dtrmflickr_queue.recent_results then
-    local recent = __dtrmflickr_queue:recent_results()
-    local last = recent[#recent]
-    if last then
-      local name = last.label or last.method or _("request")
-      local attempts = tonumber(last.attempts) or 0
-      local detail = string.format(_("last queue: %s %s"), tostring(name), tostring(last.status or ""))
-      if attempts > 1 then
-        detail = detail .. string.format(_(" after %d attempts"), attempts)
-      end
-      if last.error then detail = detail .. ": " .. tostring(last.error) end
-      panel_sets.queue_detail_label.label = detail
-    else
-      panel_sets.queue_detail_label.label = ""
-    end
+  if (tonumber(summary.rate_limited) or 0) > 0 then
+    label = label .. string.format(_(" - throttled %dx"), summary.rate_limited)
   end
+  local detail = ""
+  local last = recent and recent[#recent] or nil
+  if last then
+    local name = last.label or last.method or _("request")
+    local attempts = tonumber(last.attempts) or 0
+    detail = string.format(_("last queue: %s %s"), tostring(name), tostring(last.status or ""))
+    if attempts > 1 then
+      detail = detail .. string.format(_(" after %d attempts"), attempts)
+    end
+    local waited = tonumber(last.waited_ms) or 0
+    if waited > 0 then
+      detail = detail .. string.format(_(" (waited %.1fs)"), waited / 1000)
+    end
+    if last.error then detail = detail .. ": " .. tostring(last.error) end
+  end
+  return label, detail
+end
+
+function panel_sets.refresh_queue_status()
+  local summary = __dtrmflickr_queue and __dtrmflickr_queue:summary() or nil
+  local recent = (summary and __dtrmflickr_queue.recent_results)
+    and __dtrmflickr_queue:recent_results() or nil
+  local label, detail = format_queue_status(summary, recent)
+  panel_sets.queue_label.label = label
+  if panel_sets.queue_detail_label then panel_sets.queue_detail_label.label = detail end
 end
 
 function panel_sets.clear_choices()
@@ -5849,6 +5863,7 @@ script_data.__test = {
   panel_content_type_index_from_search_value = panel_content_type_index_from_search_value,
   flickr_queue = __dtrmflickr_queue,
   flickr_call = __dtrmflickr_call,
+  format_queue_status = format_queue_status,
   privacy_values = settings.privacy_values,
   safety_values = settings.safety_values,
   content_type_values = settings.content_type_values,
