@@ -1913,6 +1913,7 @@ local dt = require "darktable"
 local rest = require "dtrmflickr.flickr_rest"
 local state = require "dtrmflickr.state"
 local metadata = require "dtrmflickr.metadata"
+local queue = require "dtrmflickr.queue"
 
 local M = {}
 
@@ -2041,6 +2042,7 @@ end
 
 local function search_existing_candidates(api_key, api_secret, acc, image)
   local candidates, errors = {}, {}
+  local transient = nil
   local terms = M.claim_match_terms(image)
   local taken = metadata.image_date_taken(image)
 
@@ -2052,6 +2054,10 @@ local function search_existing_candidates(api_key, api_secret, acc, image)
     local bodies, err = rest.photos_search_all(api_key, api_secret, acc, args, { per_page = 50 })
     if not bodies then
       errors[#errors + 1] = tostring(err)
+      -- Remember the first transient/rate-limit failure so the caller can ask
+      -- the shared queue to retry the whole claim instead of concluding "no
+      -- match" from an incomplete candidate set.
+      if not transient and queue.is_retryable(err) then transient = tostring(err) end
       return
     end
     for _, body in ipairs(bodies) do
@@ -2068,7 +2074,7 @@ local function search_existing_candidates(api_key, api_secret, acc, image)
     run_search({ text = term, sort = "relevance" }, "text")
   end
 
-  return candidate_list(candidates), terms, taken, errors
+  return candidate_list(candidates), terms, taken, errors, transient
 end
 
 function M.choose_existing_match(candidates, terms, taken)
@@ -2097,12 +2103,17 @@ end
 
 function M.claim_existing_for_image(api_key, api_secret, acc, image)
   if state.get_photo_id(image, acc.nsid) then return "skipped", "already linked" end
-  local candidates, terms, taken, errors = search_existing_candidates(api_key, api_secret, acc, image)
+  local candidates, terms, taken, errors, transient = search_existing_candidates(api_key, api_secret, acc, image)
   local match, reason = M.choose_existing_match(candidates, terms, taken)
   if match then
     state.set_photo_id(image, acc.nsid, match.id)
     return "claimed", string.format("%s (%s)", tostring(match.id), reason)
   end
+  -- A transient/rate-limit failure left the candidate set incomplete, so any
+  -- "no match"/"skipped"/"ambiguous" verdict here is unreliable. Surface a
+  -- (nil, err) failure so the queued job retries the whole claim with backoff
+  -- instead of permanently mislinking nothing.
+  if transient then return nil, transient end
   if #errors > 0 and #candidates == 0 then return "error", table.concat(errors, "; ") end
   return "skipped", reason
 end
@@ -2152,6 +2163,13 @@ local function default_retryable(err)
   if s:find("write operation failed", 1, true) or s:find("(106)", 1, true) then return true, "transient" end
   if s:find("empty flickr", 1, true) then return true, "transient" end
   return false
+end
+
+-- Exposed so multi-call helpers (e.g. claim's fan-out of searches inside one
+-- queue job) can classify a transient/rate-limit failure and choose to surface
+-- it as a retryable `nil, err` instead of swallowing it into a status string.
+function M.is_retryable(err)
+  return default_retryable(err)
 end
 
 local function backoff_delay_ms(job, attempt, reason)
@@ -4895,6 +4913,9 @@ local function claim_existing_selection()
     local status, detail = __dtrmflickr_call("flickr.photos.search", function()
       return claim.claim_existing_for_image(api_key, api_secret, acc, image)
     end)
+    -- The queue returns (nil, err) when a transient claim search exhausted its
+    -- retries; treat that as an error rather than indexing counts[nil].
+    if status == nil then status = "error" end
     counts[status] = (counts[status] or 0) + 1
     local file = image and image.filename or "image"
     if status == "claimed" then
