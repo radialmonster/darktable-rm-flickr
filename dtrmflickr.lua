@@ -902,16 +902,41 @@ function M.parse_photosets(body)
     local id = attrs:match('id="(.-)"') or attrs:match("id='(.-)'")
     local title = inner:match("<title>(.-)</title>") or ""
     if id and id ~= "" then
+      local requested = attrs:match('has_requested_photos="(.-)"')
+        or attrs:match("has_requested_photos='(.-)'")
+        or inner:match("<has_requested_photos>(.-)</has_requested_photos>")
+        or ""
       sets[#sets + 1] = {
         id = xml_unescape(id),
         title = xml_unescape(title),
         photos = attrs:match('photos="(.-)"') or attrs:match("photos='(.-)'"),
         videos = attrs:match('videos="(.-)"') or attrs:match("videos='(.-)'"),
+        has_requested_photos = xml_unescape(requested),
+        has_requested_photos_marker = inner:find("<has_requested_photos%s*/>", 1) ~= nil,
+        has_photo_marker = inner:find("<has_photo%s*/>", 1) ~= nil,
       }
     end
   end
   return sets
 end
+
+local function photoset_has_requested_photo(item, photo_id)
+  photo_id = tostring(photo_id or "")
+  if photo_id == "" or not item then return false end
+  local requested = tostring(item.has_requested_photos or "")
+  for id in requested:gmatch("[^,%s]+") do
+    if id == photo_id then return true end
+  end
+  for id in requested:gmatch('id="(.-)"') do
+    if id == photo_id then return true end
+  end
+  for id in requested:gmatch("id='(.-)'") do
+    if id == photo_id then return true end
+  end
+  if item.has_requested_photos_marker or item.has_photo_marker then return true end
+  return false
+end
+M.photoset_has_requested_photo = photoset_has_requested_photo
 
 function M.parse_page_info(body, container)
   container = container or "photosets"
@@ -923,8 +948,13 @@ function M.parse_page_info(body, container)
   return page, pages, total
 end
 
-function M.photosets_get_list(api_key, api_secret, account, user_id)
-  local nsid = user_id or (account and account.nsid) or nil
+function M.photosets_get_list(api_key, api_secret, account, user_id, opts)
+  if type(user_id) == "table" and opts == nil then
+    opts = user_id
+    user_id = nil
+  end
+  opts = opts or {}
+  local nsid = user_id or opts.user_id or (account and account.nsid) or nil
   if not nsid or nsid == "" then return nil, "missing user id" end
 
   local all_sets, bodies = {}, {}
@@ -935,6 +965,10 @@ function M.photosets_get_list(api_key, api_secret, account, user_id)
       per_page = 500,
       page = page,
     }
+    if opts.photo_ids and opts.photo_ids ~= "" then
+      args.photo_ids = opts.photo_ids
+      args.sort_groups = opts.sort_groups or "has_photo"
+    end
     local body, err
     if account and account.token and account.secret then
       body, err = M.call(api_key, api_secret, account, "flickr.photosets.getList", args)
@@ -951,6 +985,23 @@ function M.photosets_get_list(api_key, api_secret, account, user_id)
   until page > pages
 
   return all_sets, table.concat(bodies, "\n")
+end
+
+function M.photosets_get_memberships(api_key, api_secret, account, photo_id, user_id)
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+  local sets, body = M.photosets_get_list(api_key, api_secret, account, user_id, {
+    photo_ids = photo_id,
+    sort_groups = "has_photo",
+  })
+  if not sets then return nil, body end
+
+  local memberships = {}
+  for _, item in ipairs(sets) do
+    if photoset_has_requested_photo(item, photo_id) then
+      memberships[#memberships + 1] = item
+    end
+  end
+  return memberships, body, sets
 end
 
 function M.photos_licenses_set_license(api_key, api_secret, account, photo_id, license_id)
@@ -2391,6 +2442,21 @@ local function find_album_match(value)
   return nil, "none"
 end
 
+local function find_album_exact(value)
+  value = trim(value)
+  if value == "" then return nil, "empty" end
+  local lower = value:lower()
+  for _, item in ipairs(album_cache) do
+    local id = tostring(item.id or "")
+    local title = tostring(item.title or "")
+    local label = album_label(item)
+    if value == id or lower == title:lower() or lower == label:lower() then
+      return item, "exact"
+    end
+  end
+  return nil, "none"
+end
+
 local function refresh_album_matches()
   local query = album_input_value()
   if query == "" and album_entry.text == "" then query = "" end
@@ -2988,6 +3054,30 @@ function panel_sets.refresh_list()
   return sets
 end
 
+function panel_sets.refresh_memberships()
+  local image, acc, photo_id, api_key, api_secret = panel_sets.api_context(_("refreshing albums"))
+  if not image then return nil end
+
+  local memberships, err, sets = rest.photosets_get_memberships(api_key, api_secret, acc, photo_id)
+  if not memberships then
+    panel_sets.status_label.label = _("album membership refresh failed")
+    dt.print(string.format(_("Flickr: album membership refresh failed: %s"), tostring(err)))
+    return nil, err
+  end
+
+  if sets then set_album_cache(sets) end
+  state.clear_sets(image, acc.nsid)
+  for _, item in ipairs(memberships) do
+    if item.id and item.id ~= "" then state.add_set(image, acc.nsid, item.id) end
+  end
+  panel_sets_label.label = panel_sets.format_memberships(state.get_sets(image, acc.nsid))
+  panel_sets.update_current_choices(image, acc.nsid)
+  panel_sets.update_choices(panel_sets.input_value())
+  panel_sets.status_label.label = string.format(_("synced %d album membership(s)"), #memberships)
+  dt.print(panel_sets.status_label.label)
+  return memberships
+end
+
 function panel_sets.resolve(value)
   local match, kind = find_album_match(value)
   if match then return match, kind end
@@ -3065,7 +3155,7 @@ function panel_sets.create()
     return
   end
 
-  local existing = find_album_match(title)
+  local existing = find_album_exact(title)
   if existing then
     panel_sets.status_label.label = _("album already exists")
     dt.print(string.format(_("Flickr: album '%s' already exists; use add existing album."), title))
@@ -3450,6 +3540,10 @@ local panel_widget = dt.new_widget("box") {
       label = _("refresh albums"),
       clicked_callback = function() panel_sets.refresh_list() end,
     },
+    dt.new_widget("button") {
+      label = _("sync memberships"),
+      clicked_callback = function() panel_sets.refresh_memberships() end,
+    },
   },
   dt.new_widget("label") { label = _("add existing album") },
   panel_sets.entry,
@@ -3596,7 +3690,7 @@ local function current_album()
     return { mode = "none", error = "album not found or ambiguous", query = existing_value, match = match_kind }
   end
   if mode == 3 and new_title ~= "" then
-    local match, match_kind = find_album_match(new_title)
+    local match, match_kind = find_album_exact(new_title)
     if match then
       return {
         mode = "existing",
