@@ -1938,10 +1938,28 @@ function M.image_date_taken(image)
   return string.format("%s-%s-%s %s:%s:%s", y, mo, d, h, mi, s)
 end
 
+-- Format a decimal-degree coordinate to 6 fractional digits WITHOUT going
+-- through string.format("%.6f"). C's printf "%f" honours LC_NUMERIC, and
+-- darktable runs under setlocale(LC_ALL, "") (the user's locale) without forcing
+-- LC_NUMERIC=C for the Lua VM — it only resets numerics locally around specific
+-- C code. So on a comma-decimal locale (de_DE, fr_FR, ...) "%.6f" would emit
+-- "36,084244", and that string is handed straight to flickr.photos.geo.setLocation
+-- as lat/lon, corrupting every geotagged upload's GPS. Build the string from
+-- integer parts (%d/%06d carry no decimal separator) with a hardcoded ".", so the
+-- output is identical on every locale.
+local function format_coord6(n)
+  local neg = n < 0
+  n = math.abs(n)
+  local int = math.floor(n)
+  local frac = math.floor((n - int) * 1000000 + 0.5)
+  if frac >= 1000000 then int = int + 1; frac = frac - 1000000 end
+  return string.format("%s%d.%06d", neg and "-" or "", int, frac)
+end
+
 local function flickr_coordinate(value, min_value, max_value)
   local n = tonumber(value)
   if not n or n ~= n or n < min_value or n > max_value then return nil end
-  return string.format("%.6f", n)
+  return format_coord6(n)
 end
 
 function M.image_location(image)
