@@ -1159,12 +1159,17 @@ local function set_tag(account_nsid, set_id)
   return table.concat({ PREFIX, tostring(account_nsid), "set", tostring(set_id) }, "|")
 end
 
-local function published_tag(account_nsid, stamp)
-  return table.concat({ PREFIX, tostring(account_nsid), "published", tostring(stamp) }, "|")
+local function published_tag(account_nsid, kind, stamp)
+  if kind == nil then return table.concat({ PREFIX, tostring(account_nsid), "published", tostring(stamp) }, "|") end
+  return table.concat({ PREFIX, tostring(account_nsid), "published", tostring(kind), tostring(stamp) }, "|")
 end
 
 local function needs_republish_tag(account_nsid)
   return table.concat({ PREFIX, tostring(account_nsid), "needs-republish" }, "|")
+end
+
+local function reason_tag(account_nsid, reason)
+  return table.concat({ PREFIX, tostring(account_nsid), "reason", tostring(reason) }, "|")
 end
 
 local function valid_component(value)
@@ -1177,7 +1182,7 @@ local function assert_component(kind, value)
 end
 
 local function is_reserved_account_component(value)
-  return value == "set" or value == "published" or value == "needs-republish"
+  return value == "set" or value == "published" or value == "needs-republish" or value == "reason"
 end
 
 local function ensure_tag(name)
@@ -1256,24 +1261,62 @@ function M.get_any_photo_id(image)
   return nil, nil
 end
 
-function M.get_published_at(image, account_nsid)
+local function valid_publish_kind(kind)
+  return kind == "image" or kind == "metadata"
+end
+
+local function latest_published_at(image, account_nsid, kind)
   local prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|published|"
   local latest
   for _, tag in ipairs(image_tags(image) or {}) do
     local name = tag_name(tag)
-    local stamp = name and name:sub(1, #prefix) == prefix and name:sub(#prefix + 1) or nil
+    local rest = name and name:sub(1, #prefix) == prefix and name:sub(#prefix + 1) or nil
+    local stamp
+    if rest then
+      if kind then
+        stamp = rest:match("^" .. kind .. "|(.+)$")
+      else
+        local tag_kind, tag_stamp = rest:match("^([^|]+)|(.+)$")
+        if valid_publish_kind(tag_kind) then stamp = tag_stamp else stamp = rest end
+      end
+    end
     if stamp and normalize_stamp(stamp) and (not latest or stamp_is_newer(stamp, latest)) then latest = stamp end
   end
   return latest
 end
 
-function M.clear_published_at(image, account_nsid)
+function M.get_published_at(image, account_nsid, kind)
+  if kind then
+    return latest_published_at(image, account_nsid, kind)
+  end
+  return latest_published_at(image, account_nsid, "image")
+    or latest_published_at(image, account_nsid, nil)
+end
+
+function M.get_image_published_at(image, account_nsid)
+  return M.get_published_at(image, account_nsid, "image")
+end
+
+function M.get_metadata_published_at(image, account_nsid)
+  return M.get_published_at(image, account_nsid, "metadata")
+end
+
+function M.clear_published_at(image, account_nsid, kind)
   assert_component("account id", account_nsid)
   local prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|published|"
   local removed = 0
   for _, tag in ipairs(image_tags(image) or {}) do
     local name = tag_name(tag)
-    if name and name:sub(1, #prefix) == prefix then
+    local rest = name and name:sub(1, #prefix) == prefix and name:sub(#prefix + 1) or nil
+    local matches = false
+    if rest then
+      if kind == nil then
+        matches = true
+      else
+        matches = rest:sub(1, #kind + 1) == kind .. "|"
+      end
+    end
+    if matches then
       detach(image, tag)
       removed = removed + 1
     end
@@ -1281,34 +1324,117 @@ function M.clear_published_at(image, account_nsid)
   return removed
 end
 
-function M.set_published_at(image, account_nsid, stamp)
+local function set_published_kind_at(image, account_nsid, kind, stamp)
   assert_component("account id", account_nsid)
+  assert(valid_publish_kind(kind), "invalid Flickr published kind")
   stamp = stamp or M.now_stamp()
   stamp = compact_stamp(stamp)
   assert(stamp, "invalid Flickr published stamp")
-  M.clear_published_at(image, account_nsid)
-  attach(image, ensure_tag(published_tag(account_nsid, stamp)))
+  M.clear_published_at(image, account_nsid, kind)
+  attach(image, ensure_tag(published_tag(account_nsid, kind, stamp)))
+  return stamp
+end
+
+function M.set_image_published_at(image, account_nsid, stamp)
+  local result = set_published_kind_at(image, account_nsid, "image", stamp)
+  M.clear_reason(image, account_nsid, "image")
+  return result
+end
+
+function M.set_metadata_published_at(image, account_nsid, stamp)
+  return set_published_kind_at(image, account_nsid, "metadata", stamp)
+end
+
+function M.set_published_at(image, account_nsid, stamp)
+  stamp = stamp or M.now_stamp()
+  stamp = compact_stamp(stamp)
+  assert(stamp, "invalid Flickr published stamp")
+  M.set_image_published_at(image, account_nsid, stamp)
+  M.set_metadata_published_at(image, account_nsid, stamp)
+  M.clear_metadata_reasons(image, account_nsid)
   M.clear_needs_republish(image, account_nsid)
   return stamp
 end
 
-function M.mark_needs_republish(image, account_nsid)
+function M.mark_reason(image, account_nsid, reason)
   assert_component("account id", account_nsid)
+  assert_component("reason", reason)
+  attach(image, ensure_tag(reason_tag(account_nsid, reason)))
   attach(image, ensure_tag(needs_republish_tag(account_nsid)))
+end
+
+function M.clear_reason(image, account_nsid, reason)
+  assert_component("account id", account_nsid)
+  assert_component("reason", reason)
+  local tag = dt.tags.find(reason_tag(account_nsid, reason))
+  if not tag then return false end
+  detach(image, tag)
+  if #M.get_reasons(image, account_nsid) == 0 then M.clear_needs_republish(image, account_nsid) end
+  return true
+end
+
+local metadata_reasons = {
+  keywords = true,
+  title_description = true,
+  gps = true,
+  date_taken = true,
+  visibility = true,
+  safety = true,
+  content_type = true,
+  license = true,
+  permissions = true,
+}
+
+function M.clear_metadata_reasons(image, account_nsid)
+  local removed = 0
+  for reason in pairs(metadata_reasons) do
+    if M.clear_reason(image, account_nsid, reason) then removed = removed + 1 end
+  end
+  return removed
+end
+
+function M.get_reasons(image, account_nsid)
+  local prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|reason|"
+  local reasons = {}
+  for _, tag in ipairs(image_tags(image) or {}) do
+    local name = tag_name(tag)
+    local reason = name and name:sub(1, #prefix) == prefix and name:sub(#prefix + 1) or nil
+    if valid_component(reason) then reasons[#reasons + 1] = reason end
+  end
+  table.sort(reasons)
+  return reasons
+end
+
+function M.mark_needs_republish(image, account_nsid)
+  M.mark_reason(image, account_nsid, "image")
 end
 
 function M.clear_needs_republish(image, account_nsid)
   assert_component("account id", account_nsid)
+  local removed = false
+  local reason_prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|reason|"
+  for _, tag in ipairs(image_tags(image) or {}) do
+    local name = tag_name(tag)
+    if name and name:sub(1, #reason_prefix) == reason_prefix then
+      detach(image, tag)
+      removed = true
+    end
+  end
   local tag = dt.tags.find(needs_republish_tag(account_nsid))
-  if not tag then return false end
-  detach(image, tag)
-  return true
+  if tag then
+    detach(image, tag)
+    removed = true
+  end
+  return removed
 end
 
 function M.needs_republish(image, account_nsid)
   local name = needs_republish_tag(account_nsid)
+  local reason_prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|reason|"
   for _, tag in ipairs(image_tags(image) or {}) do
-    if tag_name(tag) == name then return true end
+    local tagname = tag_name(tag)
+    if tagname == name then return true end
+    if tagname and tagname:sub(1, #reason_prefix) == reason_prefix then return true end
   end
   return false
 end
@@ -1317,19 +1443,26 @@ function M.evaluate_publish_state(image, account_nsid)
   local photo_id = M.get_photo_id(image, account_nsid)
   if not photo_id then return "unpublished", nil, nil end
 
-  local published_at = M.get_published_at(image, account_nsid)
+  local image_published_at = M.get_image_published_at(image, account_nsid)
+  local metadata_published_at = M.get_metadata_published_at(image, account_nsid)
+  local published_at = image_published_at or metadata_published_at or M.get_published_at(image, account_nsid)
+  local reasons = M.get_reasons(image, account_nsid)
+  if #reasons > 0 or M.needs_republish(image, account_nsid) then
+    return "needs-republish", published_at, photo_id, reasons
+  end
   if not published_at then
-    return M.needs_republish(image, account_nsid) and "needs-republish" or "unknown", published_at, photo_id
+    return "unknown", published_at, photo_id, reasons
   end
 
   local changed_at = image and image.change_timestamp or nil
-  if changed_at and stamp_is_newer(changed_at, published_at) then
+  local image_change_baseline = image_published_at or published_at
+  if changed_at and image_change_baseline and stamp_is_newer(changed_at, image_change_baseline) then
     M.mark_needs_republish(image, account_nsid)
-    return "needs-republish", published_at, photo_id
+    return "needs-republish", published_at, photo_id, M.get_reasons(image, account_nsid)
   end
 
   M.clear_needs_republish(image, account_nsid)
-  return "current", published_at, photo_id
+  return "current", published_at, photo_id, reasons
 end
 
 function M.set_photo_id(image, account_nsid, photo_id)
@@ -3575,14 +3708,26 @@ local function save_panel_settings()
   if wants_perms and can_update_perms then
     local ok, err = rest.photos_set_perms(api_key, api_secret, acc, photo_id, is_public, is_friend, is_family,
       panel_comment_perm_value(), panel_addmeta_perm_value())
-    if not ok then errors[#errors + 1] = "privacy: " .. tostring(err) end
+    if not ok then
+      state.mark_reason(panel_current.image, acc.nsid, "visibility")
+      state.mark_reason(panel_current.image, acc.nsid, "permissions")
+      errors[#errors + 1] = "privacy: " .. tostring(err)
+    else
+      state.clear_reason(panel_current.image, acc.nsid, "visibility")
+      state.clear_reason(panel_current.image, acc.nsid, "permissions")
+    end
   elseif wants_perms then
     skipped[#skipped + 1] = "privacy/permissions"
   end
   local safety = panel_safety_value()
   if panel_dirty.safety and sync.safety then
     local ok, err = rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety)
-    if not ok then errors[#errors + 1] = "safety: " .. tostring(err) end
+    if not ok then
+      state.mark_reason(panel_current.image, acc.nsid, "safety")
+      errors[#errors + 1] = "safety: " .. tostring(err)
+    else
+      state.clear_reason(panel_current.image, acc.nsid, "safety")
+    end
   elseif panel_dirty.safety then
     skipped[#skipped + 1] = "safety"
   end
@@ -3590,7 +3735,12 @@ local function save_panel_settings()
   if panel_dirty.content_type and sync.content_type then
     if content_type then
       local ok, err = rest.photos_set_content_type(api_key, api_secret, acc, photo_id, content_type)
-      if not ok then errors[#errors + 1] = "content type: " .. tostring(err) end
+      if not ok then
+        state.mark_reason(panel_current.image, acc.nsid, "content_type")
+        errors[#errors + 1] = "content type: " .. tostring(err)
+      else
+        state.clear_reason(panel_current.image, acc.nsid, "content_type")
+      end
     else
       errors[#errors + 1] = "content type: choose a value first"
     end
@@ -3600,7 +3750,12 @@ local function save_panel_settings()
   local license = panel_license_value()
   if panel_dirty.license and sync.license then
     local ok, err = rest.photos_licenses_set_license(api_key, api_secret, acc, photo_id, license)
-    if not ok then errors[#errors + 1] = "license: " .. tostring(err) end
+    if not ok then
+      state.mark_reason(panel_current.image, acc.nsid, "license")
+      errors[#errors + 1] = "license: " .. tostring(err)
+    else
+      state.clear_reason(panel_current.image, acc.nsid, "license")
+    end
   elseif panel_dirty.license then
     skipped[#skipped + 1] = "license"
   end
@@ -3612,7 +3767,7 @@ local function save_panel_settings()
     panel_remote_label.label = _("Flickr: settings skipped by Lua sync options")
     dt.print(_("Flickr: settings skipped by Lua sync options: ") .. table.concat(skipped, ", "))
   else
-    state.set_published_at(panel_current.image, acc.nsid)
+    state.set_metadata_published_at(panel_current.image, acc.nsid)
     panel_sets.refresh_publish_state_label(panel_current.image, acc, photo_id)
     panel_remote_label.label = _("Flickr: settings saved")
     dt.print(_("Flickr: settings saved."))
@@ -3654,12 +3809,14 @@ local function sync_panel_meta()
 
   local ok, err = rest.photos_set_meta(api_key, api_secret, acc, photo_id, title, description)
   if ok then
-    state.set_published_at(image, acc.nsid)
+    state.set_metadata_published_at(image, acc.nsid)
+    state.clear_reason(image, acc.nsid, "title_description")
     panel_sets.refresh_publish_state_label(image, acc, photo_id)
     panel_remote_label.label = _("Flickr: title/description synced")
     dt.print(_("Flickr: title/description synced."))
     load_remote_settings(api_key, api_secret, acc, photo_id)
   else
+    state.mark_reason(image, acc.nsid, "title_description")
     panel_remote_label.label = _("Flickr: metadata sync failed")
     dt.print(_("Flickr: metadata sync failed: ") .. tostring(err))
   end
@@ -3700,22 +3857,28 @@ local function sync_panel_tags()
 
   local ok, err = rest.photos_set_tags(api_key, api_secret, acc, photo_id, tags)
   if ok then
-    state.set_published_at(image, acc.nsid)
+    state.set_metadata_published_at(image, acc.nsid)
+    state.clear_reason(image, acc.nsid, "keywords")
     panel_sets.refresh_publish_state_label(image, acc, photo_id)
     panel_remote_label.label = _("Flickr: keywords synced")
     dt.print(_("Flickr: keywords synced."))
     load_remote_settings(api_key, api_secret, acc, photo_id)
   else
+    state.mark_reason(image, acc.nsid, "keywords")
     panel_remote_label.label = _("Flickr: keyword sync failed")
     dt.print(_("Flickr: keyword sync failed: ") .. tostring(err))
   end
 end
 
-local function publish_state_label(status, published_at)
+local function publish_state_label(status, published_at, reasons)
+  local suffix = published_at and (" (" .. published_at .. ")") or ""
+  if reasons and #reasons > 0 then
+    suffix = suffix .. ": " .. table.concat(reasons, ", ")
+  end
   if status == "current" then
-    return string.format(_("publish state: current%s"), published_at and (" (" .. published_at .. ")") or "")
+    return string.format(_("publish state: current%s"), suffix)
   elseif status == "needs-republish" then
-    return string.format(_("publish state: needs sync%s"), published_at and (" (" .. published_at .. ")") or "")
+    return string.format(_("publish state: needs sync%s"), suffix)
   elseif status == "unknown" then
     return _("publish state: linked, sync date unknown")
   elseif status == "unpublished" then
@@ -3733,9 +3896,9 @@ function panel_sets.refresh_publish_state_label(image, acc, photo_id)
     panel_sets.publish_label.label = _("publish state: log in to evaluate")
     return "unknown"
   end
-  local status, published_at = state.evaluate_publish_state(image, acc.nsid)
-  panel_sets.publish_label.label = publish_state_label(status, published_at)
-  return status, published_at
+  local status, published_at, _photo_id, reasons = state.evaluate_publish_state(image, acc.nsid)
+  panel_sets.publish_label.label = publish_state_label(status, published_at, reasons)
+  return status, published_at, reasons
 end
 
 function panel_sets.mark_needs_republish()
@@ -3752,8 +3915,8 @@ function panel_sets.mark_needs_republish()
     dt.print(_("Flickr: log in from Lua Options before marking sync state."))
     return
   end
-  state.mark_needs_republish(image, acc.nsid)
-  panel_sets.publish_label.label = publish_state_label("needs-republish", state.get_published_at(image, acc.nsid))
+  state.mark_reason(image, acc.nsid, "image")
+  panel_sets.publish_label.label = publish_state_label("needs-republish", state.get_published_at(image, acc.nsid), state.get_reasons(image, acc.nsid))
   dt.print(_("Flickr: marked selected photo as needing sync."))
 end
 
@@ -4430,13 +4593,17 @@ local function store(storage, image, format, filename, number, total, high_quali
   })
   if photo_id then
     state.set_photo_id(image, extra_data.account.nsid, photo_id)
+    state.set_image_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
     local post_failed = false
     if sync.license or forced.license then
       local license_ok, license_err = rest.photos_licenses_set_license(extra_data.api_key, extra_data.api_secret,
         extra_data.account, photo_id, license.flickr_value)
       if not license_ok then
         post_failed = true
+        state.mark_reason(image, extra_data.account.nsid, "license")
         record_post_error(extra_data, image, photo_id, "license", license_err)
+      else
+        state.clear_reason(image, extra_data.account.nsid, "license")
       end
     end
 
@@ -4446,7 +4613,10 @@ local function store(storage, image, format, filename, number, total, high_quali
         extra_data.account, photo_id, date_taken, 0)
       if not dates_ok then
         post_failed = true
+        state.mark_reason(image, extra_data.account.nsid, "date_taken")
         record_post_error(extra_data, image, photo_id, "date", dates_err)
+      else
+        state.clear_reason(image, extra_data.account.nsid, "date_taken")
       end
     end
 
@@ -4457,11 +4627,14 @@ local function store(storage, image, format, filename, number, total, high_quali
         extra_data.account, photo_id, lat, lon, 16)
       if not geo_ok then
         post_failed = true
+        state.mark_reason(image, extra_data.account.nsid, "gps")
         record_post_error(extra_data, image, photo_id, "location", geo_err)
+      else
+        state.clear_reason(image, extra_data.account.nsid, "gps")
       end
     end
     if post_failed then
-      state.mark_needs_republish(image, extra_data.account.nsid)
+      state.set_metadata_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
     else
       state.set_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
     end
