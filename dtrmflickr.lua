@@ -1912,6 +1912,117 @@ end
 return M
 end
 
+package.preload["dtrmflickr.queue"] = function(...)
+-- queue.lua — small serial scheduler for Flickr API work.
+--
+-- darktable Lua callbacks are synchronous, but keeping every Flickr operation
+-- behind one scheduler gives us one place for pacing, coalescing, and stale UI
+-- checks. Jobs normally run immediately; if a callback enqueues more work while
+-- the queue is active, duplicate coalesced pending jobs are replaced.
+
+local M = {}
+
+local function monotonic_ms()
+  return math.floor((os.clock() or 0) * 1000)
+end
+
+local function sleep_ms(sleep_fn, ms)
+  if sleep_fn and ms and ms > 0 then sleep_fn(ms) end
+end
+
+local Queue = {}
+Queue.__index = Queue
+
+function M.new(opts)
+  opts = opts or {}
+  return setmetatable({
+    pending = {},
+    running = false,
+    last_started = {},
+    now_ms = opts.now_ms or monotonic_ms,
+    sleep_ms = opts.sleep_ms,
+    default_pace_ms = opts.default_pace_ms or 0,
+    method_pace_ms = opts.method_pace_ms or {},
+    stats = { enqueued = 0, started = 0, coalesced = 0, stale = 0, failed = 0 },
+  }, Queue)
+end
+
+function Queue:pace_for(method, opts)
+  if opts and opts.pace_ms ~= nil then return tonumber(opts.pace_ms) or 0 end
+  return tonumber(self.method_pace_ms[method]) or tonumber(self.default_pace_ms) or 0
+end
+
+function Queue:enqueue(method, fn, opts)
+  assert(type(fn) == "function", "queue job must be a function")
+  opts = opts or {}
+  local job = {
+    method = tostring(method or "flickr.unknown"),
+    fn = fn,
+    coalesce_key = opts.coalesce_key,
+    stale = opts.stale,
+    pace_ms = self:pace_for(method, opts),
+  }
+
+  if job.coalesce_key then
+    for i, pending in ipairs(self.pending) do
+      if pending.coalesce_key == job.coalesce_key then
+        self.pending[i] = job
+        self.stats.coalesced = self.stats.coalesced + 1
+        return job
+      end
+    end
+  end
+
+  self.pending[#self.pending + 1] = job
+  self.stats.enqueued = self.stats.enqueued + 1
+  return job
+end
+
+function Queue:drain()
+  if self.running then return end
+  self.running = true
+  while #self.pending > 0 do
+    local job = table.remove(self.pending, 1)
+    if job.stale and job.stale() then
+      self.stats.stale = self.stats.stale + 1
+      job.result = { nil, "stale Flickr queue job" }
+    else
+      local now = self.now_ms()
+      local last = self.last_started[job.method]
+      if last and job.pace_ms > 0 then
+        sleep_ms(self.sleep_ms, job.pace_ms - (now - last))
+      end
+      self.last_started[job.method] = self.now_ms()
+      self.stats.started = self.stats.started + 1
+      local result = { pcall(job.fn) }
+      if result[1] then
+        table.remove(result, 1)
+        job.result = result
+      else
+        self.stats.failed = self.stats.failed + 1
+        job.result = { nil, result[2] }
+      end
+    end
+    if job.done then job.done(table.unpack(job.result or {})) end
+  end
+  self.running = false
+end
+
+function Queue:call(method, fn, opts)
+  local job = self:enqueue(method, fn, opts)
+  if opts and opts.done then job.done = opts.done end
+  self:drain()
+  if job.result then return table.unpack(job.result) end
+  return nil, "queued Flickr job has not run yet"
+end
+
+function Queue:pending_count()
+  return #self.pending
+end
+
+return M
+end
+
 package.preload["dtrmflickr.dtrmflickr"] = function(...)
 --[[ dtrmflickr — Flickr export/storage for darktable
 
@@ -1991,6 +2102,21 @@ local session_account = nil
 local EMPTY_FILTER_PREF <const> = "<none>"
 local FLICKR_TAG_LIMIT <const> = 75
 local clear_album_cache
+__dtrmflickr_queue = require("dtrmflickr.queue").new {
+  sleep_ms = function(ms)
+    if dt.control and dt.control.sleep then dt.control.sleep(ms / 1000) end
+  end,
+  method_pace_ms = {
+    ["flickr.photos.getInfo"] = 250,
+    ["flickr.photos.getPerms"] = 250,
+    ["flickr.photos.search"] = 250,
+    ["flickr.photosets.getList"] = 250,
+  },
+}
+
+function __dtrmflickr_call(method, fn, opts)
+  return __dtrmflickr_queue:call(method, fn, opts)
+end
 
 local function keep_label_pref(widget)
   -- Label-only Lua preference rows are explanatory text; there is no user value to save.
@@ -2903,7 +3029,9 @@ local function refresh_album_list()
     return nil, "missing Flickr API key/secret"
   end
 
-  local sets, err = rest.photosets_get_list(api_key, api_secret, account)
+  local sets, err = __dtrmflickr_call("flickr.photosets.getList", function()
+    return rest.photosets_get_list(api_key, api_secret, account)
+  end)
   if not sets then
     album_status_label.label = _("album refresh failed")
     dt.print(string.format(_("Flickr: album refresh failed: %s"), tostring(err)))
@@ -2924,7 +3052,9 @@ local function refresh_album_cache_for_export(api_key, api_secret, account, opts
     return album_cache
   end
   if not album_cache_matches(account) then clear_album_cache() end
-  local sets, err = rest.photosets_get_list(api_key, api_secret, account)
+  local sets, err = __dtrmflickr_call("flickr.photosets.getList", function()
+    return rest.photosets_get_list(api_key, api_secret, account)
+  end)
   if not sets then return nil, err end
   set_album_cache(sets, account)
   album_status_label.label = string.format(_("%d album(s) loaded"), #sets)
@@ -3467,7 +3597,9 @@ function panel_sets.refresh_memberships()
   local image, acc, photo_id, api_key, api_secret = panel_sets.api_context(_("refreshing albums"))
   if not image then return nil end
 
-  local memberships, err, sets = rest.photosets_get_memberships(api_key, api_secret, acc, photo_id)
+  local memberships, err, sets = __dtrmflickr_call("flickr.photosets.getList", function()
+    return rest.photosets_get_memberships(api_key, api_secret, acc, photo_id)
+  end)
   if not memberships then
     panel_sets.status_label.label = _("album membership refresh failed")
     dt.print(string.format(_("Flickr: album membership refresh failed: %s"), tostring(err)))
@@ -3524,7 +3656,9 @@ function panel_sets.add()
   for part in value:gmatch("[^,]+") do
     local item, kind = panel_sets.resolve(part)
     if item and item.id and item.id ~= "" then
-      local ok, err = rest.photosets_add_photo(api_key, api_secret, acc, item.id, photo_id)
+      local ok, err = __dtrmflickr_call("flickr.photosets.addPhoto", function()
+        return rest.photosets_add_photo(api_key, api_secret, acc, item.id, photo_id)
+      end)
       if ok or photoset_add_is_already_present(err) then
         state.add_set(image, acc.nsid, item.id)
         added = added + 1
@@ -3571,7 +3705,9 @@ function panel_sets.create()
     return
   end
 
-  local photoset_id, err = rest.photosets_create(api_key, api_secret, acc, title, photo_id)
+  local photoset_id, err = __dtrmflickr_call("flickr.photosets.create", function()
+    return rest.photosets_create(api_key, api_secret, acc, title, photo_id)
+  end)
   if photoset_id then
     state.add_set(image, acc.nsid, photoset_id)
     table.insert(album_cache, 1, { id = photoset_id, title = title, photos = "1" })
@@ -3596,7 +3732,9 @@ function panel_sets.remove_selected()
     return
   end
 
-  local ok, err = rest.photosets_remove_photo(api_key, api_secret, acc, set_id, photo_id)
+  local ok, err = __dtrmflickr_call("flickr.photosets.removePhoto", function()
+    return rest.photosets_remove_photo(api_key, api_secret, acc, set_id, photo_id)
+  end)
   local already_absent = photoset_remove_is_already_absent(err)
   if ok or already_absent then state.remove_set(image, acc.nsid, set_id) end
   panel_sets_label.label = panel_sets.format_memberships(state.get_sets(image, acc.nsid))
@@ -3624,9 +3762,13 @@ local function load_remote_content_type(api_key, api_secret, acc, photo_id, date
 
   local body
   if acc then
-    body = rest.call(api_key, api_secret, acc, "flickr.photos.search", args)
+    body = __dtrmflickr_call("flickr.photos.search", function()
+      return rest.call(api_key, api_secret, acc, "flickr.photos.search", args)
+    end)
   else
-    body = rest.public_call(api_key, "flickr.photos.search", args)
+    body = __dtrmflickr_call("flickr.photos.search", function()
+      return rest.public_call(api_key, "flickr.photos.search", args)
+    end)
   end
   local search_value = parse_search_content_type(body, photo_id)
   return panel_content_type_index_from_search_value(search_value), search_value
@@ -3636,9 +3778,13 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   panel_reset_remote(_("Flickr: loading remote settings..."))
   local body, err
   if acc then
-    body, err = rest.call(api_key, api_secret, acc, "flickr.photos.getInfo", { photo_id = photo_id })
+    body, err = __dtrmflickr_call("flickr.photos.getInfo", function()
+      return rest.call(api_key, api_secret, acc, "flickr.photos.getInfo", { photo_id = photo_id })
+    end, { coalesce_key = "panel-refresh" })
   else
-    body, err = rest.public_call(api_key, "flickr.photos.getInfo", { photo_id = photo_id })
+    body, err = __dtrmflickr_call("flickr.photos.getInfo", function()
+      return rest.public_call(api_key, "flickr.photos.getInfo", { photo_id = photo_id })
+    end, { coalesce_key = "panel-refresh" })
   end
   if not body then
     panel_reset_remote(string.format(_("Flickr: remote settings unavailable: %s"), tostring(err)))
@@ -3657,7 +3803,9 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   panel_content_type_widget.selected = content_type_index or 0
   local perms_unavailable = false
   if acc then
-    local perms_body = rest.photos_get_perms(api_key, api_secret, acc, photo_id)
+    local perms_body = __dtrmflickr_call("flickr.photos.getPerms", function()
+      return rest.photos_get_perms(api_key, api_secret, acc, photo_id)
+    end, { coalesce_key = "panel-refresh-perms" })
     if perms_body then
       panel_comment_perm_widget.selected = panel_permission_index_from_id(remote_attr(perms_body, "permcomment")) or 0
       panel_addmeta_perm_widget.selected = panel_permission_index_from_id(remote_attr(perms_body, "permaddmeta")) or 0
@@ -3725,9 +3873,11 @@ local function save_panel_settings()
   local update_comment_perm = wants_comment_perm and sync.permissions
   local update_addmeta_perm = wants_addmeta_perm and sync.permissions
   if update_privacy or update_comment_perm or update_addmeta_perm then
-    local ok, err = rest.photos_set_perms(api_key, api_secret, acc, photo_id, is_public, is_friend, is_family,
-      update_comment_perm and panel_comment_perm_value() or nil,
-      update_addmeta_perm and panel_addmeta_perm_value() or nil)
+    local ok, err = __dtrmflickr_call("flickr.photos.setPerms", function()
+      return rest.photos_set_perms(api_key, api_secret, acc, photo_id, is_public, is_friend, is_family,
+        update_comment_perm and panel_comment_perm_value() or nil,
+        update_addmeta_perm and panel_addmeta_perm_value() or nil)
+    end)
     if not ok then
       if update_privacy then state.mark_reason(panel_current.image, acc.nsid, "visibility") end
       if update_comment_perm or update_addmeta_perm then state.mark_reason(panel_current.image, acc.nsid, "permissions") end
@@ -3743,7 +3893,9 @@ local function save_panel_settings()
   end
   local safety = panel_safety_value()
   if panel_dirty.safety and sync.safety then
-    local ok, err = rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety)
+    local ok, err = __dtrmflickr_call("flickr.photos.setSafetyLevel", function()
+      return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety)
+    end)
     if not ok then
       state.mark_reason(panel_current.image, acc.nsid, "safety")
       errors[#errors + 1] = "safety: " .. tostring(err)
@@ -3756,7 +3908,9 @@ local function save_panel_settings()
   local content_type = panel_content_type_value()
   if panel_dirty.content_type and sync.content_type then
     if content_type then
-      local ok, err = rest.photos_set_content_type(api_key, api_secret, acc, photo_id, content_type)
+      local ok, err = __dtrmflickr_call("flickr.photos.setContentType", function()
+        return rest.photos_set_content_type(api_key, api_secret, acc, photo_id, content_type)
+      end)
       if not ok then
         state.mark_reason(panel_current.image, acc.nsid, "content_type")
         errors[#errors + 1] = "content type: " .. tostring(err)
@@ -3771,7 +3925,9 @@ local function save_panel_settings()
   end
   local license = panel_license_value()
   if panel_dirty.license and sync.license then
-    local ok, err = rest.photos_licenses_set_license(api_key, api_secret, acc, photo_id, license)
+    local ok, err = __dtrmflickr_call("flickr.photos.licenses.setLicense", function()
+      return rest.photos_licenses_set_license(api_key, api_secret, acc, photo_id, license)
+    end)
     if not ok then
       state.mark_reason(panel_current.image, acc.nsid, "license")
       errors[#errors + 1] = "license: " .. tostring(err)
@@ -3829,7 +3985,9 @@ local function sync_panel_meta()
     return
   end
 
-  local ok, err = rest.photos_set_meta(api_key, api_secret, acc, photo_id, title, description)
+  local ok, err = __dtrmflickr_call("flickr.photos.setMeta", function()
+    return rest.photos_set_meta(api_key, api_secret, acc, photo_id, title, description)
+  end)
   if ok then
     state.set_metadata_published_at(image, acc.nsid)
     state.clear_reason(image, acc.nsid, "title_description")
@@ -3877,7 +4035,9 @@ local function sync_panel_tags()
       FLICKR_TAG_LIMIT, truncated_tags))
   end
 
-  local ok, err = rest.photos_set_tags(api_key, api_secret, acc, photo_id, tags)
+  local ok, err = __dtrmflickr_call("flickr.photos.setTags", function()
+    return rest.photos_set_tags(api_key, api_secret, acc, photo_id, tags)
+  end)
   if ok then
     state.set_metadata_published_at(image, acc.nsid)
     state.clear_reason(image, acc.nsid, "keywords")
@@ -4001,7 +4161,9 @@ local function claim_existing_selection()
 
   local counts = { claimed = 0, skipped = 0, error = 0 }
   for _index, image in ipairs(selection) do
-    local status, detail = claim.claim_existing_for_image(api_key, api_secret, acc, image)
+    local status, detail = __dtrmflickr_call("flickr.photos.search", function()
+      return claim.claim_existing_for_image(api_key, api_secret, acc, image)
+    end)
     counts[status] = (counts[status] or 0) + 1
     local file = image and image.filename or "image"
     if status == "claimed" then
@@ -4714,25 +4876,29 @@ local function store(storage, image, format, filename, number, total, high_quali
     record_tag_limit_warning(extra_data, image, truncated_tags)
   end
   dt.print(string.format(_("Flickr: uploading %d/%d — %s"), number, total, image.filename or "?"))
-  local photo_id, err = upload.upload_photo(extra_data.api_key, extra_data.api_secret, extra_data.account, filename, {
-    title = sync.title and metadata.image_title(image, filename) or nil,
-    description = sync.description and image and image.description or nil,
-    tags = tags,
-    is_public = (sync.privacy or forced.privacy) and privacy.is_public or nil,
-    is_friend = (sync.privacy or forced.privacy) and privacy.is_friend or nil,
-    is_family = (sync.privacy or forced.privacy) and privacy.is_family or nil,
-    safety_level = (sync.safety or forced.safety) and safety.flickr_value or nil,
-    content_type = (sync.content_type or forced.content_type) and content_type.flickr_value or nil,
-    perm_comment = sync.permissions and permissions.perm_comment or nil,
-    perm_addmeta = sync.permissions and permissions.perm_addmeta or nil,
-  })
+  local photo_id, err = __dtrmflickr_call("flickr.upload", function()
+    return upload.upload_photo(extra_data.api_key, extra_data.api_secret, extra_data.account, filename, {
+      title = sync.title and metadata.image_title(image, filename) or nil,
+      description = sync.description and image and image.description or nil,
+      tags = tags,
+      is_public = (sync.privacy or forced.privacy) and privacy.is_public or nil,
+      is_friend = (sync.privacy or forced.privacy) and privacy.is_friend or nil,
+      is_family = (sync.privacy or forced.privacy) and privacy.is_family or nil,
+      safety_level = (sync.safety or forced.safety) and safety.flickr_value or nil,
+      content_type = (sync.content_type or forced.content_type) and content_type.flickr_value or nil,
+      perm_comment = sync.permissions and permissions.perm_comment or nil,
+      perm_addmeta = sync.permissions and permissions.perm_addmeta or nil,
+    })
+  end)
   if photo_id then
     state.set_photo_id(image, extra_data.account.nsid, photo_id)
     state.set_image_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
     local post_failed = false
     if sync.license or forced.license then
-      local license_ok, license_err = rest.photos_licenses_set_license(extra_data.api_key, extra_data.api_secret,
-        extra_data.account, photo_id, license.flickr_value)
+      local license_ok, license_err = __dtrmflickr_call("flickr.photos.licenses.setLicense", function()
+        return rest.photos_licenses_set_license(extra_data.api_key, extra_data.api_secret,
+          extra_data.account, photo_id, license.flickr_value)
+      end)
       if not license_ok then
         post_failed = true
         state.mark_reason(image, extra_data.account.nsid, "license")
@@ -4744,8 +4910,10 @@ local function store(storage, image, format, filename, number, total, high_quali
 
     local date_taken = sync.date_taken and metadata.image_date_taken(image) or nil
     if date_taken then
-      local dates_ok, dates_err = rest.photos_set_dates(extra_data.api_key, extra_data.api_secret,
-        extra_data.account, photo_id, date_taken, 0)
+      local dates_ok, dates_err = __dtrmflickr_call("flickr.photos.setDates", function()
+        return rest.photos_set_dates(extra_data.api_key, extra_data.api_secret,
+          extra_data.account, photo_id, date_taken, 0)
+      end)
       if not dates_ok then
         post_failed = true
         state.mark_reason(image, extra_data.account.nsid, "date_taken")
@@ -4758,8 +4926,10 @@ local function store(storage, image, format, filename, number, total, high_quali
     local lat, lon = nil, nil
     if sync.gps then lat, lon = metadata.image_location(image) end
     if lat and lon then
-      local geo_ok, geo_err = rest.photos_geo_set_location(extra_data.api_key, extra_data.api_secret,
-        extra_data.account, photo_id, lat, lon, 16)
+      local geo_ok, geo_err = __dtrmflickr_call("flickr.photos.geo.setLocation", function()
+        return rest.photos_geo_set_location(extra_data.api_key, extra_data.api_secret,
+          extra_data.account, photo_id, lat, lon, 16)
+      end)
       if not geo_ok then
         post_failed = true
         state.mark_reason(image, extra_data.account.nsid, "gps")
@@ -4805,8 +4975,10 @@ local function finalize(storage, image_table, extra_data)
 
   if uploaded > 0 and album.mode == "create" then
     local first = extra_data.uploaded[1]
-    local created_id, err = rest.photosets_create(extra_data.api_key, extra_data.api_secret, extra_data.account,
-      album.title, first.photo_id)
+    local created_id, err = __dtrmflickr_call("flickr.photosets.create", function()
+      return rest.photosets_create(extra_data.api_key, extra_data.api_secret, extra_data.account,
+        album.title, first.photo_id)
+    end)
     photoset_id = created_id
     if photoset_id then
       state.add_set(first.image, extra_data.account.nsid, photoset_id)
@@ -4829,8 +5001,10 @@ local function finalize(storage, image_table, extra_data)
     local start = album.mode == "create" and 2 or 1
     for i = start, uploaded do
       local item = extra_data.uploaded[i]
-      local ok, err = rest.photosets_add_photo(extra_data.api_key, extra_data.api_secret, extra_data.account,
-        photoset_id, item.photo_id)
+      local ok, err = __dtrmflickr_call("flickr.photosets.addPhoto", function()
+        return rest.photosets_add_photo(extra_data.api_key, extra_data.api_secret, extra_data.account,
+          photoset_id, item.photo_id)
+      end)
       if ok or photoset_add_is_already_present(err) then
         state.add_set(item.image, extra_data.account.nsid, photoset_id)
       else
@@ -4920,6 +5094,8 @@ script_data.__test = {
   claim_existing_for_image = claim.claim_existing_for_image,
   parse_photo_id_or_url = parse_photo_id_or_url,
   panel_content_type_index_from_search_value = panel_content_type_index_from_search_value,
+  flickr_queue = __dtrmflickr_queue,
+  flickr_call = __dtrmflickr_call,
   privacy_values = privacy_values,
   safety_values = safety_values,
   content_type_values = content_type_values,
