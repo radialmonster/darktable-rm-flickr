@@ -1350,7 +1350,7 @@ end
 
 local function flickr_quote_tag(tag)
   tag = tostring(tag or "")
-  if tag:find("%s") then return '"' .. tag:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"' end
+  if tag:find("[%s\"\\]") then return '"' .. tag:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"' end
   return tag
 end
 
