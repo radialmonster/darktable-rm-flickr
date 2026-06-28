@@ -2350,6 +2350,23 @@ local function default_retryable(err)
     or s:find("service unavailable", 1, true) or s:find("temporarily unavailable", 1, true) then
     return true, "rate-limit"
   end
+  -- Transport-level HTTP gateway/server errors (502/503/504) raised by Flickr's
+  -- edge or an intermediary proxy/CDN during an outage. These arrive as a raw
+  -- HTTP status (from curl/WinHTTP/MSXML) rather than a Flickr REST `<err>` body,
+  -- so they carry none of the substrings above and were previously classified
+  -- non-retryable — failing an idempotent read/setter on the first attempt
+  -- instead of riding out a brief gateway hiccup. 503 ("service unavailable") is
+  -- already caught when worded, but a bare numeric `(503)`/`http 503` would slip
+  -- through; treat 503 as rate-limit (server overload, longer backoff) and
+  -- 502/504 (bad gateway / gateway timeout) as ordinary transient. Non-idempotent
+  -- ops (upload, photosets.create) opt out of retry via max_attempts=1, so this
+  -- only affects retry-safe reads/setters. Advances the 2026-06-28 followup to
+  -- widen the matcher beyond REST error 105.
+  if s:find("(503)", 1, true) or s:find("http 503", 1, true) then return true, "rate-limit" end
+  if s:find("(502)", 1, true) or s:find("http 502", 1, true) or s:find("bad gateway", 1, true)
+    or s:find("(504)", 1, true) or s:find("http 504", 1, true) or s:find("gateway time", 1, true) then
+    return true, "transient"
+  end
   if s:find("temporar", 1, true) or s:find("timed out", 1, true) or s:find("timeout", 1, true) then return true, "transient" end
   if s:find("connection", 1, true) or s:find("network", 1, true) or s:find("curl", 1, true) then return true, "transient" end
   if s:find("write operation failed", 1, true) or s:find("(106)", 1, true) then return true, "transient" end
