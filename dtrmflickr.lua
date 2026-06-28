@@ -1002,6 +1002,34 @@ function M.photosets_remove_photo(api_key, api_secret, account, photoset_id, pho
   return true
 end
 
+-- Extract the top-level attributes of an XML open tag's attribute string into a
+-- name -> value map, respecting quoting. Naive per-attribute substring matching
+-- (`attrs:match('photos="(.-)"')`) is unsafe here: `photos` is a *substring* of
+-- `has_requested_photos`, so a `has_requested_photos="…"` attribute would have its
+-- value captured as the photo count; and an `id="…"` embedded inside another
+-- attribute's quoted value (the defensive nested-id membership shape
+-- `has_requested_photos='id="123"'`) would be grabbed as the photoset id,
+-- corrupting the id used for membership. Walking name="value"/name='value' pairs
+-- and skipping over quoted contents avoids both. (Reachable only via the
+-- defensive attribute shapes parse_photosets explicitly supports — live
+-- `getList` responses carry membership as child markers — but those shapes must
+-- parse correctly when present.)
+local function parse_attrs(attrs)
+  local out = {}
+  -- Single left-to-right pass: each `name=<quote>value<quote>` pair consumes its
+  -- whole quoted value (the %2 back-reference matches the opening quote), so a
+  -- quote of the other kind inside a value — `has_requested_photos='id="123"'` —
+  -- is treated as value content, not a new attribute, and a full attribute name
+  -- (`has_requested_photos`) is matched as one token rather than letting its
+  -- `photos` tail be read as a separate `photos` attribute. First occurrence of a
+  -- name wins.
+  for name, _, value in tostring(attrs or ""):gmatch('([%w_:%-]+)%s*=%s*(["\'])(.-)%2') do
+    if out[name] == nil then out[name] = value end
+  end
+  return out
+end
+M.parse_attrs = parse_attrs
+
 function M.parse_photosets(body)
   local sets = {}
   body = tostring(body or "")
@@ -1037,18 +1065,18 @@ function M.parse_photosets(body)
         pos = open_e + 1
       end
     end
-    local id = attrs:match('id="(.-)"') or attrs:match("id='(.-)'")
+    local attr = parse_attrs(attrs)
+    local id = attr.id
     local title = inner:match("<title>(.-)</title>") or ""
     if id and id ~= "" then
-      local requested = attrs:match('has_requested_photos="(.-)"')
-        or attrs:match("has_requested_photos='(.-)'")
+      local requested = attr.has_requested_photos
         or inner:match("<has_requested_photos>(.-)</has_requested_photos>")
         or ""
       sets[#sets + 1] = {
         id = xml_unescape(id),
         title = xml_unescape(title),
-        photos = attrs:match('photos="(.-)"') or attrs:match("photos='(.-)'"),
-        videos = attrs:match('videos="(.-)"') or attrs:match("videos='(.-)'"),
+        photos = attr.photos,
+        videos = attr.videos,
         has_requested_photos = xml_unescape(requested),
         -- Membership marker. Live responses always use the self-closing
         -- `<has_requested_photos />`, but accept the equivalent empty paired form
