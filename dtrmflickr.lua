@@ -287,13 +287,38 @@ local function write_file(path, body)
   return true
 end
 
+-- Sentinel appended to curl's stdout via --write-out so we can read the final
+-- HTTP status. curl exits 0 on a 4xx/5xx without --fail, so without this a 502/
+-- 503/504/429 would look like a success body (the gateway's HTML error page) and
+-- the queue's gateway-retry logic — which keys off an "http NNN" error string —
+-- would never see the status. The token is plain ASCII (no Lua-pattern magic).
+local CURL_STATUS_SENTINEL = "__dtrmflickr_http_status__:"
+
 local function run_curl_config(lines)
   local config_path = temp_path(".curl")
+  -- Append rather than insert: curl options are order-independent and the body
+  -- (stdout / -o file) is unaffected; write-out is emitted after the transfer.
+  lines[#lines + 1] = "write-out = " .. curl_config_quote(CURL_STATUS_SENTINEL .. "%{http_code}")
   if not write_file(config_path, table.concat(lines, "\n") .. "\n") then
     return nil, "could not write temporary curl config"
   end
-  local out, err = run("curl --config " .. shq(config_path))
+  -- via M.run (not the local upvalue) so offline tests can stub the shell-out and
+  -- exercise the status-sentinel parsing below without spawning curl.
+  local out, err = M.run("curl --config " .. shq(config_path))
   os.remove(config_path)
+  if not out then return nil, err end
+  -- On Windows, curl is only used for multipart upload and runs under -o (body to
+  -- file, write-out to a discarded stdout), so the sentinel is simply absent and
+  -- the body passes through unchanged. On the curl-primary (non-Windows) path the
+  -- sentinel rides on stdout after the body; strip it and surface a >= 400 status.
+  -- curl appends write-out directly after the body (no separator it inserts), so
+  -- strip only the sentinel itself and leave the body's own trailing newline.
+  local status = out:match(CURL_STATUS_SENTINEL .. "(%d+)%s*$")
+  if status then
+    out = out:gsub(CURL_STATUS_SENTINEL .. "%d+%s*$", "")
+    local code = tonumber(status)
+    if code and code >= 400 then return nil, "HTTP " .. code end
+  end
   return out, err
 end
 
@@ -401,6 +426,17 @@ local function windows_http(method, url, body, content_type)
     "  WriteUtf8 " .. vbs_quote(err_path) .. ", \"MSXML HTTP failed (\" & CStr(Err.Number) & \"): \" & Err.Description",
     "  WScript.Quit 1",
     "End If",
+    -- Flickr REST/upload always answer HTTP 200 even for API-level errors (the
+    -- <err> lives in the body with stat="fail"), so any status >= 400 here is a
+    -- genuine transport/proxy/CDN/gateway failure, not a Flickr API error. Without
+    -- this check a 502/503/504/429 would return the gateway's HTML error page as a
+    -- "success" body; rest.call's parse_error then yields a string with none of the
+    -- queue's retryable substrings, so the documented gateway-retry never fires.
+    -- Surface it as "HTTP NNN <statusText>" so default_retryable classifies it.
+    "If http.Status >= 400 Then",
+    "  WriteUtf8 " .. vbs_quote(err_path) .. ", \"HTTP \" & CStr(http.Status) & \" \" & http.statusText",
+    "  WScript.Quit 1",
+    "End If",
     "WriteUtf8 " .. vbs_quote(out_path) .. ", http.responseText",
     "WScript.Quit 0",
   }, "\r\n")
@@ -495,6 +531,10 @@ function M.post_multipart(url, fields, file_field, file_path)
   lines[#lines + 1] = "url = " .. curl_config_quote(url)
   return run_curl_config(lines)
 end
+
+-- Test hook: exposes the curl config runner so offline tests can stub M.run and
+-- verify the HTTP-status-sentinel parsing without spawning curl.
+M.__test = { run_curl_config = run_curl_config }
 
 return M
 end
@@ -2366,6 +2406,20 @@ local function default_retryable(err)
   if s:find("(502)", 1, true) or s:find("http 502", 1, true) or s:find("bad gateway", 1, true)
     or s:find("(504)", 1, true) or s:find("http 504", 1, true) or s:find("gateway time", 1, true) then
     return true, "transient"
+  end
+  -- General fallback for any other HTTP status a transport surfaces as a string.
+  -- The transports now emit "HTTP NNN ..." for any status >= 400 (curl/MSXML
+  -- previously swallowed the code and returned the gateway error page as a fake
+  -- success body, so the named 502/503/504 rules above were unreachable in
+  -- practice). The named forms still win first; this catches the rest — a 429
+  -- anywhere (rate-limit) and any remaining 5xx server error such as 500/507 or a
+  -- CDN's 520-524 (transient). Other 4xx stay non-retryable (a real client error
+  -- won't improve on retry). Matches both the "http NNN" form we emit and a raw
+  -- "HTTP/1.1 NNN" status line a different transport might word.
+  local http_code = tonumber(s:match("http (%d%d%d)") or s:match("http/[%d.]+%s+(%d%d%d)"))
+  if http_code then
+    if http_code == 429 or http_code == 503 then return true, "rate-limit" end
+    if http_code >= 500 then return true, "transient" end
   end
   if s:find("temporar", 1, true) or s:find("timed out", 1, true) or s:find("timeout", 1, true) then return true, "transient" end
   if s:find("connection", 1, true) or s:find("network", 1, true) or s:find("curl", 1, true) then return true, "transient" end

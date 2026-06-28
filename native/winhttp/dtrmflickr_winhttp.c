@@ -111,6 +111,26 @@ static int l_request(lua_State *L)
     return 2;
   }
 
+  /* Surface the HTTP status. Flickr REST/upload always answer HTTP 200 even for
+     API-level errors (the <err> lives in the response body), so any status >= 400
+     here is a genuine transport/proxy/CDN/gateway failure, not a Flickr API error.
+     Without this check a 502/503/504/429 would return the gateway's HTML error
+     page as a "success" body and the plugin's queue would classify it
+     non-retryable, defeating the documented gateway-retry. Return it as an
+     "HTTP NNN" string so default_retryable (queue.lua) can retry it. */
+  DWORD status = 0, status_size = sizeof(status);
+  if(WinHttpQueryHeaders(request,
+       WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+       WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX)
+     && status >= 400) {
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    lua_pushnil(L);
+    lua_pushfstring(L, "HTTP %d", (int)status);
+    return 2;
+  }
+
   luaL_Buffer b;
   luaL_buffinit(L, &b);
   for(;;) {
