@@ -2445,6 +2445,22 @@ dt.preferences.register(PLUGIN, "keyword_rules_help", "lua",
   "info",
   keyword_rules_help_widget,
   keep_label_pref)
+dt.preferences.register(PLUGIN, "skip_upload_min_rating", "string",
+  _("Flickr: minimum rating to upload"), _("blank disables; images rated below this 0-5 threshold are not uploaded to Flickr"), "")
+dt.preferences.register(PLUGIN, "skip_upload_color_labels", "string",
+  _("Flickr: skip-upload color labels"), _("comma-separated color labels that are not uploaded: red, yellow, green, blue, purple"), EMPTY_FILTER_PREF)
+dt.preferences.register(PLUGIN, "private_below_rating", "string",
+  _("Flickr: private below rating"), _("blank disables; images rated below this 0-5 threshold are uploaded as private"), "")
+dt.preferences.register(PLUGIN, "private_color_labels", "string",
+  _("Flickr: private color labels"), _("comma-separated color labels that force Flickr privacy to private: red, yellow, green, blue, purple"), EMPTY_FILTER_PREF)
+dt.preferences.register(PLUGIN, "rating_color_rules_help", "lua",
+  _("Flickr: rating/color rules"),
+  _("how rating and color-label driven Flickr settings work"),
+  "info",
+  dt.new_widget("label") {
+    label = _("rating and color-label rules run before upload\nminimum rating and skip labels leave matching images local\nprivate rating and private labels force Flickr privacy to private"),
+  },
+  keep_label_pref)
 dt.preferences.register(PLUGIN, "sync_gps", "bool",
   _("Flickr: sync GPS location"), _("send darktable GPS location to Flickr after upload"), false)
 dt.preferences.register(PLUGIN, "sync_date_taken", "bool",
@@ -4398,6 +4414,74 @@ local function first_matching_keyword_filter(tag_names, filters)
   return nil, nil
 end
 
+local rating_color_rules = {}
+rating_color_rules.color_label_values = {
+  red = true, yellow = true, green = true, blue = true, purple = true,
+}
+
+function rating_color_rules.split_color_label_list(value)
+  local labels = {}
+  for item in tostring(value or ""):gmatch("[^,]+") do
+    item = item:match("^%s*(.-)%s*$"):lower()
+    if item ~= "" and item ~= EMPTY_FILTER_PREF and rating_color_rules.color_label_values[item] then
+      labels[#labels + 1] = item
+    end
+  end
+  return labels
+end
+
+function rating_color_rules.read_rating_threshold(pref_name)
+  local raw = dt.preferences.read(PLUGIN, pref_name, "string")
+  raw = tostring(raw or ""):match("^%s*(.-)%s*$")
+  if raw == "" then return nil end
+  local rating = tonumber(raw)
+  if not rating then return nil end
+  if rating < 0 then rating = 0 end
+  if rating > 5 then rating = 5 end
+  return math.floor(rating)
+end
+
+function rating_color_rules.image_rating(image)
+  local rating = tonumber(image and image.rating or nil)
+  if not rating then return 0 end
+  if rating < 0 then return -1 end
+  if rating > 5 then return 5 end
+  return math.floor(rating)
+end
+
+function rating_color_rules.first_matching_color_label(image, labels)
+  for _, label in ipairs(labels or {}) do
+    if image and image[label] == true then return label end
+  end
+  return nil
+end
+
+function rating_color_rules.should_skip_upload_by_rating(image)
+  local threshold = rating_color_rules.read_rating_threshold("skip_upload_min_rating")
+  if not threshold then return nil, nil end
+  local rating = rating_color_rules.image_rating(image)
+  if rating < threshold then return threshold, rating end
+  return nil, nil
+end
+
+function rating_color_rules.should_skip_upload_by_color_label(image)
+  return rating_color_rules.first_matching_color_label(image,
+    rating_color_rules.split_color_label_list(dt.preferences.read(PLUGIN, "skip_upload_color_labels", "string")))
+end
+
+function rating_color_rules.should_force_private_by_rating(image)
+  local threshold = rating_color_rules.read_rating_threshold("private_below_rating")
+  if not threshold then return nil, nil end
+  local rating = rating_color_rules.image_rating(image)
+  if rating < threshold then return threshold, rating end
+  return nil, nil
+end
+
+function rating_color_rules.should_force_private_by_color_label(image)
+  return rating_color_rules.first_matching_color_label(image,
+    rating_color_rules.split_color_label_list(dt.preferences.read(PLUGIN, "private_color_labels", "string")))
+end
+
 local privacy_restrictiveness = {
   public = 1,
   ["friends & family"] = 2,
@@ -4576,9 +4660,54 @@ local function store(storage, image, format, filename, number, total, high_quali
       tostring(filename), tostring(skip_tag or ""), tostring(skip_filter or "")))
     return
   end
+  local skip_rating_threshold, skip_rating = rating_color_rules.should_skip_upload_by_rating(image)
+  if skip_rating_threshold then
+    extra_data.skipped = extra_data.skipped or {}
+    extra_data.skipped[#extra_data.skipped + 1] = {
+      image = image,
+      filename = filename,
+      reason = "rating",
+      threshold = skip_rating_threshold,
+      rating = skip_rating,
+    }
+    dt.print(string.format(_("Flickr: skipped %s because rating %s is below upload threshold %s"),
+      image and image.filename or "image", tostring(skip_rating), tostring(skip_rating_threshold)))
+    dt.print_log(string.format("[dtrmflickr] store: skipped by rating file='%s' rating='%s' threshold='%s'",
+      tostring(filename), tostring(skip_rating), tostring(skip_rating_threshold)))
+    return
+  end
+  local skip_label = rating_color_rules.should_skip_upload_by_color_label(image)
+  if skip_label then
+    extra_data.skipped = extra_data.skipped or {}
+    extra_data.skipped[#extra_data.skipped + 1] = {
+      image = image,
+      filename = filename,
+      reason = "color_label",
+      label = skip_label,
+    }
+    dt.print(string.format(_("Flickr: skipped %s because color label '%s' matched skip-upload rule"),
+      image and image.filename or "image", tostring(skip_label)))
+    dt.print_log(string.format("[dtrmflickr] store: skipped by color label file='%s' label='%s'",
+      tostring(filename), tostring(skip_label)))
+    return
+  end
   local forced, conflicts
   privacy, safety, content_type, license, forced, conflicts = apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
   for _, conflict in ipairs(conflicts or {}) do record_keyword_conflict(extra_data, conflict) end
+  local private_rating_threshold, private_rating = rating_color_rules.should_force_private_by_rating(image)
+  local private_label = rating_color_rules.should_force_private_by_color_label(image)
+  if private_rating_threshold or private_label then
+    privacy = privacy_values[1]
+    forced.privacy = true
+    if private_rating_threshold then
+      dt.print_log(string.format("[dtrmflickr] store: forcing private by rating file='%s' rating='%s' threshold='%s'",
+        tostring(filename), tostring(private_rating), tostring(private_rating_threshold)))
+    end
+    if private_label then
+      dt.print_log(string.format("[dtrmflickr] store: forcing private by color label file='%s' label='%s'",
+        tostring(filename), tostring(private_label)))
+    end
+  end
   local tags, truncated_tags = nil, 0
   if sync.tags then
     tags, truncated_tags = image_keyword_tags(image)
@@ -4740,20 +4869,18 @@ script_data.metadata = {
   author = "dtrmflickr",
 }
 script_data.destroy_method = "hide"
-local function destroy()
+function script_data.destroy()
   dt.destroy_storage(STORAGE)
   if dt.destroy_event then dt.destroy_event(PLUGIN .. "_selection_changed", "selection-changed") end
   if dt.gui.libs and dt.gui.libs[PANEL] then dt.gui.libs[PANEL].visible = false end
 end
-local function restart()
+function script_data.restart()
   if dt.gui.libs and dt.gui.libs[PANEL] then
     dt.gui.libs[PANEL].visible = true
     refresh_panel(true, false)
   end
 end
-script_data.destroy = destroy
-script_data.restart = restart
-script_data.show = restart
+script_data.show = script_data.restart
 script_data.__test = {
   save_token = save_token,
   load_token = load_token,
@@ -4775,6 +4902,12 @@ script_data.__test = {
   image_tag_names = metadata.image_tag_names,
   apply_keyword_overrides = apply_keyword_overrides,
   format_keyword_conflict = format_keyword_conflict,
+  read_rating_threshold = rating_color_rules.read_rating_threshold,
+  split_color_label_list = rating_color_rules.split_color_label_list,
+  should_skip_upload_by_rating = rating_color_rules.should_skip_upload_by_rating,
+  should_skip_upload_by_color_label = rating_color_rules.should_skip_upload_by_color_label,
+  should_force_private_by_rating = rating_color_rules.should_force_private_by_rating,
+  should_force_private_by_color_label = rating_color_rules.should_force_private_by_color_label,
   image_keyword_tags = image_keyword_tags,
   image_date_taken = metadata.image_date_taken,
   image_location = metadata.image_location,
