@@ -2812,6 +2812,21 @@ function Queue:call(method, fn, opts)
   return nil, "queued Flickr job has not run yet"
 end
 
+-- Zero the cumulative counters and drop the recent-results history so the next
+-- batch's panel feedback reflects *that batch*, not the whole darktable session.
+-- The stats table accumulates for the queue's whole lifetime, so without this a
+-- single throttled export leaves the panel showing "throttled Nx - waited X.Xs
+-- total" forever, even when later work runs clean — the aggregate the panel
+-- describes as "the whole batch's" was actually the whole session's. Call this at
+-- a batch boundary (the export `initialize`). Only the counters and `recent` are
+-- cleared: pacing timestamps (`last_started`), `pending`, `running`, and the
+-- monotonic `sequence` are scheduler state, not per-batch feedback, and are left
+-- untouched so a reset mid-activity can never corrupt pacing or job identity.
+function Queue:reset_stats()
+  for k in pairs(self.stats) do self.stats[k] = 0 end
+  self.recent = {}
+end
+
 function Queue:pending_count()
   return #self.pending
 end
@@ -5746,6 +5761,16 @@ local function supported(storage, format)
 end
 
 local function initialize(storage, format, images, high_quality, extra_data)
+  -- Start each export with a clean queue scoreboard so the panel's
+  -- "queue: N ok/failed/retried - throttled Nx - waited X.Xs total" reflects
+  -- THIS export rather than every Flickr call since darktable launched. Without
+  -- this the cumulative session stats made a single earlier throttled batch
+  -- haunt the panel for the rest of the session. Reset here (an export-batch
+  -- boundary) rather than per queue call, so a claim/album fan-out still
+  -- aggregates correctly.
+  if __dtrmflickr_queue and __dtrmflickr_queue.reset_stats then
+    __dtrmflickr_queue:reset_stats()
+  end
   extra_data.uploaded = {}
   extra_data.failed   = {}
   extra_data.skipped  = {}
