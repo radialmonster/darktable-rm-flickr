@@ -2263,6 +2263,17 @@ local function default_retryable(err)
   if s:find("rate", 1, true) and s:find("limit", 1, true) then return true, "rate-limit" end
   if s:find("too many", 1, true) or s:find("throttle", 1, true) then return true, "rate-limit" end
   if s:find("http 429", 1, true) or s:find("(429)", 1, true) then return true, "rate-limit" end
+  -- Flickr REST error 105 is the documented "service currently unavailable"
+  -- overload / soft-throttle signal — the REST-body sibling of an HTTP 429 and
+  -- the most common transient REST failure under load. Its message text
+  -- ("Service currently unavailable") contains none of the substrings matched
+  -- below (note: "currently", not "temporarily", so the "temporar" rule misses
+  -- it), so match the code and the phrase explicitly and back off like a rate
+  -- limit. Sibling of the (106) "write operation failed" rule below.
+  if s:find("(105)", 1, true) or s:find("service currently unavailable", 1, true)
+    or s:find("service unavailable", 1, true) or s:find("temporarily unavailable", 1, true) then
+    return true, "rate-limit"
+  end
   if s:find("temporar", 1, true) or s:find("timed out", 1, true) or s:find("timeout", 1, true) then return true, "transient" end
   if s:find("connection", 1, true) or s:find("network", 1, true) or s:find("curl", 1, true) then return true, "transient" end
   if s:find("write operation failed", 1, true) or s:find("(106)", 1, true) then return true, "transient" end
