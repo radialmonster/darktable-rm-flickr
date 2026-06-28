@@ -3290,6 +3290,158 @@ function M.finalize_detail_lines(extra_data, opts)
   return lines
 end
 
+----------------------------------------------------------------------
+-- Per-image result table (issue #6).
+--
+-- The compact named lines above are tuned for the panel's transient toast:
+-- they collapse to per-bucket name lists. For a large batch the user also
+-- wants the full picture — one row per image with its status and the relevant
+-- id/reason/error — which belongs in the darktable log, not a toast. These
+-- helpers build that table from the same `extra_data` buckets `store`/`finalize`
+-- already populate, so they stay pure and offline-testable.
+--
+-- A live, incrementally-updating in-panel grid is not buildable today: darktable
+-- storage callbacks are synchronous and the queue drains within a single call,
+-- so intermediate per-row states are never observable. This is the realistic
+-- end-of-batch form; the live grid stays gated on the async/persistent queue.
+
+-- Turn one skipped result entry into a human reason string. `store` records
+-- skipped rows with heterogeneous fields depending on which rule fired
+-- (keyword skip-filter, rating threshold, color label). Pure and nil-safe.
+local function skip_reason(entry)
+  if type(entry) ~= "table" then return "skipped" end
+  if entry.reason == "rating" then
+    return string.format("rating %s below threshold %s",
+      tostring(entry.rating), tostring(entry.threshold))
+  end
+  if entry.reason == "color_label" then
+    return string.format("color label '%s' matched skip rule", tostring(entry.label))
+  end
+  if entry.filter then
+    return string.format("keyword '%s' matched skip rule '%s'",
+      tostring(entry.tag or ""), tostring(entry.filter))
+  end
+  if entry.reason and entry.reason ~= "" then return tostring(entry.reason) end
+  return "skipped"
+end
+M.skip_reason = skip_reason
+
+-- Build a structured, ordered per-image result list from the finalize buckets.
+-- Returns rows in summary order (uploaded, then skipped, then failed). Each row
+-- is one of:
+--   { kind = "uploaded", filename, photo_id, failed_actions = { <action>, ... } }
+--   { kind = "skipped",  filename, reason = <string> }
+--   { kind = "failed",   filename, error = <string> }
+-- Post-upload metadata errors are not their own rows: a post-error always
+-- belongs to an image that *did* upload, so it is folded into that uploaded
+-- row's `failed_actions` (matched by photo_id, falling back to the same image
+-- object). `failed_actions` is always a list (empty when the upload was clean),
+-- so a row with #failed_actions > 0 is a "partial" success.
+function M.result_rows(extra_data)
+  extra_data = extra_data or {}
+  local rows = {}
+
+  -- Index post-upload errors by the photo they belong to so each uploaded row
+  -- can collect its own failed actions. Prefer photo_id (a stable string id);
+  -- fall back to the image object identity when an id is somehow absent.
+  local post_by_id, post_by_image = {}, {}
+  for _, pe in ipairs(extra_data.post_errors or {}) do
+    if type(pe) == "table" then
+      local action = pe.action or "metadata"
+      if pe.photo_id ~= nil and pe.photo_id ~= "" then
+        local key = tostring(pe.photo_id)
+        post_by_id[key] = post_by_id[key] or {}
+        post_by_id[key][#post_by_id[key] + 1] = action
+      elseif pe.image ~= nil then
+        post_by_image[pe.image] = post_by_image[pe.image] or {}
+        post_by_image[pe.image][#post_by_image[pe.image] + 1] = action
+      end
+    end
+  end
+
+  for _, up in ipairs(extra_data.uploaded or {}) do
+    local actions
+    if up.photo_id ~= nil and post_by_id[tostring(up.photo_id)] then
+      actions = post_by_id[tostring(up.photo_id)]
+    elseif up.image ~= nil and post_by_image[up.image] then
+      actions = post_by_image[up.image]
+    end
+    rows[#rows + 1] = {
+      kind = "uploaded",
+      filename = name_of(up),
+      photo_id = up.photo_id,
+      failed_actions = actions or {},
+    }
+  end
+  for _, sk in ipairs(extra_data.skipped or {}) do
+    rows[#rows + 1] = { kind = "skipped", filename = name_of(sk), reason = skip_reason(sk) }
+  end
+  for _, fa in ipairs(extra_data.failed or {}) do
+    rows[#rows + 1] = {
+      kind = "failed",
+      filename = name_of(fa),
+      error = (fa and fa.error and tostring(fa.error)) or "unknown error",
+    }
+  end
+  return rows
+end
+
+-- Display status word for a result row: "partial" for an uploaded row that had
+-- a post-upload metadata error, otherwise the row's kind verbatim.
+local function row_status(row)
+  if row.kind == "uploaded" and row.failed_actions and #row.failed_actions > 0 then
+    return "partial"
+  end
+  return row.kind
+end
+M.row_status = row_status
+
+-- The right-hand detail column for a result row.
+local function row_detail(row)
+  if row.kind == "uploaded" then
+    local photo = row.photo_id and ("photo " .. tostring(row.photo_id)) or "uploaded"
+    if row.failed_actions and #row.failed_actions > 0 then
+      return string.format("%s (%s update failed)", photo, table.concat(row.failed_actions, ", "))
+    end
+    return photo
+  elseif row.kind == "skipped" then
+    return row.reason or "skipped"
+  else
+    return row.error or "unknown error"
+  end
+end
+M.row_detail = row_detail
+
+-- Render the per-image result rows into aligned text lines for the log. The
+-- status and filename columns are left-padded to their widest value so the
+-- table reads as a grid. Returns an empty list when there are no rows, so the
+-- caller emits nothing for an all-clean export with no images. `opts.translate`
+-- localizes only the header line (the row data is user content / ids).
+function M.result_table_lines(extra_data, opts)
+  opts = opts or {}
+  local tr = opts.translate
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  local rows = M.result_rows(extra_data)
+  if #rows == 0 then return {} end
+
+  local status_w, name_w = 0, 0
+  local cells = {}
+  for i, row in ipairs(rows) do
+    local s, n = row_status(row), row.filename or "?"
+    cells[i] = { status = s, name = n, detail = row_detail(row) }
+    if #s > status_w then status_w = #s end
+    if #n > name_w then name_w = #n end
+  end
+
+  local lines = {}
+  lines[#lines + 1] = string.format(tr("Flickr: per-image results (%d):"), #rows)
+  local fmt = string.format("  %%-%ds  %%-%ds  %%s", status_w, name_w)
+  for _, c in ipairs(cells) do
+    lines[#lines + 1] = string.format(fmt, c.status, c.name, c.detail)
+  end
+  return lines
+end
+
 return M
 end
 
@@ -6170,6 +6322,13 @@ local function finalize(storage, image_table, extra_data)
   end
   dt.print_log(string.format("[dtrmflickr] finalize: uploaded=%d skipped=%d failed=%d post_errors=%d album_errors=%d keyword_conflicts=%d tag_limit_warnings=%d total=%d",
     uploaded, skipped, failed, post_errors, album_errors, keyword_conflicts, tag_limit_warnings, total))
+  -- Full per-image result grid (status + id/reason/error per row) goes to the
+  -- log rather than the transient panel toast: it is the complete record for a
+  -- large batch, where a multi-line grid in a toast would be unreadable. The
+  -- compact named lines above are the panel-facing summary.
+  for _, line in ipairs(report.result_table_lines(extra_data, { translate = _ })) do
+    dt.print_log("[dtrmflickr] " .. line)
+  end
 end
 
 ----------------------------------------------------------------------
