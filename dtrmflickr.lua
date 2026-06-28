@@ -1136,13 +1136,17 @@ function M.paged_call(api_key, api_secret, account, method, args, container, opt
 
     bodies[#bodies + 1] = body
     local current_page, page_count, total = M.parse_page_info(body, container)
-    -- A `stat="ok"` body that lacks the <container> wrapper is malformed/unexpected
-    -- (page_count == nil). On the first page that means we have no idea how many
-    -- pages exist, so silently returning this one truncated body would let callers
-    -- (notably claim's candidate search) conclude "no match" from an incomplete
-    -- set. Fail loudly instead so the shared queue can retry. A missing wrapper on
-    -- a *later* page is tolerated (we keep the pages already fetched and stop).
-    if page_count == nil and #bodies == 1 then
+    -- A `stat="ok"` body that lacks the <container> wrapper is malformed/truncated
+    -- (page_count == nil), on ANY page. Silently returning the pages collected so
+    -- far would let callers (notably claim's candidate search and album-membership
+    -- refresh) conclude "no match"/under-report memberships from an incomplete set
+    -- — and because parse_page_info can't read the page count from a wrapperless
+    -- body, a *later* malformed page also contributes zero parsed items with no
+    -- error. Fail loudly on any missing wrapper so the shared queue retries the
+    -- whole read with backoff (the message is classified transient in queue.lua).
+    -- A truncated page-1 OR page-N are both genuine transport/CDN failures here:
+    -- every legitimate Flickr page carries its <photos>/<photosets> wrapper.
+    if page_count == nil then
       return nil, "unparseable Flickr paged response (missing <" .. container .. "> wrapper)"
     end
     page_infos[#page_infos + 1] = { page = current_page, pages = page_count, total = total }
