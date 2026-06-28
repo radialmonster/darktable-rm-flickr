@@ -2398,6 +2398,27 @@ end
 local function default_retryable(err)
   local s = tostring(err or ""):lower()
   if s == "" then return false end
+  -- A Flickr REST error is structured: parse_error formats it as
+  -- "Flickr REST failed (<code>): <message>", where <code> is Flickr's numeric
+  -- error code and <message> is server text that frequently echoes
+  -- user-controlled content (a photo title, a tag, a filename). Classify such
+  -- errors *strictly by their code* so an echoed token in the message — a title
+  -- that literally contains "(503)", a tag "http 500", etc. — can never be
+  -- mistaken for a transport status and wrongly mark a permanent error retryable
+  -- (which would burn 3 attempts + backoff on an error that will never improve).
+  -- Only 105 ("service currently unavailable", the soft-throttle/overload signal)
+  -- and 106 ("write operation failed") are transient; every other Flickr REST
+  -- code is a permanent/client error (bad args, permission, not found, …) and
+  -- must not retry. Transport-level strings (curl/WinHTTP/MSXML "HTTP NNN …",
+  -- "bad gateway", timeouts) have no "failed (<code>)" prefix, so they fall
+  -- through to the substring/heuristic rules below. A codeless REST error
+  -- ("Flickr REST failed: <msg>", no parens) also falls through unchanged.
+  local rest_code = tonumber(s:match("flickr rest failed %((%d+)%)"))
+  if rest_code then
+    if rest_code == 105 then return true, "rate-limit" end
+    if rest_code == 106 then return true, "transient" end
+    return false
+  end
   if s:find("rate", 1, true) and s:find("limit", 1, true) then return true, "rate-limit" end
   if s:find("too many", 1, true) or s:find("throttle", 1, true) then return true, "rate-limit" end
   if s:find("http 429", 1, true) or s:find("(429)", 1, true) then return true, "rate-limit" end
@@ -2441,6 +2462,11 @@ local function default_retryable(err)
   local http_code = tonumber(s:match("http (%d%d%d)") or s:match("http/[%d.]+%s+(%d%d%d)"))
   if http_code then
     if http_code == 429 or http_code == 503 then return true, "rate-limit" end
+    -- 408 Request Timeout is a genuinely transient, retry-safe gateway/server
+    -- response (the request never completed), so retry idempotent reads/setters
+    -- on it like any other transient. (The non-idempotent upload/create opt out
+    -- via max_attempts=1.) Caught explicitly since it is < 500.
+    if http_code == 408 then return true, "transient" end
     if http_code >= 500 then return true, "transient" end
   end
   if s:find("temporar", 1, true) or s:find("timed out", 1, true) or s:find("timeout", 1, true) then return true, "transient" end
