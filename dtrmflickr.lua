@@ -964,7 +964,39 @@ end
 
 function M.parse_photosets(body)
   local sets = {}
-  for attrs, inner in tostring(body or ""):gmatch("<photoset%s+([^>]*)>(.-)</photoset>") do
+  body = tostring(body or "")
+  -- Scan each <photoset ...> open tag, then decide whether it is self-closing
+  -- (`<photoset ... />`, no children) or a normal element with an inner body up
+  -- to `</photoset>`. The old single-pattern form
+  -- (`<photoset%s+([^>]*)>(.-)</photoset>`) silently dropped any self-closing
+  -- photoset because it required a closing tag. Harmless against today's live
+  -- responses — `flickr.photosets.getList` always returns child elements
+  -- (`<title>`/`<description>` and the `<has_photo />`/`<has_requested_photos />`
+  -- membership markers), so every set has a closing tag — but a childless
+  -- self-closing set would have vanished from the list/membership with no error.
+  -- Accept both shapes defensively.
+  local pos = 1
+  while true do
+    local open_s, open_e, attrs = body:find("<photoset%s+([^>]*)>", pos)
+    if not open_s then break end
+    local inner = ""
+    if attrs:sub(-1) == "/" then
+      -- Self-closing `<photoset ... />`: strip the trailing slash from attrs,
+      -- no inner content. (A self-closing set carries no child markers, so its
+      -- membership can only come from a has_requested_photos attribute.)
+      attrs = attrs:gsub("%s*/%s*$", "")
+      pos = open_e + 1
+    else
+      local close_s, close_e, content = body:find("(.-)</photoset>", open_e + 1)
+      if close_s then
+        inner = content
+        pos = close_e + 1
+      else
+        -- Open tag with no matching close: treat as empty-bodied and advance
+        -- past the open tag so the scan can't loop forever.
+        pos = open_e + 1
+      end
+    end
     local id = attrs:match('id="(.-)"') or attrs:match("id='(.-)'")
     local title = inner:match("<title>(.-)</title>") or ""
     if id and id ~= "" then
