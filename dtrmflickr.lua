@@ -1830,17 +1830,35 @@ function M.fingerprints_from_values(values)
   local content_type = values.content_type or {}
   local license = values.license or {}
   local permissions = values.permissions or {}
-  return {
-    keywords = fingerprint_hash(values.tags or ""),
-    title_description = fingerprint_parts({ values.title or "", values.description or "" }),
-    gps = fingerprint_parts({ values.lat or "", values.lon or "" }),
-    date_taken = fingerprint_hash(values.date_taken or ""),
-    visibility = fingerprint_parts({ privacy.is_public or "", privacy.is_friend or "", privacy.is_family or "" }),
-    safety = fingerprint_hash(safety.flickr_value or ""),
-    content_type = fingerprint_hash(content_type.flickr_value or ""),
-    license = fingerprint_hash(license.flickr_value or ""),
-    permissions = fingerprint_parts({ permissions.perm_comment or "", permissions.perm_addmeta or "" }),
-  }
+  local fingerprints = {}
+  if values.include_keywords or values.tags ~= nil then
+    fingerprints.keywords = fingerprint_hash(values.tags or "")
+  end
+  if values.include_title_description or values.title ~= nil or values.description ~= nil then
+    fingerprints.title_description = fingerprint_parts({ values.title or "", values.description or "" })
+  end
+  if values.include_gps or values.lat ~= nil or values.lon ~= nil then
+    fingerprints.gps = fingerprint_parts({ values.lat or "", values.lon or "" })
+  end
+  if values.include_date_taken or values.date_taken ~= nil then
+    fingerprints.date_taken = fingerprint_hash(values.date_taken or "")
+  end
+  if values.privacy ~= nil then
+    fingerprints.visibility = fingerprint_parts({ privacy.is_public or "", privacy.is_friend or "", privacy.is_family or "" })
+  end
+  if values.safety ~= nil then
+    fingerprints.safety = fingerprint_hash(safety.flickr_value or "")
+  end
+  if values.content_type ~= nil then
+    fingerprints.content_type = fingerprint_hash(content_type.flickr_value or "")
+  end
+  if values.license ~= nil then
+    fingerprints.license = fingerprint_hash(license.flickr_value or "")
+  end
+  if values.permissions ~= nil then
+    fingerprints.permissions = fingerprint_parts({ permissions.perm_comment or "", permissions.perm_addmeta or "" })
+  end
+  return fingerprints
 end
 
 return M
@@ -5035,6 +5053,10 @@ function effective_metadata_fingerprints(image, sync, opts)
   local lat, lon = nil, nil
   if sync.gps then lat, lon = metadata.image_location(image) end
   return metadata.fingerprints_from_values({
+    include_keywords = sync.tags,
+    include_title_description = sync.title or sync.description,
+    include_gps = sync.gps,
+    include_date_taken = sync.date_taken,
     title = sync.title and metadata.image_title(image, image and image.filename or "") or nil,
     description = sync.description and image and image.description or nil,
     tags = tags,
@@ -5404,6 +5426,7 @@ script_data.__test = {
   should_force_private_by_rating = rating_color_rules.should_force_private_by_rating,
   should_force_private_by_color_label = rating_color_rules.should_force_private_by_color_label,
   image_keyword_tags = image_keyword_tags,
+  effective_metadata_fingerprints = effective_metadata_fingerprints,
   image_date_taken = metadata.image_date_taken,
   image_location = metadata.image_location,
   refresh_panel = refresh_panel,
