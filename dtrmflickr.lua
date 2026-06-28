@@ -3402,6 +3402,77 @@ function M.deserialize(blob)
   return out
 end
 
+----------------------------------------------------------------------
+-- Persistent store (load/save the resume blob through an injected backend).
+--
+-- This is the load/save preference-blob plumbing: it turns the serialize/
+-- deserialize pair into a durable round-trip against a key/value backend
+-- (darktable preferences in production). The backend is INJECTED rather than
+-- `require`d so this module stays pure and offline-testable — the main module
+-- wraps `dt.preferences` with `make_pref_backend`; tests pass a table stub.
+--
+-- A backend is any table exposing:
+--   read()      -> the stored blob string (or nil/"" when nothing is stored)
+--   write(blob) -> persist the blob string
+--
+-- Save persists only the resumable subset (`to_resumable`), so a terminal job is
+-- never written into the blob; a resume rebuilt from a reloaded blob therefore
+-- can never re-run a succeeded/failed job (the non-idempotent-retry hazard — see
+-- queue-system.md). Records keep their owning nsid, so account partitioning still
+-- happens at load time via `plan_resume_safe`; the blob itself is account-mixed.
+--
+-- LIVE use stays gated on the async/coroutine queue: the synchronous queue drains
+-- to terminal within one call, so there is never a live job to persist mid-flight.
+-- This lands the durable round-trip the async resume will call.
+----------------------------------------------------------------------
+
+local function assert_backend(backend, method)
+  assert(type(backend) == "table" and type(backend[method]) == "function",
+    "queue_jobs store backend must expose a " .. method .. "() function")
+end
+
+-- Serialize the resumable subset of `records` and persist it through `backend`.
+-- Returns the blob written (handy for tests / logging). An empty/no-resumable
+-- list writes a headers-only blob that `load_records` reads back as no records.
+function M.save_records(backend, records)
+  assert_backend(backend, "write")
+  local blob = M.serialize(M.to_resumable(records))
+  backend.write(blob)
+  return blob
+end
+
+-- Read and rebuild the persisted record list. Tolerant by way of `deserialize`:
+-- a nil/empty/corrupt blob yields an empty list ("nothing to resume").
+function M.load_records(backend)
+  assert_backend(backend, "read")
+  return M.deserialize(backend.read())
+end
+
+-- Drop the persisted blob (after a clean resume, or on logout). Distinct from
+-- `save_records({}, ...)` only for intent; both write the empty blob.
+function M.clear_records(backend)
+  assert_backend(backend, "write")
+  backend.write("")
+end
+
+-- Adapt a darktable-style preferences object to the {read, write} backend
+-- interface. `prefs` must expose read(plugin, key, type) / write(plugin, key,
+-- type, value) — exactly `dt.preferences`. Takes `prefs` as a parameter (rather
+-- than `require`-ing darktable) so this module stays offline-importable; lives
+-- here so wiring it in the main module is a one-liner that costs no main-chunk
+-- local. A nil read normalizes to "" so `deserialize` sees a string.
+function M.make_pref_backend(prefs, plugin, key)
+  assert(type(prefs) == "table" and type(prefs.read) == "function"
+    and type(prefs.write) == "function",
+    "make_pref_backend requires a preferences object with read()/write()")
+  plugin = plugin or "dtrmflickr"
+  key = key or "queue_resume"
+  return {
+    read = function() return prefs.read(plugin, key, "string") or "" end,
+    write = function(blob) prefs.write(plugin, key, "string", tostring(blob or "")) end,
+  }
+end
+
 return M
 end
 
