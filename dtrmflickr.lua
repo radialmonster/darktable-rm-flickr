@@ -2284,7 +2284,18 @@ function M.claim_existing_for_image(api_key, api_secret, acc, image)
   -- (nil, err) failure so the queued job retries the whole claim with backoff
   -- instead of permanently mislinking nothing.
   if transient then return nil, transient end
-  if #errors > 0 and #candidates == 0 then return "error", table.concat(errors, "; ") end
+  -- Any search failure — even a non-retryable one — means the candidate set may
+  -- be incomplete, so a negative verdict ("no match"/"ambiguous"/"skipped") here
+  -- is not trustworthy: the failed search could have supplied the real match or
+  -- added a same-date candidate that flips a unique match to ambiguous. We have
+  -- no confident match (a positive one short-circuited above, preserving the
+  -- "claim what you found" behaviour), so report the error instead of silently
+  -- skipping. The earlier `transient` branch already handles retryable failures;
+  -- a non-retryable one won't improve on retry, so surface it as a reported
+  -- "error" rather than guessing from a truncated set. (Previously this only
+  -- fired when *every* search failed (`#candidates == 0`); a partial failure with
+  -- surviving candidates wrongly returned "skipped".)
+  if #errors > 0 then return "error", table.concat(errors, "; ") end
   return "skipped", reason
 end
 
