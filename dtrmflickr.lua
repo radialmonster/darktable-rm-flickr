@@ -3702,22 +3702,28 @@ local function save_panel_settings()
   local skipped = {}
   local sync = master_sync_fields()
   local is_public, is_friend, is_family = panel_privacy_flags()
-  local wants_perms = panel_dirty.privacy or panel_dirty.comment_perm or panel_dirty.addmeta_perm
-  local can_update_perms = (panel_dirty.privacy and sync.privacy)
-    or ((panel_dirty.comment_perm or panel_dirty.addmeta_perm) and sync.permissions)
-  if wants_perms and can_update_perms then
+  local wants_privacy = panel_dirty.privacy
+  local wants_comment_perm = panel_dirty.comment_perm
+  local wants_addmeta_perm = panel_dirty.addmeta_perm
+  local update_privacy = wants_privacy and sync.privacy
+  local update_comment_perm = wants_comment_perm and sync.permissions
+  local update_addmeta_perm = wants_addmeta_perm and sync.permissions
+  if update_privacy or update_comment_perm or update_addmeta_perm then
     local ok, err = rest.photos_set_perms(api_key, api_secret, acc, photo_id, is_public, is_friend, is_family,
-      panel_comment_perm_value(), panel_addmeta_perm_value())
+      update_comment_perm and panel_comment_perm_value() or nil,
+      update_addmeta_perm and panel_addmeta_perm_value() or nil)
     if not ok then
-      state.mark_reason(panel_current.image, acc.nsid, "visibility")
-      state.mark_reason(panel_current.image, acc.nsid, "permissions")
+      if update_privacy then state.mark_reason(panel_current.image, acc.nsid, "visibility") end
+      if update_comment_perm or update_addmeta_perm then state.mark_reason(panel_current.image, acc.nsid, "permissions") end
       errors[#errors + 1] = "privacy: " .. tostring(err)
     else
-      state.clear_reason(panel_current.image, acc.nsid, "visibility")
-      state.clear_reason(panel_current.image, acc.nsid, "permissions")
+      if update_privacy then state.clear_reason(panel_current.image, acc.nsid, "visibility") end
+      if update_comment_perm or update_addmeta_perm then state.clear_reason(panel_current.image, acc.nsid, "permissions") end
     end
-  elseif wants_perms then
-    skipped[#skipped + 1] = "privacy/permissions"
+  end
+  if wants_privacy and not sync.privacy then skipped[#skipped + 1] = "privacy" end
+  if (wants_comment_perm or wants_addmeta_perm) and not sync.permissions then
+    skipped[#skipped + 1] = "permissions"
   end
   local safety = panel_safety_value()
   if panel_dirty.safety and sync.safety then
