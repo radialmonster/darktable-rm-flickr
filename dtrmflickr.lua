@@ -1350,8 +1350,17 @@ local function flickr_quote_tag(tag)
   return tag
 end
 
-function M.image_keyword_tags(image, excluded_filters, tag_names)
+local function publish_tag_name(name)
+  name = tostring(name or ""):match("^%s*(.-)%s*$")
+  local leaf = name:match("([^|]+)$")
+  leaf = leaf and leaf:match("^%s*(.-)%s*$") or name
+  return leaf ~= "" and leaf or nil
+end
+
+function M.image_keyword_tags(image, excluded_filters, tag_names, opts)
+  opts = opts or {}
   local tags = {}
+  local seen = {}
   local source_tags = {}
   if tag_names then
     for _, name in ipairs(tag_names) do source_tags[#source_tags + 1] = { name = name } end
@@ -1368,13 +1377,28 @@ function M.image_keyword_tags(image, excluded_filters, tag_names)
       for _, filter in ipairs(excluded_filters or {}) do
         if M.tag_matches_filter(name, filter) then excluded = true; break end
       end
-      if not excluded then tags[#tags + 1] = name end
+      if not excluded then
+        local publish_name = publish_tag_name(name)
+        local key = publish_name and publish_name:lower() or nil
+        if publish_name and not seen[key] then
+          seen[key] = true
+          tags[#tags + 1] = publish_name
+        end
+      end
     end
+  end
+
+  table.sort(tags, function(a, b) return tostring(a):lower() < tostring(b):lower() end)
+  local original_count = #tags
+  if opts.max_tags and #tags > opts.max_tags then
+    local limited = {}
+    for i = 1, opts.max_tags do limited[i] = tags[i] end
+    tags = limited
   end
 
   local encoded = {}
   for _, tag in ipairs(tags) do encoded[#encoded + 1] = flickr_quote_tag(tag) end
-  return #encoded > 0 and table.concat(encoded, " ") or nil
+  return #encoded > 0 and table.concat(encoded, " ") or nil, math.max(0, original_count - #tags)
 end
 
 return M
@@ -1659,6 +1683,8 @@ local TRANSPORT, TRANSPORT_MSG = detect_transport()
 local TOKEN_SEP <const> = "\t"   -- neither char appears in Flickr tokens
 local session_account = nil
 local EMPTY_FILTER_PREF <const> = "<none>"
+local FLICKR_TAG_LIMIT <const> = 75
+local clear_album_cache
 
 local function keep_label_pref(widget)
   -- Label-only Lua preference rows are explanatory text; there is no user value to save.
@@ -1730,6 +1756,11 @@ local settings_help_widget = dt.new_widget("label") {
 }
 
 local function save_token(acc)
+  local active_nsid = dt.preferences.read(PLUGIN, "active_nsid", "string")
+  if (session_account and session_account.nsid ~= acc.nsid)
+    or (active_nsid and active_nsid ~= "" and active_nsid ~= acc.nsid) then
+    clear_album_cache()
+  end
   local packed = pack_token(acc.token, acc.secret)
   local ok = dt.password.save(PLUGIN, acc.nsid, json_object {
     server = acc.nsid,
@@ -1765,6 +1796,7 @@ local function clear_token()
     dt.password.save(PLUGIN, nsid, json_object { server = nsid, username = nsid, password = "" })
   end  -- no delete API; blank it
   session_account = nil
+  clear_album_cache()
   dt.preferences.write(PLUGIN, "active_nsid", "string", "")
   dt.preferences.write(PLUGIN, "active_username", "string", "")
 end
@@ -2309,6 +2341,7 @@ local album_mode_widget = dt.new_widget("combobox") {
   _("no album"), _("existing album"), _("create new album"),
 }
 local album_cache = {}
+local album_cache_nsid = nil
 local filtering_albums = false
 local function trim(value)
   return tostring(value or ""):match("^%s*(.-)%s*$")
@@ -2483,8 +2516,52 @@ album_widget.changed_callback = function(widget)
   if selected ~= "" then album_entry.text = selected end
 end
 
-local function set_album_cache(items)
+local function album_cache_matches(account)
+  local nsid = type(account) == "table" and account.nsid or account
+  nsid = tostring(nsid or "")
+  return nsid == "" or album_cache_nsid == nil or album_cache_nsid == nsid
+end
+
+clear_album_cache = function()
+  album_cache = {}
+  album_cache_nsid = nil
+  update_album_choices(album_input_value())
+end
+
+local function set_album_cache(items, account)
   album_cache = items or {}
+  album_cache_nsid = account ~= nil and (type(account) == "table" and account.nsid or account) or nil
+  update_album_choices(album_input_value())
+end
+
+local function merge_album_cache(items, account)
+  items = items or {}
+  if not album_cache_matches(account) then clear_album_cache() end
+  if #album_cache == 0 then
+    set_album_cache(items, account)
+    return
+  end
+  if account ~= nil then
+    album_cache_nsid = type(account) == "table" and account.nsid or account
+  end
+
+  local positions = {}
+  for i, item in ipairs(album_cache) do
+    local id = tostring(item and item.id or "")
+    if id ~= "" then positions[id] = i end
+  end
+  for _, item in ipairs(items) do
+    local id = tostring(item and item.id or "")
+    if id ~= "" then
+      local existing_index = positions[id]
+      if existing_index then
+        album_cache[existing_index] = item
+      else
+        album_cache[#album_cache + 1] = item
+        positions[id] = #album_cache
+      end
+    end
+  end
   update_album_choices(album_input_value())
 end
 
@@ -2509,17 +2586,23 @@ local function refresh_album_list()
     dt.print_log(string.format("[dtrmflickr] album refresh failed: %s", tostring(err)))
     return nil, err
   end
-  set_album_cache(sets)
+  set_album_cache(sets, account)
   album_status_label.label = string.format(_("%d album(s) loaded"), #sets)
   dt.print(string.format(_("Flickr: loaded %d album(s)"), #sets))
   return sets
 end
 
-local function refresh_album_cache_for_export(api_key, api_secret, account)
+local function refresh_album_cache_for_export(api_key, api_secret, account, opts)
   if not account or not api_key or not api_secret then return nil, "missing account or API credentials" end
+  opts = opts or {}
+  if opts.use_cache and #album_cache > 0 and album_cache_matches(account) then
+    album_status_label.label = string.format(_("%d album(s) loaded"), #album_cache)
+    return album_cache
+  end
+  if not album_cache_matches(account) then clear_album_cache() end
   local sets, err = rest.photosets_get_list(api_key, api_secret, account)
   if not sets then return nil, err end
-  set_album_cache(sets)
+  set_album_cache(sets, account)
   album_status_label.label = string.format(_("%d album(s) loaded"), #sets)
   return sets
 end
@@ -3017,6 +3100,7 @@ function panel_sets.api_context(action)
     dt.print(_("Flickr: log in before editing albums."))
     return nil
   end
+  if not album_cache_matches(acc) then clear_album_cache() end
   local api_key, api_secret = get_credentials()
   if not api_key or not api_secret then
     dt.print(_("Flickr: missing API key/secret."))
@@ -3065,7 +3149,7 @@ function panel_sets.refresh_memberships()
     return nil, err
   end
 
-  if sets then set_album_cache(sets) end
+  if sets then merge_album_cache(sets, acc) end
   state.clear_sets(image, acc.nsid)
   for _, item in ipairs(memberships) do
     if item.id and item.id ~= "" then state.add_set(image, acc.nsid, item.id) end
@@ -3727,7 +3811,8 @@ local function initialize(storage, format, images, high_quality, extra_data)
   local wants_album = (album_mode == 2 and album_input_value() ~= "")
     or (album_mode == 3 and trim(album_new_entry.text or "") ~= "")
   if album_mode ~= 1 and wants_album and extra_data.account then
-    local _sets, album_refresh_err = refresh_album_cache_for_export(extra_data.api_key, extra_data.api_secret, extra_data.account)
+    local _sets, album_refresh_err = refresh_album_cache_for_export(extra_data.api_key, extra_data.api_secret,
+      extra_data.account, { use_cache = true })
     if album_refresh_err then
       dt.print(string.format(_("Flickr: could not refresh albums before export: %s"), tostring(album_refresh_err)))
       dt.print_log(string.format("[dtrmflickr] initialize: album refresh failed: %s", tostring(album_refresh_err)))
@@ -3903,7 +3988,18 @@ local function apply_keyword_overrides(tag_names, privacy, safety, content_type,
 end
 
 local function image_keyword_tags(image, tag_names)
-  return metadata.image_keyword_tags(image, keyword_rule_filters(), tag_names)
+  return metadata.image_keyword_tags(image, keyword_rule_filters(), tag_names, { max_tags = FLICKR_TAG_LIMIT })
+end
+
+local function record_tag_limit_warning(extra_data, image, truncated_count)
+  if not extra_data or not truncated_count or truncated_count <= 0 then return end
+  extra_data.tag_limit_warnings = extra_data.tag_limit_warnings or {}
+  extra_data.tag_limit_warnings[#extra_data.tag_limit_warnings + 1] = {
+    image = image,
+    truncated_count = truncated_count,
+  }
+  dt.print(string.format(_("Flickr: %s has more than %d publishable keywords; skipped %d extra tag(s)"),
+    image and image.filename or "image", FLICKR_TAG_LIMIT, truncated_count))
 end
 
 local function record_post_error(extra_data, image, photo_id, action, err)
@@ -3943,7 +4039,11 @@ local function store(storage, image, format, filename, number, total, high_quali
   local forced, conflicts
   privacy, safety, content_type, license, forced, conflicts = apply_keyword_overrides(tag_names, privacy, safety, content_type, license)
   for _, conflict in ipairs(conflicts or {}) do record_keyword_conflict(extra_data, conflict) end
-  local tags = sync.tags and image_keyword_tags(image) or nil
+  local tags, truncated_tags = nil, 0
+  if sync.tags then
+    tags, truncated_tags = image_keyword_tags(image)
+    record_tag_limit_warning(extra_data, image, truncated_tags)
+  end
   dt.print(string.format(_("Flickr: uploading %d/%d — %s"), number, total, image.filename or "?"))
   local photo_id, err = upload.upload_photo(extra_data.api_key, extra_data.api_secret, extra_data.account, filename, {
     title = sync.title and metadata.image_title(image, filename) or nil,
@@ -3998,6 +4098,7 @@ local function finalize(storage, image_table, extra_data)
   local failed = #(extra_data.failed or {})
   local post_errors = #(extra_data.post_errors or {})
   local keyword_conflicts = #(extra_data.keyword_conflicts or {})
+  local tag_limit_warnings = #(extra_data.tag_limit_warnings or {})
   local album = extra_data.album or { mode = "none" }
   local album_errors = 0
   local photoset_id = album.photoset_id
@@ -4057,8 +4158,12 @@ local function finalize(storage, image_table, extra_data)
   if keyword_conflicts > 0 then
     dt.print(string.format(_("Flickr: %d keyword rule conflict(s); see messages above"), keyword_conflicts))
   end
-  dt.print_log(string.format("[dtrmflickr] finalize: uploaded=%d failed=%d post_errors=%d album_errors=%d keyword_conflicts=%d total=%d",
-    uploaded, failed, post_errors, album_errors, keyword_conflicts, total))
+  if tag_limit_warnings > 0 then
+    dt.print(string.format(_("Flickr: %d image(s) had keywords truncated to Flickr's %d-tag limit"),
+      tag_limit_warnings, FLICKR_TAG_LIMIT))
+  end
+  dt.print_log(string.format("[dtrmflickr] finalize: uploaded=%d failed=%d post_errors=%d album_errors=%d keyword_conflicts=%d tag_limit_warnings=%d total=%d",
+    uploaded, failed, post_errors, album_errors, keyword_conflicts, tag_limit_warnings, total))
 end
 
 ----------------------------------------------------------------------
