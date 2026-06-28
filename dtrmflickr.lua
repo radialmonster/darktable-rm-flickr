@@ -1032,6 +1032,19 @@ function M.photos_set_meta(api_key, api_secret, account, photo_id, title, descri
   return true
 end
 
+function M.photos_set_tags(api_key, api_secret, account, photo_id, tags)
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+  if tags == nil then return nil, "missing tags" end
+
+  local body, err = M.call(api_key, api_secret, account, "flickr.photos.setTags", {
+    photo_id = photo_id,
+    tags = tags,
+    _allow_empty = { tags = true },
+  })
+  if not body then return nil, err end
+  return true
+end
+
 function M.photos_get_perms(api_key, api_secret, account, photo_id)
   if not photo_id or photo_id == "" then return nil, "missing photo id" end
 
@@ -3525,6 +3538,50 @@ local function sync_panel_meta()
   end
 end
 
+local image_keyword_tags
+
+local function sync_panel_tags()
+  local acc, photo_id, image = panel_current.account, panel_current.photo_id, panel_current.image
+  if (panel_current.selection_count or 0) ~= 1 then
+    dt.print(_("Flickr: select exactly one image before syncing keywords."))
+    return
+  end
+  if not image or not photo_id then
+    dt.print(_("Flickr: select a published image first."))
+    return
+  end
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before syncing Flickr keywords."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+  if not master_sync_fields().tags then
+    dt.print(_("Flickr: keyword sync disabled in Lua Options."))
+    return
+  end
+
+  local tags, truncated_tags = image_keyword_tags(image)
+  tags = tags or ""
+  if truncated_tags and truncated_tags > 0 then
+    dt.print(string.format(_("Flickr: selected image has more than %d publishable keywords; skipped %d extra tag(s)"),
+      FLICKR_TAG_LIMIT, truncated_tags))
+  end
+
+  local ok, err = rest.photos_set_tags(api_key, api_secret, acc, photo_id, tags)
+  if ok then
+    panel_remote_label.label = _("Flickr: keywords synced")
+    dt.print(_("Flickr: keywords synced."))
+    load_remote_settings(api_key, api_secret, acc, photo_id)
+  else
+    panel_remote_label.label = _("Flickr: keyword sync failed")
+    dt.print(_("Flickr: keyword sync failed: ") .. tostring(err))
+  end
+end
+
 local function claim_existing_selection()
   local selection = dt.gui.selection and dt.gui.selection() or {}
   if #selection == 0 then
@@ -3727,6 +3784,10 @@ local panel_widget = dt.new_widget("box") {
   dt.new_widget("button") {
     label = _("sync title/description"),
     clicked_callback = function() sync_panel_meta() end,
+  },
+  dt.new_widget("button") {
+    label = _("sync keywords"),
+    clicked_callback = function() sync_panel_tags() end,
   },
   dt.new_widget("button") {
     label = _("refresh"),
@@ -4042,7 +4103,7 @@ local function apply_keyword_overrides(tag_names, privacy, safety, content_type,
     conflicts
 end
 
-local function image_keyword_tags(image, tag_names)
+function image_keyword_tags(image, tag_names)
   return metadata.image_keyword_tags(image, keyword_rule_filters(), tag_names, { max_tags = FLICKR_TAG_LIMIT })
 end
 
