@@ -1361,12 +1361,14 @@ function M.parse_search_photos(body)
     }
   end
   for attrs in tostring(body or ""):gmatch("<photo%s+([^>]-)>") do
-    photos[#photos + 1] = {
-      id = remote_attr(attrs, "id"),
-      title = xml_unescape(remote_attr(attrs, "title") or ""),
-      datetaken = remote_attr(attrs, "datetaken"),
-      dateupload = remote_attr(attrs, "dateupload"),
-    }
+    if not attrs:match("/%s*$") then
+      photos[#photos + 1] = {
+        id = remote_attr(attrs, "id"),
+        title = xml_unescape(remote_attr(attrs, "title") or ""),
+        datetaken = remote_attr(attrs, "datetaken"),
+        dateupload = remote_attr(attrs, "dateupload"),
+      }
+    end
   end
   return photos
 end
@@ -2780,7 +2782,7 @@ local function parse_search_content_type(body, photo_id)
     end
   end
   for attrs in tostring(body or ""):gmatch("<photo%s+([^>]-)>") do
-    if remote_attr(attrs, "id") == id then
+    if not attrs:match("/%s*$") and remote_attr(attrs, "id") == id then
       return remote_attr(attrs, "content_type")
     end
   end
