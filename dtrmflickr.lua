@@ -3198,6 +3198,52 @@ function M.cancel_orphans(records, active_nsid)
   return runnable, orphaned
 end
 
+-- Keep only the records worth persisting for a resume: the non-terminal
+-- (`is_resumable`) ones. A terminal job is already decided — re-running a
+-- `succeeded` job duplicates work, and re-running a `failed` upload may create a
+-- duplicate photo (see the non-idempotent-retry note in queue-system.md) — so it
+-- must never be carried into the resume blob. Pure; returns a new list.
+function M.to_resumable(records)
+  local out = {}
+  for _, rec in ipairs(records or {}) do
+    if type(rec) == "table" and M.is_resumable(rec.state) then
+      out[#out + 1] = rec
+    end
+  end
+  return out
+end
+
+-- Resume-safety classifier. Unlike `partition_by_account` (which keys purely on
+-- the owning nsid and would happily mark a terminal-but-owned record runnable),
+-- `plan_resume` is what an async resume calls: it guarantees a terminal job is
+-- never re-run. Returns three lists:
+--   runnable — resumable AND owned by the active account (safe to re-run)
+--   orphaned — resumable but owned by another account / unbound / logged out
+--   finished — already terminal (succeeded/failed/stale/cancelled): skip, never
+--              re-run, regardless of which account owns it
+-- Pure (no mutation). A logged-out active account (nil/"") sends every resumable
+-- record to `orphaned`. This wires the documented `is_resumable` contract into
+-- the partition path so the persistence layer is resume-safe end to end.
+function M.plan_resume(records, active_nsid)
+  active_nsid = active_nsid ~= nil and tostring(active_nsid) or ""
+  local runnable, orphaned, finished = {}, {}, {}
+  for _, rec in ipairs(records or {}) do
+    if type(rec) == "table" then
+      if M.is_terminal(rec.state) then
+        finished[#finished + 1] = rec
+      else
+        local owner = rec.nsid ~= nil and tostring(rec.nsid) or ""
+        if active_nsid ~= "" and owner == active_nsid then
+          runnable[#runnable + 1] = rec
+        else
+          orphaned[#orphaned + 1] = rec
+        end
+      end
+    end
+  end
+  return runnable, orphaned, finished
+end
+
 ----------------------------------------------------------------------
 -- Serialization (durable string for a preference blob).
 --
