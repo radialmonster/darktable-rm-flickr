@@ -684,7 +684,14 @@ local function parse_upload_response(body)
     local photo_id = body:match("<photoid>(.-)</photoid>")
     if photo_id and photo_id ~= "" then return xml_unescape(photo_id) end
     local ticket_id = body:match("<ticketid>(.-)</ticketid>")
-    if ticket_id and ticket_id ~= "" then return nil, "async upload returned ticket " .. xml_unescape(ticket_id) end
+    if ticket_id and ticket_id ~= "" then
+      -- Pixels reached Flickr but the photo id is not in this response; signal
+      -- the ticket as the third return so upload_photo can resolve it instead of
+      -- reporting a plain failure (which would invite a duplicate-creating
+      -- re-export). The second return is informational only.
+      ticket_id = xml_unescape(ticket_id)
+      return nil, "async upload returned ticket " .. ticket_id, ticket_id
+    end
     return nil, "Flickr upload succeeded but returned no photoid"
   end
 
@@ -697,6 +704,61 @@ local function parse_upload_response(body)
   return nil, body ~= "" and body or "empty Flickr upload response"
 end
 M.parse_upload_response = parse_upload_response
+
+-- Resolve an asynchronous upload ticket to a photo id.
+--
+-- A ticket means the pixels are already on Flickr (the photo will exist); only
+-- the id is not back yet. checkTickets is an idempotent unauthenticated read, so
+-- we poll it a few times. Outcomes:
+--   * complete with a photoid  -> return the photo id (normal success path)
+--   * complete == 2            -> Flickr failed to convert the file; no photo was
+--                                 created, so a plain failure (and re-export) is
+--                                 the correct, non-duplicating outcome
+--   * invalid ticket           -> report failure
+--   * still processing at the  -> return an error that explicitly says "do not
+--     end of the poll budget      re-export" (with the ticket id as 3rd return),
+--                                 because the photo is on Flickr and re-exporting
+--                                 would duplicate it
+--
+-- opts.sleep_fn(ms) is used between polls (e.g. dt.control.sleep); without it the
+-- loop simply re-checks without waiting. opts.ticket_attempts / ticket_poll_ms
+-- tune the poll budget (defaults: 6 attempts, 2000 ms apart).
+local function resolve_ticket(api_key, ticket_id, opts)
+  local rest = require "dtrmflickr.flickr_rest"
+  opts = opts or {}
+  ticket_id = tostring(ticket_id or "")
+  local attempts = tonumber(opts.ticket_attempts) or 6
+  local poll_ms = tonumber(opts.ticket_poll_ms) or 2000
+  local sleep_fn = opts.sleep_fn
+  local last_err
+  for i = 1, attempts do
+    local tickets, terr = rest.upload_check_tickets(api_key, ticket_id)
+    if tickets then
+      local t = tickets[ticket_id]
+      if t then
+        if t.invalid then
+          return nil, "Flickr rejected upload ticket " .. ticket_id .. " (invalid)"
+        end
+        if t.complete == 2 then
+          return nil, "Flickr could not process the uploaded photo (ticket " .. ticket_id .. ")"
+        end
+        if t.photo_id and t.photo_id ~= "" then
+          return t.photo_id
+        end
+        -- complete == 0 / nil: still converting, keep polling.
+      end
+    else
+      last_err = terr
+    end
+    if i < attempts and sleep_fn then sleep_fn(poll_ms) end
+  end
+  return nil,
+    "Flickr is still processing the uploaded photo (ticket " .. ticket_id
+      .. "); it should appear on your account shortly — do not re-export it"
+      .. (last_err and (" [" .. tostring(last_err) .. "]") or ""),
+    ticket_id
+end
+M.resolve_ticket = resolve_ticket
 
 -- upload_photo(...) -> photo_id | nil, err
 --
@@ -728,7 +790,11 @@ function M.upload_photo(api_key, api_secret, account, filename, opts)
   params.oauth_signature = oauth.signature("POST", M.UPLOAD_URL, params, api_secret, account.secret)
   local body, transport_err = M.http.post_multipart(M.UPLOAD_URL, params, "photo", filename)
   if not body then return nil, transport_err end
-  return parse_upload_response(body)
+
+  local photo_id, err, ticket_id = parse_upload_response(body)
+  if photo_id then return photo_id end
+  if ticket_id then return resolve_ticket(api_key, ticket_id, opts) end
+  return nil, err
 end
 
 return M
@@ -1173,6 +1239,45 @@ function M.photos_geo_set_location(api_key, api_secret, account, photo_id, lat, 
   })
   if not body then return nil, err end
   return true
+end
+
+-- Parse a flickr.photos.upload.checkTickets response into a map keyed by ticket
+-- id. Each entry: { id, complete = 0|1|2|nil, photo_id = "..."|nil, invalid }.
+-- Flickr's status attribute is historically named `complete` (0 = processing,
+-- 1 = done with a photoid, 2 = conversion failed); we also accept `status` for
+-- safety. A ticket Flickr did not recognise carries `invalid="1"`.
+function M.parse_upload_tickets(body)
+  local tickets = {}
+  for attrs in tostring(body or ""):gmatch("<ticket%s+([^>]*)>") do
+    local id = attrs:match('id="(.-)"') or attrs:match("id='(.-)'")
+    if id and id ~= "" then
+      local complete = attrs:match('complete="(.-)"') or attrs:match("complete='(.-)'")
+        or attrs:match('status="(.-)"') or attrs:match("status='(.-)'")
+      local photoid = attrs:match('photoid="(.-)"') or attrs:match("photoid='(.-)'")
+      local invalid = attrs:match('invalid="(.-)"') or attrs:match("invalid='(.-)'")
+      tickets[xml_unescape(id)] = {
+        id = xml_unescape(id),
+        complete = complete and tonumber(complete) or nil,
+        photo_id = (photoid and photoid ~= "") and xml_unescape(photoid) or nil,
+        invalid = invalid ~= nil and invalid ~= "" and invalid ~= "0",
+      }
+    end
+  end
+  return tickets
+end
+
+-- Check the status of one or more asynchronous upload tickets. Unauthenticated
+-- (uses the public API key), so it is an idempotent read safe to poll/retry.
+function M.upload_check_tickets(api_key, ticket_ids)
+  if type(ticket_ids) == "table" then ticket_ids = table.concat(ticket_ids, ",") end
+  ticket_ids = tostring(ticket_ids or "")
+  if ticket_ids == "" then return nil, "missing upload ticket id(s)" end
+
+  local body, err = M.public_call(api_key, "flickr.photos.upload.checkTickets", {
+    tickets = ticket_ids,
+  })
+  if not body then return nil, err end
+  return M.parse_upload_tickets(body), body
 end
 
 return M
@@ -5486,6 +5591,13 @@ local function store(storage, image, format, filename, number, total, high_quali
       content_type = (sync.content_type or forced.content_type) and content_type.flickr_value or nil,
       perm_comment = sync.permissions and permissions.perm_comment or nil,
       perm_addmeta = sync.permissions and permissions.perm_addmeta or nil,
+      -- If Flickr returns an async ticket instead of a photo id, resolve it
+      -- (idempotent checkTickets poll) rather than reporting a false failure
+      -- that would prompt a duplicate-creating re-export. Poll waits use
+      -- darktable's millisecond sleep.
+      sleep_fn = function(ms)
+        if dt.control and dt.control.sleep then dt.control.sleep(math.floor(tonumber(ms) or 0)) end
+      end,
     })
   end, { max_attempts = 1 })
   if photo_id then
