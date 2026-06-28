@@ -1385,6 +1385,24 @@ local metadata_reasons = {
   permissions = true,
 }
 
+function M.is_metadata_reason(reason)
+  return metadata_reasons[tostring(reason or "")] == true
+end
+
+function M.classify_reasons(reasons)
+  local has_image = false
+  local has_metadata = false
+  for _, reason in ipairs(reasons or {}) do
+    if reason == "image" then has_image = true
+    elseif M.is_metadata_reason(reason) then has_metadata = true
+    else has_metadata = true end
+  end
+  if has_image and has_metadata then return "both" end
+  if has_image then return "image" end
+  if has_metadata then return "metadata" end
+  return "none"
+end
+
 function M.clear_metadata_reasons(image, account_nsid)
   local removed = 0
   for reason in pairs(metadata_reasons) do
@@ -1455,8 +1473,11 @@ function M.evaluate_publish_state(image, account_nsid)
   end
 
   local changed_at = image and image.change_timestamp or nil
-  local image_change_baseline = image_published_at or published_at
-  if changed_at and image_change_baseline and stamp_is_newer(changed_at, image_change_baseline) then
+  local newest_handled_at = image_published_at
+  if metadata_published_at and (not newest_handled_at or stamp_is_newer(metadata_published_at, newest_handled_at)) then
+    newest_handled_at = metadata_published_at
+  end
+  if changed_at and newest_handled_at and stamp_is_newer(changed_at, newest_handled_at) then
     M.mark_needs_republish(image, account_nsid)
     return "needs-republish", published_at, photo_id, M.get_reasons(image, account_nsid)
   end
@@ -4052,6 +4073,14 @@ local function publish_state_label(status, published_at, reasons)
   if status == "current" then
     return string.format(_("publish state: current%s"), suffix)
   elseif status == "needs-republish" then
+    local kind = state.classify_reasons and state.classify_reasons(reasons) or "none"
+    if kind == "image" then
+      return string.format(_("publish state: needs reupload%s"), suffix)
+    elseif kind == "metadata" then
+      return string.format(_("publish state: needs metadata sync%s"), suffix)
+    elseif kind == "both" then
+      return string.format(_("publish state: needs reupload + metadata sync%s"), suffix)
+    end
     return string.format(_("publish state: needs sync%s"), suffix)
   elseif status == "unknown" then
     return _("publish state: linked, sync date unknown")
