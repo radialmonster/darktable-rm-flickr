@@ -921,6 +921,66 @@ local function ok(body)
   return body:find('stat%s*=%s*"ok"') or body:find("stat%s*=%s*'ok'")
 end
 
+-- Flickr's generic auth-failure REST codes. These are the REST-body equivalent of
+-- an HTTP 401 on a signed request:
+--   98  "Invalid auth token" — the OAuth token has expired or been revoked. This
+--       is the definitive "your saved login is no longer good" signal; the only
+--       fix is to log in again. Tagged "expired".
+--   99  "User not logged in / Insufficient permissions" — AMBIGUOUS. Flickr
+--       returns 99 both when the token is missing/invalid AND when a perfectly
+--       valid token simply lacks the scope a method needs (e.g. a write-only
+--       token calling flickr.photos.delete returns 99 — see CLAUDE.md's live
+--       test note). Because we cannot tell the two apart from the code alone,
+--       99 is tagged "permission" and must NOT, on its own, trigger a re-login
+--       prompt: doing so would falsely claim the login expired every time the
+--       user hits a permission-scoped method. Callers that want to act on token
+--       expiry should look only for kind == "expired".
+M.AUTH_ERROR_CODES = {
+  [98] = "expired",
+  [99] = "permission",
+}
+
+-- is_auth_error(err) -> code, kind | nil
+--
+-- Classify a failure string from a signed Flickr call as an authentication
+-- error. Recognises the structured REST/upload error prefix produced by
+-- parse_error / parse_upload_response ("Flickr REST failed (<code>): …",
+-- "Flickr upload failed (<code>): …") and a transport-level HTTP 401 surfaced as
+-- a string. `kind` is "expired" (re-login required: REST code 98 or HTTP 401) or
+-- "permission" (REST code 99, ambiguous — see AUTH_ERROR_CODES). Returns nil for
+-- any non-auth error, including other Flickr REST codes. Pure and side-effect
+-- free so it can be unit-tested offline and reused by the queue/UI layer.
+function M.is_auth_error(err)
+  local s = tostring(err or ""):lower()
+  if s == "" then return nil end
+  -- Structured Flickr error: "flickr rest failed (NN): ..." or
+  -- "flickr upload failed (NN): ...". Classify strictly by code so an echoed
+  -- token in the server message (a title/tag literally containing "(98)") can
+  -- never be mistaken for a status — same discipline as queue.default_retryable.
+  local code = tonumber(s:match("flickr %w+ failed %((%d+)%)"))
+  if code then
+    local kind = M.AUTH_ERROR_CODES[code]
+    if kind then return code, kind end
+    return nil
+  end
+  -- Transport-level 401 on a signed request (the OAuth endpoints can answer 401
+  -- rather than a REST <err> body). A 401 against a signed call means the token
+  -- is rejected outright, so treat it as expired/revoked. Matches both the
+  -- "http 401 ..." form our transports emit and a raw "HTTP/1.1 401" status line.
+  if s:find("http 401", 1, true) or s:find("(401)", 1, true)
+    or s:match("http/[%d.]+%s+401") then
+    return 401, "expired"
+  end
+  return nil
+end
+
+-- Convenience predicate: true only for the re-login case (token expired/revoked),
+-- i.e. kind == "expired". Permission errors (code 99) return false.
+function M.is_token_expired(err)
+  local _, kind = M.is_auth_error(err)
+  return kind == "expired"
+end
+
 function M.call(api_key, api_secret, account, method, args)
   if not account or not account.token or not account.secret then
     return nil, "not logged in to Flickr"
@@ -3955,6 +4015,17 @@ __dtrmflickr_queue = require("dtrmflickr.queue").new {
 
 function __dtrmflickr_call(method, fn, opts)
   local results = table.pack(__dtrmflickr_queue:call(method, fn, opts))
+  -- Detect an expired/revoked OAuth token (the 401-equivalent) on any signed
+  -- Flickr call and flip the session into a "needs re-login" state, instead of
+  -- letting the operation fail silently mid-batch with a generic error (issue
+  -- #1). Helper convention: a non-nil first return is success; a failure is
+  -- (nil, err), so the error message lives in slot 2 when slot 1 is nil. The
+  -- queue already refuses to retry these (codes 98/99/401 are not transient).
+  -- __dtrmflickr_note_auth_failure is a global assigned once the account UI is
+  -- built; guard for module-load ordering even though calls only run afterwards.
+  if results[1] == nil and results.n >= 2 and __dtrmflickr_note_auth_failure then
+    __dtrmflickr_note_auth_failure(results[2])
+  end
   if panel_sets and panel_sets.refresh_queue_status then panel_sets.refresh_queue_status() end
   return table.unpack(results, 1, results.n)
 end
@@ -4041,6 +4112,8 @@ local function save_token(acc)
     password = packed,
   })
   session_account = acc
+  -- A fresh access token clears any prior expired/revoked flag (issue #1).
+  __dtrmflickr_auth_revoked = false
   -- Account-binding contract (issue #36 / design-notes): switching accounts
   -- invalidates any non-terminal jobs owned by the previous account so a
   -- deferred/persisted job can never run against the new account's token.
@@ -4073,6 +4146,9 @@ local function clear_token()
     dt.password.save(PLUGIN, nsid, json_object { server = nsid, username = nsid, password = "" })
   end  -- no delete API; blank it
   session_account = nil
+  -- Clearing the token clears any stale "login revoked" flag: there is no longer
+  -- a saved login the warning could apply to.
+  __dtrmflickr_auth_revoked = false
   clear_album_cache()
   -- Logout invalidates every non-terminal job (no active token to run them).
   if __dtrmflickr_jobs then __dtrmflickr_jobs:cancel_for_account_change(nil) end
@@ -4182,8 +4258,16 @@ local function refresh_status()
   local acc = load_token()
   local logged_in = acc ~= nil
   local waiting_for_verifier = pending ~= nil and not logged_in
+  -- A saved token that Flickr has since rejected (expired/revoked, code 98 or a
+  -- 401 on a signed call). We keep the token so the account name still shows, but
+  -- surface the re-login prompt loudly instead of pretending we are still logged
+  -- in. Cleared on a fresh login (save_token) and on logout (clear_token).
+  local revoked = logged_in and __dtrmflickr_auth_revoked == true
 
-  status_label.label = logged_in
+  status_label.label = revoked
+      and string.format(_("status: login for %s expired or was revoked — log out and log in again"),
+        acc.username or acc.nsid)
+    or logged_in
     and (last_error
       and string.format(_("status: logged in as %s (not saved)"), acc.username or acc.nsid)
       or string.format(_("status: logged in as %s"), acc.username or acc.nsid))
@@ -4196,8 +4280,31 @@ local function refresh_status()
   verifier_label.visible = waiting_for_verifier
   verifier_entry.visible = waiting_for_verifier
   if complete_button then complete_button.visible = waiting_for_verifier end
-  if login_button then login_button.visible = not logged_in end
+  -- Offer the re-login button whenever there is no usable session: either no
+  -- token at all, or a saved-but-revoked one the user must replace.
+  if login_button then login_button.visible = (not logged_in) or revoked end
   if logout_button then logout_button.visible = logged_in end
+end
+
+-- Called from __dtrmflickr_call when a signed Flickr call fails. If the failure
+-- is an expired/revoked token (NOT an ambiguous permission error — see
+-- flickr_rest.AUTH_ERROR_CODES), mark the session as needing re-login, refresh
+-- the account status, and print a one-time prompt so the user notices even when
+-- the Lua-options pane is closed. Idempotent: re-flagging an already-revoked
+-- session does not re-spam the prompt. A successful login clears the flag.
+function __dtrmflickr_note_auth_failure(err)
+  if not rest.is_token_expired(err) then return end
+  -- Only meaningful while a token is actually saved; a call that fails with 98
+  -- after the user already logged out needs no prompt.
+  if not load_token() then return end
+  local already = __dtrmflickr_auth_revoked == true
+  __dtrmflickr_auth_revoked = true
+  refresh_status()
+  if not already then
+    dt.print(_("Flickr rejected your saved login — it has expired or been revoked. "
+      .. "Open Lua options > 'Flickr: account login' and log in again."))
+    dt.print_log("[dtrmflickr] auth token expired/revoked: " .. tostring(err))
+  end
 end
 
 login_button = dt.new_widget("button") {
