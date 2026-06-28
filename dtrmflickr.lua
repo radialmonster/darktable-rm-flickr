@@ -2566,6 +2566,10 @@ function M.new(opts)
     last_started = {},
     recent = {},
     sequence = 0,
+    -- Attempt count of the most recently *run* job (success or failure), so a
+    -- caller can read how many tries the call it just made took. Stale-cancelled
+    -- jobs never run their fn and report 0. See Queue:last_attempts.
+    last_run_attempts = 0,
     now_ms = opts.now_ms or monotonic_ms,
     sleep_ms = opts.sleep_ms,
     on_wait = opts.on_wait,
@@ -2715,6 +2719,7 @@ function Queue:run_job(job)
     -- (nil, err) on failure.
     if ok and packed[2] ~= nil then
       local out = table.pack(table.unpack(packed, 2, packed.n))
+      self.last_run_attempts = attempt
       self.stats.succeeded = self.stats.succeeded + 1
       self:record(job, "succeeded", { attempts = attempt, waited_ms = job.waited_ms })
       self:emit("succeeded", job, { attempt = attempt })
@@ -2737,6 +2742,7 @@ function Queue:run_job(job)
       self:wait(job, backoff_delay_ms(job, attempt, reason), reason or "retry", attempt)
       attempt = attempt + 1
     else
+      self.last_run_attempts = attempt
       self.stats.failed = self.stats.failed + 1
       self:record(job, "failed", { attempts = attempt, error = err, waited_ms = job.waited_ms })
       self:emit("failed", job, { attempt = attempt, error = err })
@@ -2760,6 +2766,8 @@ function Queue:finish_job(job)
     is_stale = ok and res and true or false
   end
   if is_stale then
+    -- A stale job never runs its fn, so the "attempts of the last call" is 0.
+    self.last_run_attempts = 0
     self.stats.stale = self.stats.stale + 1
     job.result = table.pack(nil, "stale Flickr queue job")
     self:record(job, "stale", { attempts = 0, error = job.result[2], waited_ms = job.waited_ms })
@@ -2829,6 +2837,15 @@ end
 
 function Queue:pending_count()
   return #self.pending
+end
+
+-- Attempt count of the most recently run job (the call that just returned).
+-- 1 for a first-try success/failure, N for a job the retry loop ran N times, 0
+-- when the last job was stale-cancelled (or none has run yet). Lets a caller
+-- attribute the retry cost of an individual call to whatever it was doing — the
+-- queue's cumulative `summary().retried` can't be split per call.
+function Queue:last_attempts()
+  return self.last_run_attempts or 0
 end
 
 function Queue:recent_results()
@@ -3724,6 +3741,7 @@ function M.result_rows(extra_data)
       filename = name_of(up),
       photo_id = up.photo_id,
       failed_actions = actions or {},
+      attempts = tonumber(up.attempts),
     }
   end
   for _, sk in ipairs(extra_data.skipped or {}) do
@@ -3734,6 +3752,7 @@ function M.result_rows(extra_data)
       kind = "failed",
       filename = name_of(fa),
       error = (fa and fa.error and tostring(fa.error)) or "unknown error",
+      attempts = tonumber(fa.attempts),
     }
   end
   return rows
@@ -3749,18 +3768,31 @@ local function row_status(row)
 end
 M.row_status = row_status
 
+-- A " (N attempts)" suffix for a row whose work retried (N > 1). Upload itself
+-- is single-attempt, so this only appears when an idempotent post-upload setter
+-- (or a failed-row's call) rode out a transient/rate-limit error. Empty string
+-- for a clean first-try row (or a skipped row, which never ran a call), so the
+-- detail column stays terse in the common case.
+local function attempts_suffix(row)
+  local n = tonumber(row.attempts)
+  if n and n > 1 then return string.format(" (%d attempts)", n) end
+  return ""
+end
+M.attempts_suffix = attempts_suffix
+
 -- The right-hand detail column for a result row.
 local function row_detail(row)
   if row.kind == "uploaded" then
     local photo = row.photo_id and ("photo " .. tostring(row.photo_id)) or "uploaded"
     if row.failed_actions and #row.failed_actions > 0 then
-      return string.format("%s (%s update failed)", photo, table.concat(row.failed_actions, ", "))
+      return string.format("%s (%s update failed)%s", photo,
+        table.concat(row.failed_actions, ", "), attempts_suffix(row))
     end
-    return photo
+    return photo .. attempts_suffix(row)
   elseif row.kind == "skipped" then
     return row.reason or "skipped"
   else
-    return row.error or "unknown error"
+    return (row.error or "unknown error") .. attempts_suffix(row)
   end
 end
 M.row_detail = row_detail
@@ -6519,6 +6551,11 @@ local function store(storage, image, format, filename, number, total, high_quali
       end,
     })
   end, { max_attempts = 1 })
+  -- Track the worst (max) attempt count across this image's upload and its
+  -- post-upload setters so the per-image result row can report how many tries
+  -- the image took. Upload is max_attempts=1 (always 1); a retry only shows up
+  -- when an idempotent post-upload setter rode out a transient/rate-limit error.
+  local image_attempts = __dtrmflickr_queue:last_attempts()
   if photo_id then
     state.set_photo_id(image, extra_data.account.nsid, photo_id)
     state.set_image_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
@@ -6529,6 +6566,7 @@ local function store(storage, image, format, filename, number, total, high_quali
         return rest.photos_licenses_set_license(extra_data.api_key, extra_data.api_secret,
           extra_data.account, photo_id, license.flickr_value)
       end)
+      image_attempts = math.max(image_attempts, __dtrmflickr_queue:last_attempts())
       if not license_ok then
         post_failed = true
         failed_metadata_fields.license = true
@@ -6545,6 +6583,7 @@ local function store(storage, image, format, filename, number, total, high_quali
         return rest.photos_set_dates(extra_data.api_key, extra_data.api_secret,
           extra_data.account, photo_id, date_taken, 0)
       end)
+      image_attempts = math.max(image_attempts, __dtrmflickr_queue:last_attempts())
       if not dates_ok then
         post_failed = true
         failed_metadata_fields.date_taken = true
@@ -6562,6 +6601,7 @@ local function store(storage, image, format, filename, number, total, high_quali
         return rest.photos_geo_set_location(extra_data.api_key, extra_data.api_secret,
           extra_data.account, photo_id, lat, lon, 16)
       end)
+      image_attempts = math.max(image_attempts, __dtrmflickr_queue:last_attempts())
       if not geo_ok then
         post_failed = true
         failed_metadata_fields.gps = true
@@ -6592,11 +6632,11 @@ local function store(storage, image, format, filename, number, total, high_quali
       state.set_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
       store_metadata_fingerprints(image, extra_data.account.nsid, upload_fingerprints)
     end
-    extra_data.uploaded[#extra_data.uploaded + 1] = { image = image, filename = filename, photo_id = photo_id }
+    extra_data.uploaded[#extra_data.uploaded + 1] = { image = image, filename = filename, photo_id = photo_id, attempts = image_attempts }
     dt.print(string.format(_("Flickr: uploaded %s as photo %s"), image.filename or "image", photo_id))
     dt.print_log(string.format("[dtrmflickr] store: uploaded '%s' -> photo_id=%s", filename, photo_id))
   else
-    extra_data.failed[#extra_data.failed + 1] = { image = image, filename = filename, error = err }
+    extra_data.failed[#extra_data.failed + 1] = { image = image, filename = filename, error = err, attempts = image_attempts }
     dt.print(string.format(_("Flickr: upload failed for %s: %s"), image.filename or "image", tostring(err)))
     dt.print_log(string.format("[dtrmflickr] store: upload failed for '%s': %s", filename, tostring(err)))
   end
