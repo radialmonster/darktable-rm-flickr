@@ -1159,6 +1159,14 @@ local function set_tag(account_nsid, set_id)
   return table.concat({ PREFIX, tostring(account_nsid), "set", tostring(set_id) }, "|")
 end
 
+local function published_tag(account_nsid, stamp)
+  return table.concat({ PREFIX, tostring(account_nsid), "published", tostring(stamp) }, "|")
+end
+
+local function needs_republish_tag(account_nsid)
+  return table.concat({ PREFIX, tostring(account_nsid), "needs-republish" }, "|")
+end
+
 local function valid_component(value)
   value = tostring(value or "")
   return value ~= "" and value:find("|", 1, true) == nil
@@ -1166,6 +1174,10 @@ end
 
 local function assert_component(kind, value)
   assert(valid_component(value), "invalid Flickr " .. kind)
+end
+
+local function is_reserved_account_component(value)
+  return value == "set" or value == "published" or value == "needs-republish"
 end
 
 local function ensure_tag(name)
@@ -1191,12 +1203,42 @@ function M.is_plugin_tag(name)
   return type(name) == "string" and (name == PREFIX or name:sub(1, #PREFIX + 1) == PREFIX .. "|")
 end
 
+function M.now_stamp()
+  return os.date("!%Y%m%dT%H%M%SZ")
+end
+
+local function normalize_stamp(value)
+  value = tostring(value or ""):match("^%s*(.-)%s*$")
+  if value == "" then return nil end
+  local y, mo, d, h, mi, s = value:match("^(%d%d%d%d)(%d%d)(%d%d)T(%d%d)(%d%d)(%d%d)Z$")
+  if y then return y .. mo .. d .. h .. mi .. s end
+  y, mo, d, h, mi, s = value:match("^(%d%d%d%d)[:%-](%d%d)[:%-](%d%d)%s+(%d%d):(%d%d):(%d%d)")
+  if y then return y .. mo .. d .. h .. mi .. s end
+  return nil
+end
+M.normalize_stamp = normalize_stamp
+
+local function stamp_is_newer(a, b)
+  local na = normalize_stamp(a)
+  local nb = normalize_stamp(b)
+  if not na or not nb then return false end
+  return na > nb
+end
+M.stamp_is_newer = stamp_is_newer
+
+local function compact_stamp(value)
+  local n = normalize_stamp(value)
+  if not n then return nil end
+  return n:sub(1, 8) .. "T" .. n:sub(9, 14) .. "Z"
+end
+M.compact_stamp = compact_stamp
+
 function M.get_photo_id(image, account_nsid)
   local prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|"
   for _, tag in ipairs(image_tags(image) or {}) do
     local name = tag_name(tag)
     local id = name and name:sub(1, #prefix) == prefix and name:sub(#prefix + 1) or nil
-    if id and id ~= "" and not id:find("|", 1, true) then return id end
+    if id and id ~= "" and not id:find("|", 1, true) and not is_reserved_account_component(id) then return id end
   end
   return nil
 end
@@ -1208,10 +1250,86 @@ function M.get_any_photo_id(image)
     if name and name:sub(1, #prefix) == prefix then
       local rest = name:sub(#prefix + 1)
       local account_nsid, photo_id = rest:match("^([^|]+)|([^|]+)$")
-      if account_nsid and photo_id then return account_nsid, photo_id end
+      if account_nsid and photo_id and not is_reserved_account_component(photo_id) then return account_nsid, photo_id end
     end
   end
   return nil, nil
+end
+
+function M.get_published_at(image, account_nsid)
+  local prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|published|"
+  local latest
+  for _, tag in ipairs(image_tags(image) or {}) do
+    local name = tag_name(tag)
+    local stamp = name and name:sub(1, #prefix) == prefix and name:sub(#prefix + 1) or nil
+    if stamp and normalize_stamp(stamp) and (not latest or stamp_is_newer(stamp, latest)) then latest = stamp end
+  end
+  return latest
+end
+
+function M.clear_published_at(image, account_nsid)
+  assert_component("account id", account_nsid)
+  local prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|published|"
+  local removed = 0
+  for _, tag in ipairs(image_tags(image) or {}) do
+    local name = tag_name(tag)
+    if name and name:sub(1, #prefix) == prefix then
+      detach(image, tag)
+      removed = removed + 1
+    end
+  end
+  return removed
+end
+
+function M.set_published_at(image, account_nsid, stamp)
+  assert_component("account id", account_nsid)
+  stamp = stamp or M.now_stamp()
+  stamp = compact_stamp(stamp)
+  assert(stamp, "invalid Flickr published stamp")
+  M.clear_published_at(image, account_nsid)
+  attach(image, ensure_tag(published_tag(account_nsid, stamp)))
+  M.clear_needs_republish(image, account_nsid)
+  return stamp
+end
+
+function M.mark_needs_republish(image, account_nsid)
+  assert_component("account id", account_nsid)
+  attach(image, ensure_tag(needs_republish_tag(account_nsid)))
+end
+
+function M.clear_needs_republish(image, account_nsid)
+  assert_component("account id", account_nsid)
+  local tag = dt.tags.find(needs_republish_tag(account_nsid))
+  if not tag then return false end
+  detach(image, tag)
+  return true
+end
+
+function M.needs_republish(image, account_nsid)
+  local name = needs_republish_tag(account_nsid)
+  for _, tag in ipairs(image_tags(image) or {}) do
+    if tag_name(tag) == name then return true end
+  end
+  return false
+end
+
+function M.evaluate_publish_state(image, account_nsid)
+  local photo_id = M.get_photo_id(image, account_nsid)
+  if not photo_id then return "unpublished", nil, nil end
+
+  local published_at = M.get_published_at(image, account_nsid)
+  if not published_at then
+    return M.needs_republish(image, account_nsid) and "needs-republish" or "unknown", published_at, photo_id
+  end
+
+  local changed_at = image and image.change_timestamp or nil
+  if changed_at and stamp_is_newer(changed_at, published_at) then
+    M.mark_needs_republish(image, account_nsid)
+    return "needs-republish", published_at, photo_id
+  end
+
+  M.clear_needs_republish(image, account_nsid)
+  return "current", published_at, photo_id
 end
 
 function M.set_photo_id(image, account_nsid, photo_id)
@@ -1231,6 +1349,8 @@ function M.clear_photo_id(image, account_nsid)
   if not old_id then return false end
   local old_tag = dt.tags.find(photo_tag(account_nsid, old_id))
   if old_tag then detach(image, old_tag) end
+  M.clear_published_at(image, account_nsid)
+  M.clear_needs_republish(image, account_nsid)
   return true
 end
 
@@ -1271,6 +1391,8 @@ end
 
 function M.clear_account(image, account_nsid)
   local removed = M.clear_sets(image, account_nsid)
+  removed = removed + M.clear_published_at(image, account_nsid)
+  if M.clear_needs_republish(image, account_nsid) then removed = removed + 1 end
   if M.clear_photo_id(image, account_nsid) then removed = removed + 1 end
   return removed
 end
@@ -2710,6 +2832,7 @@ local panel_photo_label = dt.new_widget("label") { label = "" }
 local panel_sets_label = dt.new_widget("label") { label = "" }
 local panel_sets = { filtering = false, current_ids = {} }
 panel_sets.status_label = dt.new_widget("label") { label = "" }
+panel_sets.publish_label = dt.new_widget("label") { label = "" }
 local panel_remote_label = dt.new_widget("label") { label = "" }
 local panel_tags_label = dt.new_widget("label") { label = "" }
 panel_sets.current_widget = dt.new_widget("combobox") {
@@ -3489,6 +3612,8 @@ local function save_panel_settings()
     panel_remote_label.label = _("Flickr: settings skipped by Lua sync options")
     dt.print(_("Flickr: settings skipped by Lua sync options: ") .. table.concat(skipped, ", "))
   else
+    state.set_published_at(panel_current.image, acc.nsid)
+    panel_sets.refresh_publish_state_label(panel_current.image, acc, photo_id)
     panel_remote_label.label = _("Flickr: settings saved")
     dt.print(_("Flickr: settings saved."))
     load_remote_settings(api_key, api_secret, acc, photo_id)
@@ -3529,6 +3654,8 @@ local function sync_panel_meta()
 
   local ok, err = rest.photos_set_meta(api_key, api_secret, acc, photo_id, title, description)
   if ok then
+    state.set_published_at(image, acc.nsid)
+    panel_sets.refresh_publish_state_label(image, acc, photo_id)
     panel_remote_label.label = _("Flickr: title/description synced")
     dt.print(_("Flickr: title/description synced."))
     load_remote_settings(api_key, api_secret, acc, photo_id)
@@ -3573,6 +3700,8 @@ local function sync_panel_tags()
 
   local ok, err = rest.photos_set_tags(api_key, api_secret, acc, photo_id, tags)
   if ok then
+    state.set_published_at(image, acc.nsid)
+    panel_sets.refresh_publish_state_label(image, acc, photo_id)
     panel_remote_label.label = _("Flickr: keywords synced")
     dt.print(_("Flickr: keywords synced."))
     load_remote_settings(api_key, api_secret, acc, photo_id)
@@ -3580,6 +3709,92 @@ local function sync_panel_tags()
     panel_remote_label.label = _("Flickr: keyword sync failed")
     dt.print(_("Flickr: keyword sync failed: ") .. tostring(err))
   end
+end
+
+local function publish_state_label(status, published_at)
+  if status == "current" then
+    return string.format(_("publish state: current%s"), published_at and (" (" .. published_at .. ")") or "")
+  elseif status == "needs-republish" then
+    return string.format(_("publish state: needs sync%s"), published_at and (" (" .. published_at .. ")") or "")
+  elseif status == "unknown" then
+    return _("publish state: linked, sync date unknown")
+  elseif status == "unpublished" then
+    return _("publish state: unpublished")
+  end
+  return _("publish state: unknown")
+end
+
+function panel_sets.refresh_publish_state_label(image, acc, photo_id)
+  if not image or not photo_id then
+    panel_sets.publish_label.label = publish_state_label("unpublished")
+    return "unpublished"
+  end
+  if not acc then
+    panel_sets.publish_label.label = _("publish state: log in to evaluate")
+    return "unknown"
+  end
+  local status, published_at = state.evaluate_publish_state(image, acc.nsid)
+  panel_sets.publish_label.label = publish_state_label(status, published_at)
+  return status, published_at
+end
+
+function panel_sets.mark_needs_republish()
+  local acc, photo_id, image = panel_current.account, panel_current.photo_id, panel_current.image
+  if (panel_current.selection_count or 0) ~= 1 then
+    dt.print(_("Flickr: select exactly one image before marking sync state."))
+    return
+  end
+  if not image or not photo_id then
+    dt.print(_("Flickr: select a published image first."))
+    return
+  end
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before marking sync state."))
+    return
+  end
+  state.mark_needs_republish(image, acc.nsid)
+  panel_sets.publish_label.label = publish_state_label("needs-republish", state.get_published_at(image, acc.nsid))
+  dt.print(_("Flickr: marked selected photo as needing sync."))
+end
+
+function panel_sets.clear_needs_republish()
+  local acc, photo_id, image = panel_current.account, panel_current.photo_id, panel_current.image
+  if (panel_current.selection_count or 0) ~= 1 then
+    dt.print(_("Flickr: select exactly one image before clearing sync state."))
+    return
+  end
+  if not image or not photo_id then
+    dt.print(_("Flickr: select a published image first."))
+    return
+  end
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before clearing sync state."))
+    return
+  end
+  state.set_published_at(image, acc.nsid, image.change_timestamp or nil)
+  panel_sets.refresh_publish_state_label(image, acc, photo_id)
+  dt.print(_("Flickr: cleared selected photo's needs-sync marker."))
+end
+
+function panel_sets.scan_selected_publish_state()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection == 0 then
+    dt.print(_("Flickr: select one or more images before scanning sync state."))
+    return
+  end
+  local acc = load_token()
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before scanning sync state."))
+    return
+  end
+  local counts = { ["needs-republish"] = 0, current = 0, unknown = 0, unpublished = 0 }
+  for _, image in ipairs(selection) do
+    local status = state.evaluate_publish_state(image, acc.nsid)
+    counts[status] = (counts[status] or 0) + 1
+  end
+  refresh_panel(true, false)
+  dt.print(string.format(_("Flickr: scanned %d selected photo(s): %d need sync, %d current, %d unknown, %d unpublished"),
+    #selection, counts["needs-republish"] or 0, counts.current or 0, counts.unknown or 0, counts.unpublished or 0))
 end
 
 local function claim_existing_selection()
@@ -3630,6 +3845,7 @@ function refresh_panel(force, fetch_remote)
     panel_file_label.label = ""
     panel_account_label.label = ""
     panel_photo_label.label = ""
+    panel_sets.publish_label.label = ""
     panel_sets_label.label = ""
     panel_sets.status_label.label = ""
     panel_sets.clear_current_choices()
@@ -3652,6 +3868,7 @@ function refresh_panel(force, fetch_remote)
     panel_photo_label.label = tagged_photo_id
       and string.format(_("photo: %s"), tagged_photo_id)
       or _("photo: not published")
+    panel_sets.refresh_publish_state_label(image, nil, tagged_photo_id)
     panel_sets_label.label = ""
     panel_sets.clear_current_choices()
     if not tagged_photo_id then
@@ -3679,6 +3896,7 @@ function refresh_panel(force, fetch_remote)
   panel_photo_label.label = photo_id
     and string.format(_("photo: %s"), photo_id)
     or _("photo: not published")
+  panel_sets.refresh_publish_state_label(image, acc, photo_id)
   panel_sets_label.label = panel_sets.format_memberships(sets)
   panel_sets.update_current_choices(image, acc.nsid)
   if not photo_id then
@@ -3713,6 +3931,7 @@ local panel_widget = dt.new_widget("box") {
   panel_file_label,
   panel_account_label,
   panel_photo_label,
+  panel_sets.publish_label,
   panel_sets_label,
   dt.new_widget("label") { label = _("albums") },
   dt.new_widget("box") {
@@ -3788,6 +4007,21 @@ local panel_widget = dt.new_widget("box") {
   dt.new_widget("button") {
     label = _("sync keywords"),
     clicked_callback = function() sync_panel_tags() end,
+  },
+  dt.new_widget("box") {
+    orientation = "horizontal",
+    dt.new_widget("button") {
+      label = _("mark needs sync"),
+      clicked_callback = function() panel_sets.mark_needs_republish() end,
+    },
+    dt.new_widget("button") {
+      label = _("clear needs sync"),
+      clicked_callback = function() panel_sets.clear_needs_republish() end,
+    },
+  },
+  dt.new_widget("button") {
+    label = _("scan selected"),
+    clicked_callback = function() panel_sets.scan_selected_publish_state() end,
   },
   dt.new_widget("button") {
     label = _("refresh"),
@@ -3909,6 +4143,7 @@ local function initialize(storage, format, images, high_quality, extra_data)
   extra_data.post_errors = {}
   extra_data.keyword_conflicts = {}
   extra_data.keyword_conflict_seen = {}
+  extra_data.publish_stamp = state.now_stamp()
   local album_mode = album_mode_widget.selected or 1
   local wants_album = (album_mode == 2 and album_input_value() ~= "")
     or (album_mode == 3 and trim(album_new_entry.text or "") ~= "")
@@ -4195,10 +4430,12 @@ local function store(storage, image, format, filename, number, total, high_quali
   })
   if photo_id then
     state.set_photo_id(image, extra_data.account.nsid, photo_id)
+    local post_failed = false
     if sync.license or forced.license then
       local license_ok, license_err = rest.photos_licenses_set_license(extra_data.api_key, extra_data.api_secret,
         extra_data.account, photo_id, license.flickr_value)
       if not license_ok then
+        post_failed = true
         record_post_error(extra_data, image, photo_id, "license", license_err)
       end
     end
@@ -4207,7 +4444,10 @@ local function store(storage, image, format, filename, number, total, high_quali
     if date_taken then
       local dates_ok, dates_err = rest.photos_set_dates(extra_data.api_key, extra_data.api_secret,
         extra_data.account, photo_id, date_taken, 0)
-      if not dates_ok then record_post_error(extra_data, image, photo_id, "date", dates_err) end
+      if not dates_ok then
+        post_failed = true
+        record_post_error(extra_data, image, photo_id, "date", dates_err)
+      end
     end
 
     local lat, lon = nil, nil
@@ -4215,7 +4455,15 @@ local function store(storage, image, format, filename, number, total, high_quali
     if lat and lon then
       local geo_ok, geo_err = rest.photos_geo_set_location(extra_data.api_key, extra_data.api_secret,
         extra_data.account, photo_id, lat, lon, 16)
-      if not geo_ok then record_post_error(extra_data, image, photo_id, "location", geo_err) end
+      if not geo_ok then
+        post_failed = true
+        record_post_error(extra_data, image, photo_id, "location", geo_err)
+      end
+    end
+    if post_failed then
+      state.mark_needs_republish(image, extra_data.account.nsid)
+    else
+      state.set_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
     end
     extra_data.uploaded[#extra_data.uploaded + 1] = { image = image, filename = filename, photo_id = photo_id }
     dt.print(string.format(_("Flickr: uploaded %s as photo %s"), image.filename or "image", photo_id))
