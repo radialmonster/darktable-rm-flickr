@@ -3195,6 +3195,89 @@ end
 return M
 end
 
+package.preload["dtrmflickr.report"] = function(...)
+-- report.lua — pure formatters for end-of-batch result reporting.
+--
+-- The storage `finalize` callback prints an aggregate count line (uploaded /
+-- skipped / failed / post-upload errors / album errors). On a large batch the
+-- per-image `dt.print` messages emitted during `store` scroll out of view long
+-- before `finalize` runs, so a count alone ("3 failed") leaves the user with no
+-- idea *which* images failed or were skipped. These helpers turn the result
+-- buckets that `store` accumulates in `extra_data` into concise, named detail
+-- lines without bloating the main module or touching darktable widgets, so they
+-- are unit-tested offline (see tests/test_report.lua).
+
+local M = {}
+
+-- How many filenames to list before collapsing the rest into "(+N more)".
+local DEFAULT_MAX_NAMES = 8
+
+-- A result entry can carry an explicit `filename` (store records one on every
+-- failed/skipped row) and/or an `image` with a `.filename` (post-upload error
+-- rows carry the image, not a separate filename). Prefer the explicit filename,
+-- fall back to the image's, and never error on a malformed/absent entry.
+local function name_of(entry)
+  if type(entry) ~= "table" then return "?" end
+  if entry.filename and entry.filename ~= "" then return entry.filename end
+  local image = entry.image
+  if type(image) == "table" and image.filename and image.filename ~= "" then
+    return image.filename
+  end
+  return "?"
+end
+M.name_of = name_of
+
+-- Join up to `max` names from a list of result entries into a comma-separated
+-- string, appending " (+N more)" when the list is longer than `max`. Returns
+-- "" for an empty/absent list so the caller can skip the line entirely.
+local function join_names(entries, max)
+  entries = entries or {}
+  max = tonumber(max) or DEFAULT_MAX_NAMES
+  if max < 1 then max = 1 end
+  local n = #entries
+  if n == 0 then return "" end
+  local shown = math.min(n, max)
+  local names = {}
+  for i = 1, shown do names[i] = name_of(entries[i]) end
+  local joined = table.concat(names, ", ")
+  if n > shown then
+    joined = joined .. string.format(" (+%d more)", n - shown)
+  end
+  return joined
+end
+M.join_names = join_names
+
+-- Build concise per-image detail lines for the finalize summary so a large
+-- batch is not reported as a silent count. Returns a (possibly empty) list of
+-- strings the caller prints after the aggregate line.
+--
+-- `opts.translate` is an optional gettext-style wrapper (defaults to identity)
+-- so the caller can localize while the formatting stays pure and testable;
+-- `opts.max_names` overrides the per-line name cap.
+function M.finalize_detail_lines(extra_data, opts)
+  opts = opts or {}
+  local tr = opts.translate
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  local max = opts.max_names or DEFAULT_MAX_NAMES
+  local lines = {}
+  local failed = (extra_data and extra_data.failed) or {}
+  if #failed > 0 then
+    lines[#lines + 1] = string.format(tr("Flickr: failed: %s"), join_names(failed, max))
+  end
+  local skipped = (extra_data and extra_data.skipped) or {}
+  if #skipped > 0 then
+    lines[#lines + 1] = string.format(tr("Flickr: skipped: %s"), join_names(skipped, max))
+  end
+  local post_errors = (extra_data and extra_data.post_errors) or {}
+  if #post_errors > 0 then
+    lines[#lines + 1] = string.format(tr("Flickr: post-upload metadata errors: %s"), join_names(post_errors, max))
+  end
+  return lines
+end
+
+return M
+end
+
 package.preload["dtrmflickr.dtrmflickr"] = function(...)
 --[[ dtrmflickr — Flickr export/storage for darktable
 
@@ -3237,6 +3320,7 @@ local metadata = require "dtrmflickr.metadata"
 local claim = require "dtrmflickr.claim"
 local settings = require "dtrmflickr.settings"
 local rules = require "dtrmflickr.rules"
+local report = require "dtrmflickr.report"
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -6046,6 +6130,12 @@ local function finalize(storage, image_table, extra_data)
 
   dt.print(string.format(_("Flickr: finished — %d uploaded, %d skipped, %d failed, %d post-upload error(s), %d album error(s), %d total"),
     uploaded, skipped, failed, post_errors, album_errors, total))
+  -- Name *which* images failed/were skipped, not just how many. The per-image
+  -- dt.print messages emitted during store scroll out of view on a large batch,
+  -- so without this the count line is the only end-state the user sees.
+  for _, line in ipairs(report.finalize_detail_lines(extra_data, { translate = _ })) do
+    dt.print(line)
+  end
   if keyword_conflicts > 0 then
     dt.print(string.format(_("Flickr: %d keyword rule conflict(s); see messages above"), keyword_conflicts))
   end
