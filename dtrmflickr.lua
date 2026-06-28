@@ -2121,8 +2121,20 @@ package.preload["dtrmflickr.queue"] = function(...)
 
 local M = {}
 
+-- NOTE: os.clock() is wall-clock on Windows (the shipping target) but CPU time
+-- on POSIX, so on non-Windows hosts method pacing over-waits (it never sees the
+-- real time elapsed during a network/sleep). Hosts that need accurate pacing
+-- elsewhere can inject a wall-clock `now_ms` via M.new{ now_ms = ... }.
 local function monotonic_ms()
   return math.floor((os.clock() or 0) * 1000)
+end
+
+-- Unpack a packed result table preserving exact arity, including nil holes and
+-- a trailing nil. Plain table.unpack relies on the ambiguous `#` border and can
+-- drop values after an interior nil (e.g. memberships, nil, sets).
+local function unpack_result(result)
+  if not result then return end
+  return table.unpack(result, 1, result.n or #result)
 end
 
 local function sleep_ms(sleep_fn, ms)
@@ -2305,19 +2317,26 @@ function Queue:run_job(job)
     self.last_started[job.method] = self.now_ms()
     self.stats.started = self.stats.started + 1
 
-    local result = { pcall(job.fn, attempt) }
-    local ok = result[1]
-    if ok then
-      table.remove(result, 1)
-      if result[1] ~= nil then
-        self.stats.succeeded = self.stats.succeeded + 1
-        self:record(job, "succeeded", { attempts = attempt, waited_ms = job.waited_ms })
-        self:emit("succeeded", job, { attempt = attempt })
-        return result
-      end
+    -- table.pack keeps the exact return arity (including interior/trailing nils),
+    -- so multi-value successes like (memberships, nil, sets) survive unpack.
+    local packed = table.pack(pcall(job.fn, attempt))
+    local ok = packed[1]
+    -- Success convention: the job ran AND its first return value is non-nil.
+    -- Flickr helpers return a truthy value (id/body/true) on success and
+    -- (nil, err) on failure.
+    if ok and packed[2] ~= nil then
+      local out = table.pack(table.unpack(packed, 2, packed.n))
+      self.stats.succeeded = self.stats.succeeded + 1
+      self:record(job, "succeeded", { attempts = attempt, waited_ms = job.waited_ms })
+      self:emit("succeeded", job, { attempt = attempt })
+      return out
     end
 
-    local err = ok and result[2] or result[2]
+    -- Failure: if pcall caught a raised error it is in slot 2; if the job ran
+    -- and returned (nil, err) the message is in slot 3 (slot 2 holds the nil
+    -- first return). Guarantee a non-nil message so it survives unpack.
+    local err = ok and packed[3] or packed[2]
+    if err == nil then err = "Flickr queue job returned no result" end
     local retry, reason = false, nil
     if attempt < job.max_attempts and job.retryable then
       retry, reason = job.retryable(err, job.method, attempt)
@@ -2332,7 +2351,7 @@ function Queue:run_job(job)
       self.stats.failed = self.stats.failed + 1
       self:record(job, "failed", { attempts = attempt, error = err, waited_ms = job.waited_ms })
       self:emit("failed", job, { attempt = attempt, error = err })
-      return { nil, err }
+      return table.pack(nil, err)
     end
   end
 end
@@ -2340,7 +2359,7 @@ end
 function Queue:finish_job(job)
   if job.stale and job.stale() then
     self.stats.stale = self.stats.stale + 1
-    job.result = { nil, "stale Flickr queue job" }
+    job.result = table.pack(nil, "stale Flickr queue job")
     self:record(job, "stale", { attempts = 0, error = job.result[2], waited_ms = job.waited_ms })
     self:emit("stale", job, { error = job.result[2] })
   else
@@ -2348,9 +2367,9 @@ function Queue:finish_job(job)
   end
   for _, replaced in ipairs(job.replaced_jobs or {}) do
     replaced.result = job.result
-    if replaced.done then replaced.done(table.unpack(replaced.result or {})) end
+    if replaced.done then replaced.done(unpack_result(replaced.result)) end
   end
-  if job.done then job.done(table.unpack(job.result or {})) end
+  if job.done then job.done(unpack_result(job.result)) end
   return job.result
 end
 
@@ -2368,16 +2387,20 @@ function Queue:call(method, fn, opts)
   local job = self:enqueue(method, fn, opts)
   if opts and opts.done then job.done = opts.done end
   if self.running then
+    -- Reentrant call from inside a running job: run it now (synchronously,
+    -- jumping the queue) and return its real result instead of leaving it
+    -- pending. The job is the just-enqueued/surviving pending entry, so pull it
+    -- out of pending if present and finish it directly.
     for i, pending in ipairs(self.pending) do
       if pending == job then
         table.remove(self.pending, i)
-        local result = self:finish_job(job)
-        return table.unpack(result)
+        break
       end
     end
+    return unpack_result(self:finish_job(job))
   end
   self:drain()
-  if job.result then return table.unpack(job.result) end
+  if job.result then return unpack_result(job.result) end
   return nil, "queued Flickr job has not run yet"
 end
 
@@ -4439,18 +4462,18 @@ local function load_remote_content_type(api_key, api_secret, acc, photo_id, date
     args.max_upload_date = dateuploaded
   end
 
-  local body
+  local body, err
   if acc then
-    body = __dtrmflickr_call("flickr.photos.search", function()
+    body, err = __dtrmflickr_call("flickr.photos.search", function()
       return rest.call(api_key, api_secret, acc, "flickr.photos.search", args)
-    end)
+    end, { coalesce_key = "panel-refresh-content" })
   else
-    body = __dtrmflickr_call("flickr.photos.search", function()
+    body, err = __dtrmflickr_call("flickr.photos.search", function()
       return rest.public_call(api_key, "flickr.photos.search", args)
-    end)
+    end, { coalesce_key = "panel-refresh-content" })
   end
   local search_value = parse_search_content_type(body, photo_id)
-  return panel_content_type_index_from_search_value(search_value), search_value
+  return panel_content_type_index_from_search_value(search_value), search_value, err
 end
 
 local function load_remote_settings(api_key, api_secret, acc, photo_id)
