@@ -1122,6 +1122,38 @@ function M.photosets_remove_photo(api_key, api_secret, account, photoset_id, pho
   return true
 end
 
+-- Set the album cover (primary photo) of a photoset. The photo must already be a
+-- member of the set (Flickr error 2 "Photo not found" otherwise). Returns true on
+-- success, or (nil, err) on failure (issue #31).
+function M.photosets_set_primary_photo(api_key, api_secret, account, photoset_id, photo_id)
+  if not photoset_id or photoset_id == "" then return nil, "missing photoset id" end
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+
+  local body, err = M.call(api_key, api_secret, account, "flickr.photosets.setPrimaryPhoto", {
+    photoset_id = photoset_id,
+    photo_id = photo_id,
+  })
+  if not body then return nil, err end
+  return true
+end
+
+-- Reorder a photoset. `photo_ids` is the ordered, comma-delimited list of photo
+-- ids; photos not named keep their original relative order (so passing a single
+-- id moves just that photo to the front). Accepts a list (joined here) or a
+-- pre-built string. Returns true on success, or (nil, err) (issue #31).
+function M.photosets_reorder_photos(api_key, api_secret, account, photoset_id, photo_ids)
+  if not photoset_id or photoset_id == "" then return nil, "missing photoset id" end
+  if type(photo_ids) == "table" then photo_ids = table.concat(photo_ids, ",") end
+  if not photo_ids or photo_ids == "" then return nil, "missing photo ids" end
+
+  local body, err = M.call(api_key, api_secret, account, "flickr.photosets.reorderPhotos", {
+    photoset_id = photoset_id,
+    photo_ids = photo_ids,
+  })
+  if not body then return nil, err end
+  return true
+end
+
 -- Extract the top-level attributes of an XML open tag's attribute string into a
 -- name -> value map, respecting quoting. Naive per-attribute substring matching
 -- (`attrs:match('photos="(.-)"')`) is unsafe here: `photos` is a *substring* of
@@ -5612,6 +5644,24 @@ function M.plan_selection_create(entries)
   return plan
 end
 
+-- Build the ordered, comma-delimited photo-id list for
+-- flickr.photosets.reorderPhotos (issue #31). `ids` is a list of photo ids in the
+-- desired order; entries are stringified, trimmed, empties dropped, and duplicates
+-- collapsed (first occurrence wins). Returns the comma-joined string ("" when no
+-- usable id remains). Flickr keeps any photos NOT named here in their original
+-- relative order, so a single-id result moves just that photo to the front.
+function M.reorder_csv(ids)
+  local out, seen = {}, {}
+  for _, id in ipairs(ids or {}) do
+    local s = trim(id)
+    if s ~= "" and not seen[s] then
+      seen[s] = true
+      out[#out + 1] = s
+    end
+  end
+  return table.concat(out, ",")
+end
+
 -- Resolve a comma-separated list of NEW-album titles into targets. Each title
 -- is checked against the cache via `exact_resolver(title)` (find_album_exact):
 -- if a set with that exact title/id already exists we reuse it (kind="existing",
@@ -7019,8 +7069,8 @@ panel_reconcile.remove_widget = dt.new_widget("combobox") {
   selected = 0,
 }
 panel_sets.current_widget = dt.new_widget("combobox") {
-  label = _("remove from album"),
-  tooltip = _("recorded Flickr albums for this photo; choose one to remove"),
+  label = _("album for cover/order/remove"),
+  tooltip = _("recorded Flickr albums for this photo; choose one, then set it as cover, move this photo to its front, or remove this photo from it"),
   selected = 0,
 }
 panel_sets.entry = dt.new_widget("entry") {
@@ -7214,7 +7264,7 @@ end
 function panel_sets.clear_current_choices()
   panel_sets.current_ids = {}
   clear_widget_items(panel_sets.current_widget)  -- not a cached for-loop; see clear_widget_items
-  panel_sets.current_widget[1] = _("Select an album to remove")
+  panel_sets.current_widget[1] = _("Select one of this photo's albums")
   panel_sets.current_widget.selected = 1
 end
 
@@ -7882,6 +7932,59 @@ function panel_sets.remove_selected()
   else
     panel_sets.status_label.label = string.format(_("removed from album %s"), tostring(set_id))
     dt.print(panel_sets.status_label.label)
+  end
+end
+
+-- Set the selected published photo as the cover (primary photo) of the album
+-- chosen in the "album for cover/order/remove" combobox (issue #31). The photo
+-- must already be a member of that album; the combobox only lists the photo's
+-- recorded albums, so a chosen album is normally a valid target.
+function panel_sets.set_cover()
+  local image, acc, photo_id, api_key, api_secret = panel_sets.api_context(_("setting an album cover"))
+  if not image then return end
+  local set_id = panel_sets.selected_current_id()
+  if not set_id or set_id == "" then
+    panel_sets.status_label.label = _("choose one of this photo's albums first")
+    dt.print(_("Flickr: choose one of this photo's albums to set as cover."))
+    return
+  end
+
+  local ok, err = __dtrmflickr_call("flickr.photosets.setPrimaryPhoto", function()
+    return rest.photosets_set_primary_photo(api_key, api_secret, acc, set_id, photo_id)
+  end)
+  if ok then
+    panel_sets.status_label.label = string.format(_("set as cover of album %s"), tostring(set_id))
+    dt.print(panel_sets.status_label.label)
+  else
+    panel_sets.status_label.label = _("set cover failed")
+    dt.print(string.format(_("Flickr: set album cover failed: %s"), tostring(err)))
+  end
+end
+
+-- Move the selected published photo to the front of the album chosen in the
+-- "album for cover/order/remove" combobox (issue #31). Uses reorderPhotos with a
+-- single-id ordered list: Flickr keeps the album's other photos in their existing
+-- relative order, so this only promotes the chosen photo to first.
+function panel_sets.move_to_front()
+  local image, acc, photo_id, api_key, api_secret = panel_sets.api_context(_("reordering an album"))
+  if not image then return end
+  local set_id = panel_sets.selected_current_id()
+  if not set_id or set_id == "" then
+    panel_sets.status_label.label = _("choose one of this photo's albums first")
+    dt.print(_("Flickr: choose one of this photo's albums to reorder."))
+    return
+  end
+
+  local photo_ids = albums.reorder_csv({ photo_id })
+  local ok, err = __dtrmflickr_call("flickr.photosets.reorderPhotos", function()
+    return rest.photosets_reorder_photos(api_key, api_secret, acc, set_id, photo_ids)
+  end)
+  if ok then
+    panel_sets.status_label.label = string.format(_("moved to front of album %s"), tostring(set_id))
+    dt.print(panel_sets.status_label.label)
+  else
+    panel_sets.status_label.label = _("reorder failed")
+    dt.print(string.format(_("Flickr: album reorder failed: %s"), tostring(err)))
   end
 end
 
@@ -9490,6 +9593,16 @@ local panel_widget = dt.new_widget("box") {
   panel_sets.current_widget,
   dt.new_widget("box") {
     orientation = "horizontal",
+    dt.new_widget("button") {
+      label = _("set as cover"),
+      tooltip = _("set this photo as the cover (primary photo) of the chosen album"),
+      clicked_callback = function() panel_sets.set_cover() end,
+    },
+    dt.new_widget("button") {
+      label = _("move to front"),
+      tooltip = _("move this photo to the front of the chosen album; the album's other photos keep their order"),
+      clicked_callback = function() panel_sets.move_to_front() end,
+    },
     dt.new_widget("button") {
       label = _("remove selected album"),
       clicked_callback = function() panel_sets.remove_selected() end,
