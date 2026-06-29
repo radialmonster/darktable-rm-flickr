@@ -5037,16 +5037,27 @@ M.row_detail = row_detail
 -- table reads as a grid. Returns an empty list when there are no rows, so the
 -- caller emits nothing for an all-clean export with no images. `opts.translate`
 -- localizes only the header line (the row data is user content / ids).
+--
+-- `opts.max_rows` caps how many image rows are rendered before collapsing the
+-- rest into a single "(+N more — see log)" footer; the header still counts every
+-- row. Omit it (as the log call does) and the full table is emitted. The widths
+-- are measured over the *shown* rows only, so a capped panel table stays narrow.
 function M.result_table_lines(extra_data, opts)
   opts = opts or {}
   local tr = opts.translate
   if type(tr) ~= "function" then tr = function(s) return s end end
   local rows = M.result_rows(extra_data, opts.owner)
-  if #rows == 0 then return {} end
+  local total = #rows
+  if total == 0 then return {} end
+
+  local max = tonumber(opts.max_rows)
+  local shown = total
+  if max and max >= 1 and total > max then shown = max end
 
   local status_w, name_w = 0, 0
   local cells = {}
-  for i, row in ipairs(rows) do
+  for i = 1, shown do
+    local row = rows[i]
     local s, n = row_status(row), row.filename or "?"
     cells[i] = { status = s, name = n, detail = row_detail(row) }
     if #s > status_w then status_w = #s end
@@ -5054,12 +5065,40 @@ function M.result_table_lines(extra_data, opts)
   end
 
   local lines = {}
-  lines[#lines + 1] = string.format(tr("Flickr: per-image results (%d):"), #rows)
+  lines[#lines + 1] = string.format(tr("Flickr: per-image results (%d):"), total)
   local fmt = string.format("  %%-%ds  %%-%ds  %%s", status_w, name_w)
   for _, c in ipairs(cells) do
     lines[#lines + 1] = string.format(fmt, c.status, c.name, c.detail)
   end
+  if shown < total then
+    lines[#lines + 1] = string.format(tr("  (+%d more — see log for the full table)"), total - shown)
+  end
   return lines
+end
+
+-- Compose the panel-facing result block (issue #40): the aggregate summary line
+-- followed by the capped per-image table, joined into one multi-line string for
+-- a darktable label widget. `finalize` already computes the bucket counts, so it
+-- passes them in `counts` (the same shape M.finalize_summary takes); the table
+-- is built from the raw `extra_data` buckets. Returns "" when nothing was
+-- processed (no summary worth showing), so the panel can blank its result label.
+--
+-- `opts.translate` localizes, `opts.owner` adds per-row Flickr URLs, and
+-- `opts.max_rows` (default 20) caps the in-panel table — the full table still
+-- goes to the log via M.result_table_lines with no cap.
+function M.result_panel_text(counts, extra_data, opts)
+  opts = opts or {}
+  counts = counts or {}
+  local total = tonumber(counts.total) or 0
+  if total == 0 then return "" end
+  local max = tonumber(opts.max_rows) or 20
+  local parts = { M.finalize_summary(counts, opts) }
+  for _, line in ipairs(M.result_table_lines(extra_data, {
+    translate = opts.translate, owner = opts.owner, max_rows = max,
+  })) do
+    parts[#parts + 1] = line
+  end
+  return table.concat(parts, "\n")
 end
 
 -- Compact "resulting Flickr URL" lines for the panel toast (issue #37). The
@@ -7467,6 +7506,10 @@ local album_search_button = dt.new_widget("button") {
   tooltip = _("show matching fetched Flickr albums for the typed text"),
   clicked_callback = function() refresh_album_matches() end,
 }
+-- Filled by finalize with the end-of-batch result table (issue #40); see the
+-- "last upload result" section of storage_widget below.
+local upload_result_label = dt.new_widget("label") { label = "" }
+
 local storage_widget = dt.new_widget("box") {
   orientation = "vertical",
   dt.new_widget("label") { label = _("upload metadata") },
@@ -7497,6 +7540,13 @@ local storage_widget = dt.new_widget("box") {
   dt.new_widget("label") { label = _("new album") },
   album_new_entry,
   album_status_label,
+  -- A clear, in-context result table after each export (issue #40). finalize
+  -- fills upload_result_label with the summary line + a capped per-image grid so
+  -- the outcome (uploaded / skipped / failed / post-upload errors) is visible
+  -- right where the user clicked export, not only in the transient toast or the
+  -- buried log. Blank until the first export of the session.
+  dt.new_widget("label") { label = _("last upload result") },
+  upload_result_label,
 }
 
 ----------------------------------------------------------------------
@@ -11256,6 +11306,13 @@ local function finalize(storage, image_table, extra_data)
   for _, line in ipairs(report.result_table_lines(extra_data, { translate = _, owner = report_owner })) do
     dt.print_log("[dtrmflickr] " .. line)
   end
+  -- Surface the same result as a clear, persistent table in the export panel
+  -- (issue #40): the toast above is transient and the log is buried, so the
+  -- panel keeps the summary + a capped per-image grid visible after the export.
+  upload_result_label.label = report.result_panel_text({
+    uploaded = fresh_uploads, updated = replaced_uploads, skipped = skipped,
+    failed = failed, post_errors = post_errors, album_errors = album_errors, total = total,
+  }, extra_data, { translate = _, owner = report_owner })
   -- Fill the batch progress bar and remove it from the background-jobs area.
   -- Guarded against an absent/invalidated job (older darktable, or a cancel).
   if extra_data.progress_job and extra_data.progress_job.valid then
