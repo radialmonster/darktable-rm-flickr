@@ -7914,6 +7914,17 @@ function panel_sets.pull_remote_meta()
   if panel_sets.refresh_publish_state_label then
     panel_sets.refresh_publish_state_label(image, acc, photo_id)
   end
+  -- Writing image.title/description updates the darktable database, but the
+  -- editable "metadata editor" module does not re-read until the selection
+  -- changes, so the pulled values would otherwise only appear after the user
+  -- clicks off and back. Re-emit the current selection (dt.gui.selection raises
+  -- selection-changed on both its clear+select) to force that module to refresh
+  -- live. Our own selection-changed handler runs force=false, so the
+  -- last_remote_load guard makes this a no-op for Flickr — no extra getInfo.
+  if dt.gui and dt.gui.selection then
+    local sel = dt.gui.selection()
+    dt.gui.selection(sel)
+  end
   panel_remote_label.label = string.format(_("Flickr: pulled %s from Flickr"), table.concat(changed, ", "))
   dt.print(panel_remote_label.label)
 end
