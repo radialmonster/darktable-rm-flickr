@@ -1511,6 +1511,91 @@ function M.parse_upload_tickets(body)
   return tickets
 end
 
+-- Parse a flickr.photos.people.getList response into a list of the people tagged
+-- on a photo. Each <person .../> carries at least an nsid; username/realname and
+-- the optional bounding-box coords (x/y/w/h) are passed through when present.
+-- parse_attrs walks quoted name=value pairs, so a realname containing spaces or an
+-- attribute whose name is a substring of another is handled safely.
+function M.parse_people(body)
+  local people = {}
+  for attrs in tostring(body or ""):gmatch("<person%s+([^>]*)>") do
+    local a = parse_attrs(attrs)
+    local nsid = a.nsid
+    if nsid and nsid ~= "" then
+      people[#people + 1] = {
+        nsid = xml_unescape(nsid),
+        username = a.username and xml_unescape(a.username) or nil,
+        realname = a.realname and xml_unescape(a.realname) or nil,
+        added_by = a.added_by and xml_unescape(a.added_by) or nil,
+        x = a.x, y = a.y, w = a.w, h = a.h,
+      }
+    end
+  end
+  return people
+end
+
+-- Parse a flickr.people.findByUsername / findByEmail response. Both return the
+-- same shape: <user nsid="12037949632@N01"><username>Stewart</username></user>.
+-- Returns { nsid, username } or nil when no user element is present.
+function M.parse_find_user(body)
+  body = tostring(body or "")
+  local nsid = body:match('<user[^>]-nsid="(.-)"') or body:match("<user[^>]-nsid='(.-)'")
+  if not nsid or nsid == "" then return nil end
+  local username = body:match("<username>(.-)</username>")
+  return { nsid = xml_unescape(nsid), username = username and xml_unescape(username) or nil }
+end
+
+-- List the people tagged on a photo. flickr.photos.people.getList does not strictly
+-- require authentication, but a signed call is used so people on the account's own
+-- non-public photos are visible. Idempotent read. Returns (people, body).
+function M.people_get_list(api_key, api_secret, account, photo_id)
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+  local body, err = M.call(api_key, api_secret, account, "flickr.photos.people.getList", {
+    photo_id = photo_id,
+  })
+  if not body then return nil, err end
+  return M.parse_people(body), body
+end
+
+-- Resolve a username to an NSID. Unauthenticated read (public API key). Returns
+-- ({ nsid, username }, body) or (nil, err) — a "User not found" (Flickr code 1)
+-- surfaces as a normal REST error string.
+function M.people_find_by_username(api_key, username)
+  username = tostring(username or "")
+  if username == "" then return nil, "missing username" end
+  local body, err = M.public_call(api_key, "flickr.people.findByUsername", { username = username })
+  if not body then return nil, err end
+  local user = M.parse_find_user(body)
+  if not user then return nil, "Flickr returned no user for that username" end
+  return user, body
+end
+
+-- Resolve an email address to an NSID. Unauthenticated read (public API key).
+-- Returns ({ nsid, username }, body) or (nil, err).
+function M.people_find_by_email(api_key, email)
+  email = tostring(email or "")
+  if email == "" then return nil, "missing email" end
+  local body, err = M.public_call(api_key, "flickr.people.findByEmail", { find_email = email })
+  if not body then return nil, err end
+  local user = M.parse_find_user(body)
+  if not user then return nil, "Flickr returned no user for that email" end
+  return user, body
+end
+
+-- Add a person (by NSID) to a photo. Requires 'write' permission and an HTTP POST
+-- (M.call already POSTs). Coordinates are intentionally omitted — Flickr accepts a
+-- coordinate-less person tag. Returns true or (nil, err).
+function M.people_add(api_key, api_secret, account, photo_id, user_id)
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+  if not user_id or user_id == "" then return nil, "missing user id" end
+  local body, err = M.call(api_key, api_secret, account, "flickr.photos.people.add", {
+    photo_id = photo_id,
+    user_id = user_id,
+  })
+  if not body then return nil, err end
+  return true
+end
+
 -- Check the status of one or more asynchronous upload tickets. Unauthenticated
 -- (uses the public API key), so it is an idempotent read safe to poll/retry.
 function M.upload_check_tickets(api_key, ticket_ids)
@@ -4834,6 +4919,90 @@ end
 return M
 end
 
+package.preload["dtrmflickr.people"] = function(...)
+-- people.lua — pure helpers for Flickr people tagging (issues #24, #18).
+--
+-- The darktable-side wiring (resolving identifiers to NSIDs, calling
+-- flickr.photos.people.add) lives in dtrmflickr.lua; the signed REST plumbing and
+-- response parsers live in flickr_rest.lua. This module holds only the
+-- side-effect-free decision logic so it can be unit-tested offline:
+--   * parse_identifiers — turn the free-text panel field into distinct tokens
+--   * add_plan          — idempotent diff of who still needs adding to the photo
+
+local M = {}
+
+-- Split a free-text "people" field into a list of distinct identifier tokens.
+-- Tokens are separated by commas or new lines only — NOT spaces, because Flickr
+-- usernames may legitimately contain spaces (e.g. "Jane Doe"). Each token is
+-- trimmed; empty tokens are dropped; duplicates collapse case-insensitively with
+-- the first spelling winning. A token containing "@" is classified as an email
+-- (resolved via flickr.people.findByEmail), otherwise a username
+-- (flickr.people.findByUsername). Returns a list of { value = <trimmed string>,
+-- kind = "email" | "username" }.
+function M.parse_identifiers(text)
+  local out, seen = {}, {}
+  for token in tostring(text or ""):gmatch("[^,\r\n]+") do
+    local value = token:match("^%s*(.-)%s*$")
+    if value ~= "" then
+      local key = value:lower()
+      if not seen[key] then
+        seen[key] = true
+        out[#out + 1] = {
+          value = value,
+          kind = value:find("@", 1, true) and "email" or "username",
+        }
+      end
+    end
+  end
+  return out
+end
+
+-- Decide which resolved members still need adding to a photo, idempotently.
+-- `resolved` is a list of { value = <original identifier>, nsid = <NSID|nil> }
+-- (the result of looking each identifier up via findByUsername/findByEmail).
+-- `existing_nsids` is the list of NSIDs already on the photo (from
+-- flickr.photos.people.getList). For each entry an action is assigned:
+--   "unresolved" — no NSID (lookup failed); nothing to add
+--   "present"    — NSID already on the photo; skip (idempotent re-run)
+--   "duplicate"  — a different identifier in this request already resolved to the
+--                  same NSID; collapse to a single add
+--   "add"        — genuinely new; queue an flickr.photos.people.add call
+-- Returns { to_add = { nsid, ... },           -- NSIDs to add, de-duplicated
+--           already_present = { value, ... },  -- identifiers skipped as present
+--           entries = { { value, nsid, action }, ... } }.  -- full per-input trace
+function M.add_plan(resolved, existing_nsids)
+  local present = {}
+  for _, id in ipairs(existing_nsids or {}) do
+    local nsid = tostring(id or "")
+    if nsid ~= "" then present[nsid] = true end
+  end
+
+  local queued = {}
+  local to_add, already_present, entries = {}, {}, {}
+  for _, e in ipairs(resolved or {}) do
+    local nsid = tostring(e and e.nsid or "")
+    local entry = { value = e and e.value or "", nsid = nsid }
+    if nsid == "" then
+      entry.action = "unresolved"
+    elseif present[nsid] then
+      entry.action = "present"
+      already_present[#already_present + 1] = entry.value
+    elseif queued[nsid] then
+      entry.action = "duplicate"
+    else
+      queued[nsid] = true
+      entry.action = "add"
+      to_add[#to_add + 1] = nsid
+    end
+    entries[#entries + 1] = entry
+  end
+
+  return { to_add = to_add, already_present = already_present, entries = entries }
+end
+
+return M
+end
+
 package.preload["dtrmflickr.widgets"] = function(...)
 -- widgets.lua — small darktable widget helpers kept out of the main module so
 -- they stay offline-testable against a faithful widget mock (tests/test_widgets.lua).
@@ -4920,6 +5089,7 @@ local settings = require "dtrmflickr.settings"
 local rules = require "dtrmflickr.rules"
 local report = require "dtrmflickr.report"
 local tag_reconcile = require "dtrmflickr.tag_reconcile"
+local people = require "dtrmflickr.people"
 local widgets = require "dtrmflickr.widgets"
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
@@ -6015,6 +6185,11 @@ panel_sets.new_entry = dt.new_widget("entry") {
   text = "",
   placeholder = _("new album title"),
   tooltip = _("create a new Flickr album with the selected photo as its first photo"),
+}
+panel_sets.people_entry = dt.new_widget("entry") {
+  text = "",
+  placeholder = _("usernames or emails, comma-separated"),
+  tooltip = _("Flickr members to tag on the selected published photo; separate multiple by commas or new lines"),
 }
 local panel_privacy_widget = dt.new_widget("combobox") {
   label = _("privacy"),
@@ -7124,6 +7299,106 @@ function panel_sets.sync_geo_date()
   end
 end
 
+-- People tagging (issues #24, #18): tag Flickr members on the selected published
+-- photo. The user types one or more Flickr usernames/emails (comma- or
+-- newline-separated) into panel_sets.people_entry; each is resolved to an NSID via
+-- findByUsername / findByEmail, then added with flickr.photos.people.add. The
+-- operation is idempotent — people already on the photo (read via
+-- flickr.photos.people.getList) are skipped, and duplicate identifiers that resolve
+-- to the same member collapse to a single add. Per-identifier result reporting; no
+-- pixel re-upload. The pure decision logic is people.parse_identifiers / add_plan.
+function panel_sets.tag_people()
+  local acc, photo_id = panel_current.account, panel_current.photo_id
+  if (panel_current.selection_count or 0) ~= 1 then
+    dt.print(_("Flickr: select exactly one published image to tag people."))
+    return
+  end
+  if not photo_id then
+    dt.print(_("Flickr: select a published image first."))
+    return
+  end
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before tagging people."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+
+  local identifiers = people.parse_identifiers(panel_sets.people_entry and panel_sets.people_entry.text or "")
+  if #identifiers == 0 then
+    dt.print(_("Flickr: enter one or more Flickr usernames or emails to tag."))
+    return
+  end
+
+  -- Read who is already on the photo so an idempotent re-run skips them. A failed
+  -- read is non-fatal: the worst case is people.add reporting an already-tagged
+  -- member as a failure, which is still surfaced per-identifier below.
+  local existing = {}
+  local people_list = __dtrmflickr_call("flickr.photos.people.getList", function()
+    return rest.people_get_list(api_key, api_secret, acc, photo_id)
+  end)
+  if type(people_list) == "table" then
+    for _, p in ipairs(people_list) do
+      if p.nsid then existing[#existing + 1] = p.nsid end
+    end
+  end
+
+  -- Resolve each identifier to an NSID via the appropriate public lookup.
+  local resolved, unresolved = {}, {}
+  for _, id in ipairs(identifiers) do
+    local user, lookup_err
+    if id.kind == "email" then
+      user, lookup_err = __dtrmflickr_call("flickr.people.findByEmail", function()
+        return rest.people_find_by_email(api_key, id.value)
+      end)
+    else
+      user, lookup_err = __dtrmflickr_call("flickr.people.findByUsername", function()
+        return rest.people_find_by_username(api_key, id.value)
+      end)
+    end
+    if type(user) == "table" and user.nsid and user.nsid ~= "" then
+      resolved[#resolved + 1] = { value = id.value, nsid = user.nsid }
+    else
+      unresolved[#unresolved + 1] = id.value .. ": " .. tostring(lookup_err or _("not found"))
+    end
+  end
+
+  local plan = people.add_plan(resolved, existing)
+  local added, failed = {}, {}
+  for _, nsid in ipairs(plan.to_add) do
+    local ok, add_err = __dtrmflickr_call("flickr.photos.people.add", function()
+      return rest.people_add(api_key, api_secret, acc, photo_id, nsid)
+    end)
+    if ok then
+      added[#added + 1] = nsid
+    else
+      failed[#failed + 1] = nsid .. ": " .. tostring(add_err)
+    end
+  end
+
+  local parts = {}
+  if #added > 0 then parts[#parts + 1] = string.format(_("tagged %d"), #added) end
+  if #plan.already_present > 0 then parts[#parts + 1] = string.format(_("%d already tagged"), #plan.already_present) end
+  if #unresolved > 0 then parts[#parts + 1] = string.format(_("%d not found"), #unresolved) end
+  if #failed > 0 then parts[#parts + 1] = string.format(_("%d failed"), #failed) end
+  local summary = #parts > 0 and table.concat(parts, ", ") or _("nothing to do")
+  panel_remote_label.label = _("Flickr: people — ") .. summary
+  dt.print(_("Flickr: people tagging — ") .. summary)
+
+  local detail = {}
+  for _, u in ipairs(unresolved) do detail[#detail + 1] = u end
+  for _, f in ipairs(failed) do detail[#detail + 1] = f end
+  if #detail > 0 then dt.print(table.concat(detail, "; ")) end
+
+  if #added > 0 then
+    panel_sets.people_entry.text = ""
+    load_remote_settings(api_key, api_secret, acc, photo_id)
+  end
+end
+
 ----------------------------------------------------------------------
 -- Tag reconciler (issue #3): side-by-side local-keyword vs Flickr-tag view
 -- with explicit, confirmation-gated actions. The pure diff/plan logic lives in
@@ -7921,6 +8196,13 @@ local panel_widget = dt.new_widget("box") {
     label = _("sync GPS/date taken"),
     tooltip = _("push darktable GPS location and date taken to the linked Flickr photo without re-uploading"),
     clicked_callback = function() panel_sets.sync_geo_date() end,
+  },
+  dt.new_widget("label") { label = _("people tags") },
+  panel_sets.people_entry,
+  dt.new_widget("button") {
+    label = _("tag people"),
+    tooltip = _("add the listed Flickr members (usernames or emails) to the selected published photo without re-uploading"),
+    clicked_callback = function() panel_sets.tag_people() end,
   },
   dt.new_widget("label") { label = _("tag reconciler") },
   panel_reconcile.diff_label,
