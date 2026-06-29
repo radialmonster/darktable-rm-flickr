@@ -6516,6 +6516,226 @@ end
 return M
 end
 
+package.preload["dtrmflickr.panel_helpers"] = function(...)
+-- panel_helpers.lua — pure parsing/control helpers for the lighttable Flickr panel.
+--
+-- The selected-photo panel reads Flickr REST responses (getInfo, getPerms,
+-- photos.search) and maps the values they carry into the panel's combobox
+-- indices, and it formats the per-image publish-state label. None of that work
+-- touches darktable widgets or live account state, so it lives here as small,
+-- offline-testable functions instead of bloating the main module's tight
+-- main-chunk local budget (Lua caps locals per function; see
+-- tests/test_lua_limits.lua). The main module requires this and references the
+-- helpers via the module table; tests cover them directly
+-- (tests/test_panel_helpers.lua) and through the legacy __test surface.
+--
+-- The combobox-index helpers consult the stable option tables in settings.lua
+-- (privacy/safety/content-type/license/permission), so this module requires it.
+-- publish_state_label additionally consults state.lua for reason
+-- classification, and takes an optional gettext-style `translate` so the
+-- formatting stays pure while the caller localizes.
+
+local settings = require "dtrmflickr.settings"
+local state = require "dtrmflickr.state"
+
+local M = {}
+
+-- Pull a single XML attribute value out of a Flickr REST fragment. Accepts
+-- either quote style and returns nil when the attribute (or the body) is
+-- absent. `name` is matched literally as the attribute name.
+local function remote_attr(body, name)
+  return body and (body:match(name .. '="(.-)"') or body:match(name .. "='(.-)'")) or nil
+end
+M.remote_attr = remote_attr
+
+-- Decode the XML/HTML entities Flickr emits in tag `raw` values (numeric
+-- &#x..; / &#..; references and the five named entities). Always returns a
+-- string; malformed numeric references collapse to "" rather than erroring.
+local function xml_unescape(s)
+  return tostring(s or "")
+    :gsub("&#x(%x+);", function(h)
+      local n = tonumber(h, 16)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
+    :gsub("&#(%d+);", function(d)
+      local n = tonumber(d, 10)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
+    :gsub("&quot;", '"')
+    :gsub("&apos;", "'")
+    :gsub("&lt;", "<")
+    :gsub("&gt;", ">")
+    :gsub("&amp;", "&")
+end
+M.xml_unescape = xml_unescape
+
+-- Parse the <tags> block of a photos.getInfo response into a sorted list of
+-- decoded raw tag strings (both quote styles handled). Returns {} when the
+-- body has no <tags> block.
+local function parse_remote_tags(body)
+  local tags_block = body and body:match("<tags>(.-)</tags>") or nil
+  if not tags_block then return {} end
+  local tags = {}
+  for raw in tags_block:gmatch("<tag[^>]-raw=\"(.-)\"[^>]*>") do
+    tags[#tags + 1] = xml_unescape(raw)
+  end
+  for raw in tags_block:gmatch("<tag[^>]-raw='(.-)'[^>]*>") do
+    tags[#tags + 1] = xml_unescape(raw)
+  end
+  table.sort(tags)
+  return tags
+end
+M.parse_remote_tags = parse_remote_tags
+
+-- Find the content_type of a specific photo in a photos.search response.
+-- Handles both self-closing (`<photo ... />`) and open `<photo ...>` element
+-- shapes; returns nil when the id is empty or not present.
+local function parse_search_content_type(body, photo_id)
+  local id = tostring(photo_id or "")
+  if id == "" then return nil end
+  for attrs in tostring(body or ""):gmatch("<photo%s+([^>]-)/>") do
+    if remote_attr(attrs, "id") == id then
+      return remote_attr(attrs, "content_type")
+    end
+  end
+  for attrs in tostring(body or ""):gmatch("<photo%s+([^>]-)>") do
+    if not attrs:match("/%s*$") and remote_attr(attrs, "id") == id then
+      return remote_attr(attrs, "content_type")
+    end
+  end
+  return nil
+end
+M.parse_search_content_type = parse_search_content_type
+
+-- Map Flickr's ispublic/isfriend/isfamily visibility flags to the panel's
+-- privacy combobox index (1=private .. 5=public). Returns nil when all three
+-- flags are absent (nothing to display).
+local function panel_privacy_index_from_flags(is_public, is_friend, is_family)
+  if is_public == nil and is_friend == nil and is_family == nil then return nil end
+  is_public = tostring(is_public or "0")
+  is_friend = tostring(is_friend or "0")
+  is_family = tostring(is_family or "0")
+  if is_public == "1" then return 5 end
+  if is_friend == "1" and is_family == "1" then return 4 end
+  if is_family == "1" then return 3 end
+  if is_friend == "1" then return 2 end
+  return 1
+end
+M.panel_privacy_index_from_flags = panel_privacy_index_from_flags
+
+-- Map a Flickr safety_level value to the panel's safety combobox index.
+-- Flickr getInfo has returned 0 for "safe" in live tests, while the documented
+-- write API uses safety_level=1 for "safe"; this normalizes only the display
+-- index (saved values still use the documented flickr_value). Returns nil for
+-- an empty/unrecognized value.
+local function panel_safety_index_from_remote(value)
+  if value == nil or value == "" then return nil end
+  local n = tonumber(value)
+  if n == 0 or n == 1 then return 1 end
+  for i, item in ipairs(settings.safety_values) do
+    if item.flickr_value == n then return i end
+  end
+  return nil
+end
+M.panel_safety_index_from_remote = panel_safety_index_from_remote
+
+-- Map a write-side content_type id (1..4) to the panel's content-type combobox
+-- index. Returns nil for an unrecognized value.
+local function panel_content_type_index_from_value(value)
+  local id = tonumber(value)
+  for i, item in ipairs(settings.content_type_values) do
+    if item.flickr_value == id then return i end
+  end
+  return nil
+end
+M.panel_content_type_index_from_value = panel_content_type_index_from_value
+
+-- flickr.photos.search returns a different content_type representation than
+-- upload/setContentType accepts: search uses 0/1/2/3, write APIs use 1/2/3/4.
+-- Keep write-side Flickr IDs unchanged and normalize only this read response.
+local search_content_type_to_write_value = {
+  [0] = 1, -- photo
+  [1] = 2, -- screenshot
+  [2] = 3, -- other/illustration/art
+  [3] = 4, -- virtual photography
+}
+
+-- Map a photos.search content_type value (0..3) to the panel combobox index by
+-- first translating it to the write-side id. Returns nil for an unrecognized
+-- value.
+local function panel_content_type_index_from_search_value(value)
+  local write_value = search_content_type_to_write_value[tonumber(value)]
+  if not write_value then return nil end
+  return panel_content_type_index_from_value(write_value)
+end
+M.panel_content_type_index_from_search_value = panel_content_type_index_from_search_value
+
+-- Map a Flickr license id to the panel's license combobox index. Returns nil
+-- for an empty/unrecognized value.
+local function panel_license_index_from_id(value)
+  if value == nil or value == "" then return nil end
+  local id = tonumber(value)
+  for i, item in ipairs(settings.license_values) do
+    if item.flickr_value == id then return i end
+  end
+  return nil
+end
+M.panel_license_index_from_id = panel_license_index_from_id
+
+-- Map a Flickr permission value (permcomment/permaddmeta) to the panel's
+-- permission combobox index. Returns nil for an empty/unrecognized value.
+local function panel_permission_index_from_id(value)
+  if value == nil or value == "" then return nil end
+  local id = tonumber(value)
+  for i, item in ipairs(settings.permission_values) do
+    if item.flickr_value == id then return i end
+  end
+  return nil
+end
+M.panel_permission_index_from_id = panel_permission_index_from_id
+
+-- Format the per-image publish-state label shown in the panel. `status` is the
+-- evaluate_publish_state verdict; `published_at`/`reasons` annotate it. Reason
+-- classification comes from state.lua. `translate` is an optional gettext-style
+-- wrapper (defaults to identity) so the formatting stays pure and testable
+-- while the caller localizes the user-facing strings.
+local function publish_state_label(status, published_at, reasons, translate)
+  local tr = translate
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  local suffix = published_at and (" (" .. published_at .. ")") or ""
+  if reasons and #reasons > 0 then
+    local described = state.describe_reasons and state.describe_reasons(reasons)
+      or table.concat(reasons, ", ")
+    suffix = suffix .. ": " .. described
+  end
+  if status == "current" then
+    return string.format(tr("publish state: current%s"), suffix)
+  elseif status == "needs-republish" then
+    local kind = state.classify_reasons and state.classify_reasons(reasons) or "none"
+    if kind == "image" then
+      return string.format(tr("publish state: needs reupload%s"), suffix)
+    elseif kind == "metadata" then
+      return string.format(tr("publish state: needs metadata sync%s"), suffix)
+    elseif kind == "both" then
+      return string.format(tr("publish state: needs reupload + metadata sync%s"), suffix)
+    end
+    return string.format(tr("publish state: needs sync%s"), suffix)
+  elseif status == "unknown" then
+    return tr("publish state: linked, sync date unknown")
+  elseif status == "unpublished" then
+    return tr("publish state: unpublished")
+  end
+  return tr("publish state: unknown")
+end
+M.publish_state_label = publish_state_label
+
+return M
+end
+
 package.preload["dtrmflickr.dtrmflickr"] = function(...)
 --[[ dtrmflickr — Flickr export/storage for darktable
 
@@ -6565,6 +6785,7 @@ local albums = require "dtrmflickr.albums"
 local groups = require "dtrmflickr.groups"  -- group/pool submission helpers (#32)
 local widgets = require "dtrmflickr.widgets"
 local remote_pull = require "dtrmflickr.remote_pull"  -- pull remote edits back (#20)
+local panel_helpers = require "dtrmflickr.panel_helpers"  -- pure panel parse/index/label helpers (#46)
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -8053,34 +8274,9 @@ function panel_sets.copy_links()
   end
 end
 
-local function panel_privacy_index_from_flags(is_public, is_friend, is_family)
-  if is_public == nil and is_friend == nil and is_family == nil then return nil end
-  is_public = tostring(is_public or "0")
-  is_friend = tostring(is_friend or "0")
-  is_family = tostring(is_family or "0")
-  if is_public == "1" then return 5 end
-  if is_friend == "1" and is_family == "1" then return 4 end
-  if is_family == "1" then return 3 end
-  if is_friend == "1" then return 2 end
-  return 1
-end
-
 local function panel_privacy_flags()
   local selected = settings.privacy_values[panel_privacy_widget.selected or 1] or settings.privacy_values[1]
   return selected.is_public, selected.is_friend, selected.is_family
-end
-
-local function panel_safety_index_from_remote(value)
-  if value == nil or value == "" then return nil end
-  local n = tonumber(value)
-  -- Flickr getInfo has returned 0 for "safe" in live tests, while the
-  -- documented write API uses safety_level=1 for "safe". This normalizes only
-  -- the display label; saved values still use the documented flickr_value above.
-  if n == 0 or n == 1 then return 1 end
-  for i, item in ipairs(settings.safety_values) do
-    if item.flickr_value == n then return i end
-  end
-  return nil
 end
 
 local function panel_safety_value()
@@ -8096,51 +8292,9 @@ local function panel_content_type_value()
   return selected.flickr_value
 end
 
-local function panel_content_type_index_from_value(value)
-  local id = tonumber(value)
-  for i, item in ipairs(settings.content_type_values) do
-    if item.flickr_value == id then return i end
-  end
-  return nil
-end
-
--- flickr.photos.search returns a different content_type representation than
--- upload/setContentType accepts: search uses 0/1/2/3, write APIs use 1/2/3/4.
--- Keep write-side Flickr IDs unchanged and normalize only this read response.
-local search_content_type_to_write_value = {
-  [0] = 1, -- photo
-  [1] = 2, -- screenshot
-  [2] = 3, -- other/illustration/art
-  [3] = 4, -- virtual photography
-}
-
-local function panel_content_type_index_from_search_value(value)
-  local write_value = search_content_type_to_write_value[tonumber(value)]
-  if not write_value then return nil end
-  return panel_content_type_index_from_value(write_value)
-end
-
-local function panel_license_index_from_id(value)
-  if value == nil or value == "" then return nil end
-  local id = tonumber(value)
-  for i, item in ipairs(settings.license_values) do
-    if item.flickr_value == id then return i end
-  end
-  return nil
-end
-
 local function panel_license_value()
   local selected = settings.license_values[panel_license_widget.selected or 1] or settings.license_values[1]
   return selected.flickr_value
-end
-
-local function panel_permission_index_from_id(value)
-  if value == nil or value == "" then return nil end
-  local id = tonumber(value)
-  for i, item in ipairs(settings.permission_values) do
-    if item.flickr_value == id then return i end
-  end
-  return nil
 end
 
 local function panel_comment_perm_value()
@@ -8151,61 +8305,6 @@ end
 local function panel_addmeta_perm_value()
   local selected = settings.permission_values[panel_addmeta_perm_widget.selected or 4] or settings.permission_values[4]
   return selected.flickr_value
-end
-
-local function remote_attr(body, name)
-  return body and (body:match(name .. '="(.-)"') or body:match(name .. "='(.-)'")) or nil
-end
-
-local function xml_unescape(s)
-  return tostring(s or "")
-    :gsub("&#x(%x+);", function(h)
-      local n = tonumber(h, 16)
-      if not n then return "" end
-      local ok, c = pcall(utf8.char, n)
-      return ok and c or ""
-    end)
-    :gsub("&#(%d+);", function(d)
-      local n = tonumber(d, 10)
-      if not n then return "" end
-      local ok, c = pcall(utf8.char, n)
-      return ok and c or ""
-    end)
-    :gsub("&quot;", '"')
-    :gsub("&apos;", "'")
-    :gsub("&lt;", "<")
-    :gsub("&gt;", ">")
-    :gsub("&amp;", "&")
-end
-
-local function parse_remote_tags(body)
-  local tags_block = body and body:match("<tags>(.-)</tags>") or nil
-  if not tags_block then return {} end
-  local tags = {}
-  for raw in tags_block:gmatch("<tag[^>]-raw=\"(.-)\"[^>]*>") do
-    tags[#tags + 1] = xml_unescape(raw)
-  end
-  for raw in tags_block:gmatch("<tag[^>]-raw='(.-)'[^>]*>") do
-    tags[#tags + 1] = xml_unescape(raw)
-  end
-  table.sort(tags)
-  return tags
-end
-
-local function parse_search_content_type(body, photo_id)
-  local id = tostring(photo_id or "")
-  if id == "" then return nil end
-  for attrs in tostring(body or ""):gmatch("<photo%s+([^>]-)/>") do
-    if remote_attr(attrs, "id") == id then
-      return remote_attr(attrs, "content_type")
-    end
-  end
-  for attrs in tostring(body or ""):gmatch("<photo%s+([^>]-)>") do
-    if not attrs:match("/%s*$") and remote_attr(attrs, "id") == id then
-      return remote_attr(attrs, "content_type")
-    end
-  end
-  return nil
 end
 
 local parse_photo_id_or_url = claim.parse_photo_id
@@ -8660,8 +8759,8 @@ local function load_remote_content_type(api_key, api_secret, acc, photo_id, date
       return rest.public_call(api_key, "flickr.photos.search", args)
     end, { coalesce_key = "panel-refresh-content:" .. tostring(photo_id) })
   end
-  local search_value = parse_search_content_type(body, photo_id)
-  return panel_content_type_index_from_search_value(search_value), search_value, err,
+  local search_value = panel_helpers.parse_search_content_type(body, photo_id)
+  return panel_helpers.panel_content_type_index_from_search_value(search_value), search_value, err,
     remote_pull.search_views(body, photo_id)
 end
 
@@ -8694,16 +8793,16 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
 
   local visibility = body:match("<visibility%s+([^>]-)/>") or body:match("<visibility%s+([^>]-)>")
   panel_loading = true
-  panel_privacy_widget.selected = panel_privacy_index_from_flags(
-    visibility and remote_attr(visibility, "ispublic"),
-    visibility and remote_attr(visibility, "isfriend"),
-    visibility and remote_attr(visibility, "isfamily")) or 0
-  panel_safety_widget.selected = panel_safety_index_from_remote(remote_attr(body, "safety_level")) or 0
+  panel_privacy_widget.selected = panel_helpers.panel_privacy_index_from_flags(
+    visibility and panel_helpers.remote_attr(visibility, "ispublic"),
+    visibility and panel_helpers.remote_attr(visibility, "isfriend"),
+    visibility and panel_helpers.remote_attr(visibility, "isfamily")) or 0
+  panel_safety_widget.selected = panel_helpers.panel_safety_index_from_remote(panel_helpers.remote_attr(body, "safety_level")) or 0
   -- Flickr exposes no read for the search-hidden state, so the panel toggle always
   -- starts unchecked on a fresh load (see its definition / issue #71).
   panel_sets.hidden_widget.value = false
-  panel_license_widget.selected = panel_license_index_from_id(remote_attr(body, "license")) or 0
-  local remote_dateuploaded = remote_attr(body, "dateuploaded")
+  panel_license_widget.selected = panel_helpers.panel_license_index_from_id(panel_helpers.remote_attr(body, "license")) or 0
+  local remote_dateuploaded = panel_helpers.remote_attr(body, "dateuploaded")
   -- Persist Flickr's authoritative upload date/time (issue #21). This is the
   -- truth source: it refines the local stamp a fresh upload seeded, and — more
   -- importantly — backfills the real date for photos that were claimed/linked
@@ -8726,8 +8825,8 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
       return rest.photos_get_perms(api_key, api_secret, acc, photo_id)
     end, { coalesce_key = "panel-refresh-perms:" .. tostring(photo_id) })
     if perms_body then
-      panel_comment_perm_widget.selected = panel_permission_index_from_id(remote_attr(perms_body, "permcomment")) or 0
-      panel_addmeta_perm_widget.selected = panel_permission_index_from_id(remote_attr(perms_body, "permaddmeta")) or 0
+      panel_comment_perm_widget.selected = panel_helpers.panel_permission_index_from_id(panel_helpers.remote_attr(perms_body, "permcomment")) or 0
+      panel_addmeta_perm_widget.selected = panel_helpers.panel_permission_index_from_id(panel_helpers.remote_attr(perms_body, "permaddmeta")) or 0
     else
       -- Capture and log the reason so a real perms failure is diagnosable,
       -- matching the getInfo/search read sites; the controls still disable.
@@ -8741,7 +8840,7 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
     panel_comment_perm_widget.selected = 0
     panel_addmeta_perm_widget.selected = 0
   end
-  local remote_tags = parse_remote_tags(body)
+  local remote_tags = panel_helpers.parse_remote_tags(body)
   panel_tags_label.label = #remote_tags > 0
     and string.format(_("Flickr tags: %s"), table.concat(remote_tags, ", "))
     or _("Flickr tags: none")
@@ -9606,36 +9705,9 @@ function panel_reconcile.pull_remote_only()
   panel_reconcile.refresh(image, panel_reconcile.remote_tags)
 end
 
-local function publish_state_label(status, published_at, reasons)
-  local suffix = published_at and (" (" .. published_at .. ")") or ""
-  if reasons and #reasons > 0 then
-    local described = state.describe_reasons and state.describe_reasons(reasons)
-      or table.concat(reasons, ", ")
-    suffix = suffix .. ": " .. described
-  end
-  if status == "current" then
-    return string.format(_("publish state: current%s"), suffix)
-  elseif status == "needs-republish" then
-    local kind = state.classify_reasons and state.classify_reasons(reasons) or "none"
-    if kind == "image" then
-      return string.format(_("publish state: needs reupload%s"), suffix)
-    elseif kind == "metadata" then
-      return string.format(_("publish state: needs metadata sync%s"), suffix)
-    elseif kind == "both" then
-      return string.format(_("publish state: needs reupload + metadata sync%s"), suffix)
-    end
-    return string.format(_("publish state: needs sync%s"), suffix)
-  elseif status == "unknown" then
-    return _("publish state: linked, sync date unknown")
-  elseif status == "unpublished" then
-    return _("publish state: unpublished")
-  end
-  return _("publish state: unknown")
-end
-
 function panel_sets.refresh_publish_state_label(image, acc, photo_id)
   if not image or not photo_id then
-    panel_sets.publish_label.label = publish_state_label("unpublished")
+    panel_sets.publish_label.label = panel_helpers.publish_state_label("unpublished", nil, nil, _)
     return "unpublished"
   end
   if not acc then
@@ -9645,7 +9717,7 @@ function panel_sets.refresh_publish_state_label(image, acc, photo_id)
   local status, published_at, _photo_id, reasons = state.evaluate_publish_state(image, acc.nsid, {
     metadata_fingerprints = effective_metadata_fingerprints and effective_metadata_fingerprints(image, master_sync_fields()) or nil,
   })
-  panel_sets.publish_label.label = publish_state_label(status, published_at, reasons)
+  panel_sets.publish_label.label = panel_helpers.publish_state_label(status, published_at, reasons, _)
   return status, published_at, reasons
 end
 
@@ -9664,7 +9736,7 @@ function panel_sets.mark_needs_republish()
     return
   end
   state.mark_reason(image, acc.nsid, "image")
-  panel_sets.publish_label.label = publish_state_label("needs-republish", state.get_published_at(image, acc.nsid), state.get_reasons(image, acc.nsid))
+  panel_sets.publish_label.label = panel_helpers.publish_state_label("needs-republish", state.get_published_at(image, acc.nsid), state.get_reasons(image, acc.nsid), _)
   dt.print(_("Flickr: marked selected photo as needing sync."))
 end
 
@@ -11403,8 +11475,8 @@ script_data.__test = {
   image_date_taken = metadata.image_date_taken,
   image_location = metadata.image_location,
   refresh_panel = refresh_panel,
-  parse_remote_tags = parse_remote_tags,
-  parse_search_content_type = parse_search_content_type,
+  parse_remote_tags = panel_helpers.parse_remote_tags,
+  parse_search_content_type = panel_helpers.parse_search_content_type,
   parse_search_photos = claim.parse_search_photos,
   claim_match_terms = claim.claim_match_terms,
   choose_existing_match = claim.choose_existing_match,
@@ -11415,7 +11487,7 @@ script_data.__test = {
   plan_batch_claim = claim.plan_batch_claim,
   format_candidate_label = claim.format_candidate_label,
   parse_photo_id_or_url = parse_photo_id_or_url,
-  panel_content_type_index_from_search_value = panel_content_type_index_from_search_value,
+  panel_content_type_index_from_search_value = panel_helpers.panel_content_type_index_from_search_value,
   flickr_queue = __dtrmflickr_queue,
   flickr_jobs = __dtrmflickr_jobs,
   queue_jobs = require("dtrmflickr.queue_jobs"),
