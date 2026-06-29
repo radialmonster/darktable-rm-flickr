@@ -5671,6 +5671,83 @@ function M.title_description_pull(remote, local_vals, sync)
   return plan
 end
 
+-- classify_change(stored_fp, local_fp, remote_fp): three-way (baseline / local /
+-- remote) classification for a field or field-group, used by the conflict-
+-- resolution UI (issue #22). The arguments are fingerprints (opaque strings):
+--   stored_fp — the value as last published to Flickr (the merge baseline); nil or
+--               "" when no fingerprint was ever recorded (e.g. an older publish).
+--   local_fp  — the current darktable value's fingerprint.
+--   remote_fp — the current Flickr value's fingerprint.
+-- Returns one of:
+--   "in_sync"  — local and remote agree; nothing to resolve.
+--   "local"    — only the local side drifted from the baseline; pushing local is
+--                safe (Flickr is still at the baseline).
+--   "remote"   — only the remote side drifted; pulling remote is safe (darktable is
+--                still at the baseline).
+--   "conflict" — BOTH sides drifted from the baseline, OR the baseline is unknown
+--                and the two sides differ; the user must choose a direction.
+-- Pure/offline-testable. Mirrors the per-field sync intent: the caller computes the
+-- fingerprints with the same toggles used by the push/pull paths so the verdict
+-- matches what those buttons would actually do.
+function M.classify_change(stored_fp, local_fp, remote_fp)
+  local lf = norm(local_fp)
+  local rf = norm(remote_fp)
+  if lf == rf then return "in_sync" end
+  local base = stored_fp ~= nil and tostring(stored_fp) or ""
+  if base == "" then return "conflict" end  -- differ with unknown baseline
+  local local_changed = lf ~= base
+  local remote_changed = rf ~= base
+  if local_changed and remote_changed then return "conflict" end
+  if local_changed then return "local" end
+  if remote_changed then return "remote" end
+  -- Unreachable in practice (lf==base and rf==base implies lf==rf, handled above);
+  -- treated as a conflict defensively.
+  return "conflict"
+end
+
+-- Trim a value for single-line panel display, collapsing newlines and clipping to
+-- `n` characters with an ellipsis so a long title/description does not blow up the
+-- panel label. Pure.
+local function ellipsize(value, n)
+  local s = norm(value):gsub("%s+", " "):match("^%s*(.-)%s*$")
+  if #s > n then return s:sub(1, n - 1) .. "\u{2026}" end
+  return s
+end
+
+-- describe_field(label, local_value, remote_value): one human-readable comparison
+-- line for the side-by-side conflict view. When the two values match it reads
+-- 'label: matches Flickr'; otherwise it shows both, quoted and clipped, e.g.
+--   title: local "Sunset" \u{00B7} Flickr "Sunset over the bay"
+-- Pure/offline-testable.
+function M.describe_field(label, local_value, remote_value)
+  if norm(local_value) == norm(remote_value) then
+    return string.format("%s: matches Flickr", tostring(label or ""))
+  end
+  return string.format('%s: local "%s" \u{00B7} Flickr "%s"',
+    tostring(label or ""), ellipsize(local_value, 40), ellipsize(remote_value, 40))
+end
+
+-- conflict_summary(status, fields): the multi-line text the panel shows after a
+-- "compare with Flickr" action. `status` is a classify_change() verdict for the
+-- field group; `fields` is an array of { label, local_value, remote } rendered one
+-- comparison line each (via describe_field). The first line is a plain-language
+-- verdict that names the resolution: push (the sync button), pull (the pull
+-- button), or leave-as-is (skip). Pure/offline-testable.
+local STATUS_HEADLINE = {
+  in_sync  = "Flickr matches darktable - nothing to resolve.",
+  ["local"] = "darktable is newer - use \"sync title/description\" to push to Flickr.",
+  remote   = "Flickr is newer - use \"pull title/description from Flickr\" to update darktable.",
+  conflict = "Conflict: both sides changed - push (sync), pull, or leave as-is to skip.",
+}
+
+function M.conflict_summary(status, fields)
+  local lines = { STATUS_HEADLINE[status] or "Compared title/description with Flickr." }
+  for _, f in ipairs(fields or {}) do
+    lines[#lines + 1] = M.describe_field(f.label, f.local_value, f.remote)
+  end
+  return table.concat(lines, "\n")
+end
+
 return M
 end
 
@@ -7929,6 +8006,95 @@ function panel_sets.pull_remote_meta()
   dt.print(panel_remote_label.label)
 end
 
+-- Conflict-resolution comparison for title/description (issue #22). Reads the
+-- linked photo's current title/description via flickr.photos.getInfo and shows
+-- them side by side against the local image, then classifies the field group with
+-- a three-way (baseline/local/remote) merge so the user is told whether to push
+-- (the "sync title/description" button), pull (the "pull title/description from
+-- Flickr" button), or leave it (skip). A true conflict — both the local image and
+-- the Flickr photo changed since the last publish — is detected via the stored
+-- title_description fingerprint, so blindly pushing or pulling no longer silently
+-- clobbers the other side's edit. Read-only: it never writes locally or remotely;
+-- it only reports. A panel_sets.* method (not a top-level local) to stay under the
+-- main chunk's local ceiling. Live-gated (needs in-app verify).
+function panel_sets.compare_remote_meta()
+  local acc, photo_id, image = panel_current.account, panel_current.photo_id, panel_current.image
+  if (panel_current.selection_count or 0) ~= 1 then
+    dt.print(_("Flickr: select exactly one image before comparing with Flickr."))
+    return
+  end
+  if not image or not photo_id then
+    dt.print(_("Flickr: select a published image first."))
+    return
+  end
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before comparing with Flickr."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+  local sync = master_sync_fields()
+  if not sync.title and not sync.description then
+    dt.print(_("Flickr: title/description sync disabled in Lua Options."))
+    return
+  end
+
+  local body, err = __dtrmflickr_call("flickr.photos.getInfo", function()
+    return rest.call(api_key, api_secret, acc, "flickr.photos.getInfo", { photo_id = photo_id })
+  end, { coalesce_key = "panel-compare:" .. tostring(photo_id) })
+  if not body then
+    local kind = remote_pull.classify_error(err)
+    if kind == "deleted" then
+      panel_remote_label.label = _("Flickr: photo no longer exists on Flickr (deleted/removed)")
+      dt.print(_("Flickr: this photo no longer exists on Flickr; nothing to compare."))
+    else
+      panel_remote_label.label = _("Flickr: compare failed")
+      dt.print(string.format(_("Flickr: could not read remote photo: %s"), tostring(err)))
+    end
+    return
+  end
+
+  local remote = remote_pull.parse_info(body)
+  if not remote then
+    panel_remote_label.label = _("Flickr: compare failed")
+    dt.print(_("Flickr: could not parse the remote photo info."))
+    return
+  end
+
+  -- Compute fingerprints with the SAME per-field toggles the push/pull paths use, so
+  -- the verdict matches what those buttons would actually do.
+  local local_fp = (effective_metadata_fingerprints(image, sync) or {}).title_description
+  local remote_fp = metadata.fingerprints_from_values({
+    include_title_description = true,
+    title = sync.title and (remote.title or "") or nil,
+    description = sync.description and (remote.description or "") or nil,
+  }).title_description
+  local stored_fp = state.get_fingerprint(image, acc.nsid, "title_description")
+  local status = remote_pull.classify_change(stored_fp, local_fp, remote_fp)
+
+  local fields = {}
+  if sync.title then
+    fields[#fields + 1] = {
+      label = _("title"),
+      local_value = metadata.image_title(image, image and image.filename or ""),
+      remote = remote.title or "",
+    }
+  end
+  if sync.description then
+    fields[#fields + 1] = {
+      label = _("description"),
+      local_value = image and image.description or "",
+      remote = remote.description or "",
+    }
+  end
+
+  panel_remote_label.label = remote_pull.conflict_summary(status, fields)
+  dt.print(panel_remote_label.label)
+end
+
 -- Single-image GPS / date-taken resend (issue #18). Mirrors sync_panel_meta /
 -- sync_panel_tags: pushes only the darktable GPS location and/or date-taken to
 -- an already-published photo via setDates + geo.setLocation, with no pixel
@@ -9041,6 +9207,11 @@ local panel_widget = dt.new_widget("box") {
     label = _("pull title/description from Flickr"),
     tooltip = _("overwrite the local title/description with the linked Flickr photo's current values (only fields whose sync toggle is on; tags use the reconciler)"),
     clicked_callback = function() panel_sets.pull_remote_meta() end,
+  },
+  dt.new_widget("button") {
+    label = _("compare title/description with Flickr"),
+    tooltip = _("show local vs Flickr title/description side by side and advise whether to push (sync), pull, or leave as-is; detects edit conflicts where both sides changed since the last publish. Read-only — changes nothing."),
+    clicked_callback = function() panel_sets.compare_remote_meta() end,
   },
   dt.new_widget("button") {
     label = _("sync keywords"),
