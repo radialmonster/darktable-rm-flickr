@@ -4736,6 +4736,48 @@ end
 return M
 end
 
+package.preload["dtrmflickr.widgets"] = function(...)
+-- widgets.lua — small darktable widget helpers kept out of the main module so
+-- they stay offline-testable against a faithful widget mock (tests/test_widgets.lua).
+
+local M = {}
+
+-- Empty a combobox's entries safely across darktable versions.
+--
+-- darktable's combobox __newindex (src/lua/widget/combobox.c) routes
+-- `widget[i] = nil` to *remove* entry i only when 1 <= i <= length. Two other
+-- cases raise and abort the caller:
+--   * i == length+1  -> the *append* path, which calls luaL_checkstring on the
+--                       value and raises "bad argument #3 ... string expected,
+--                       got nil".
+--   * i <= 0 or i > length+1 -> "Invalid index for combobox : <i>".
+-- The community idiom `for i = #widget, 1, -1 do widget[i] = nil end` caches the
+-- length once; if a removal's effect on the reported length is ever off by one,
+-- a later (cached) index addresses past the live length and hits one of those
+-- errors. Because the panel clears comboboxes during its startup refresh, that
+-- abort leaves the whole plugin's UI unregistered (no Flickr panel).
+--
+-- Remove a CONSTANT index 1 instead: index 1 is valid whenever length > 0 (the
+-- loop guards that by re-reading #widget each pass), and each remove shrinks the
+-- combobox by exactly one, so it terminates. Deselect first so removing the
+-- active entry has no selection side effects. Each step is pcall-guarded so an
+-- unexpected length mismatch degrades to a best-effort clear rather than a crash;
+-- the counter bounds the loop if a remove ever fails to shrink the widget.
+function M.clear_combobox(widget)
+  pcall(function() widget.selected = 0 end)
+  local guard = 0
+  while guard < 10000 do
+    local n = #widget
+    if n <= 0 then break end
+    local ok = pcall(function() widget[1] = nil end)
+    if not ok then break end
+    guard = guard + 1
+  end
+end
+
+return M
+end
+
 package.preload["dtrmflickr.dtrmflickr"] = function(...)
 --[[ dtrmflickr — Flickr export/storage for darktable
 
@@ -4780,6 +4822,7 @@ local settings = require "dtrmflickr.settings"
 local rules = require "dtrmflickr.rules"
 local report = require "dtrmflickr.report"
 local tag_reconcile = require "dtrmflickr.tag_reconcile"
+local widgets = require "dtrmflickr.widgets"
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -5367,7 +5410,11 @@ local hidden_widget = dt.new_widget("check_button") {
   tooltip = _("keep uploaded photos out of public Flickr searches (they stay reachable via direct link and your photostream)"),
   value = dt.preferences.read(PLUGIN, "default_hide_from_search", "bool") == true,
 }
-hidden_widget.changed_callback = function(widget)
+-- check_button fires clicked_callback (not changed_callback, which only exists
+-- for slider/combobox/entry types); assigning changed_callback to a check_button
+-- raises "field can't be written for type lua_check_button" and aborts the whole
+-- script load. The signature/value access is identical.
+hidden_widget.clicked_callback = function(widget)
   dt.preferences.write(PLUGIN, "default_hide_from_search", "bool", widget.value == true)
   dt.print_log(string.format("[dtrmflickr] hide-from-search changed -> default_hide_from_search=%s",
     tostring(widget.value == true)))
@@ -5594,9 +5641,10 @@ end
 
 local ALBUM_MATCH_LIMIT = 25
 
-local function clear_widget_items(widget)
-  for i = #widget, 1, -1 do widget[i] = nil end
-end
+-- Empty a combobox's entries. The safe-clear logic lives in widgets.lua (it has
+-- to dodge darktable's append/invalid-index __newindex traps); see the comment
+-- there. Kept as a thin local alias so the many call sites stay terse.
+local clear_widget_items = widgets.clear_combobox
 
 local function update_album_match_widget(widget, query)
   clear_widget_items(widget)
@@ -6016,7 +6064,7 @@ end
 
 function panel_sets.clear_current_choices()
   panel_sets.current_ids = {}
-  for i = #panel_sets.current_widget, 1, -1 do panel_sets.current_widget[i] = nil end
+  clear_widget_items(panel_sets.current_widget)  -- not a cached for-loop; see clear_widget_items
   panel_sets.current_widget[1] = _("Select an album to remove")
   panel_sets.current_widget.selected = 1
 end
