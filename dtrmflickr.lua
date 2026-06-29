@@ -5216,6 +5216,134 @@ local function trim(s)
   return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+-- ---------------------------------------------------------------------------
+-- Album-cache helpers (issue #45)
+--
+-- These used to live in the main module as closures over the `album_cache`
+-- table. They are pure: where they need the cache they take it as an explicit
+-- first argument, so they can be unit-tested and shared by the export and panel
+-- paths without darktable UI state. The main module still owns the actual
+-- `album_cache` table (its mutation is tied to widget refreshes) and passes it
+-- in.
+-- ---------------------------------------------------------------------------
+
+-- Sort key for natural-ish album ordering: a leading integer sorts numerically
+-- (so "20031107 ..." groups before plain-text titles and orders by number),
+-- everything else falls back to a case-insensitive title compare.
+local function natural_title_key(item)
+  local title = trim(item and item.title or "")
+  if title == "" then title = tostring(item and item.id or "") end
+  local prefix, rest = title:match("^(%d+)%s*(.*)$")
+  if prefix then
+    return 0, tonumber(prefix) or 0, rest:lower(), title:lower()
+  end
+  return 1, 0, title:lower(), title:lower()
+end
+M.natural_title_key = natural_title_key
+
+-- Sort a list of album items in place (numeric-prefix-aware, then title).
+function M.sort(items)
+  table.sort(items, function(a, b)
+    local ag, an, ar, at = natural_title_key(a)
+    local bg, bn, br, bt = natural_title_key(b)
+    if ag ~= bg then return ag < bg end
+    if an ~= bn then return an < bn end
+    if ar ~= br then return ar < br end
+    if at ~= bt then return at < bt end
+    return tostring(a.id or "") < tostring(b.id or "")
+  end)
+end
+
+-- Human-readable combobox/status label for one album item: "Title (#id) - N photo(s)".
+function M.label(item)
+  local title = trim(item and item.title or "")
+  local id = tostring(item and item.id or "")
+  local count = item and item.photos and tostring(item.photos) or nil
+  if title == "" then title = id end
+  local label = string.format("%s (#%s)", title, id)
+  if count and count ~= "" then
+    return string.format("%s - %s photo(s)", label, count)
+  end
+  return label
+end
+
+-- True if `query` (case-insensitive substring) appears in the album's id,
+-- title, or rendered label. An empty query matches everything.
+function M.matches_query(item, query)
+  query = trim(query):lower()
+  if query == "" then return true end
+  local haystack = table.concat({
+    tostring(item.id or ""),
+    tostring(item.title or ""),
+    M.label(item),
+  }, " "):lower()
+  return haystack:find(query, 1, true) ~= nil
+end
+
+-- Resolve a free-text album reference against `cache`. Returns (item, kind):
+--   "exact"     id/title/label matched exactly
+--   "unique"    a single fuzzy match
+-- or (nil, kind) where kind is "ambiguous" / "none" / "empty".
+function M.find_match(cache, value)
+  value = trim(value)
+  if value == "" then return nil, "empty" end
+  local lower = value:lower()
+  local matches = {}
+  for _, item in ipairs(cache or {}) do
+    local id = tostring(item.id or "")
+    local title = tostring(item.title or "")
+    local label = M.label(item)
+    if value == id or lower == title:lower() or lower == label:lower() then
+      return item, "exact"
+    end
+    if M.matches_query(item, value) then matches[#matches + 1] = item end
+  end
+  if #matches == 1 then return matches[1], "unique" end
+  if #matches > 1 then return nil, "ambiguous" end
+  return nil, "none"
+end
+
+-- Like find_match but exact-only (no fuzzy fallback). Returns (item, "exact")
+-- or (nil, "none"/"empty"). Used to detect a pre-existing album before create.
+function M.find_exact(cache, value)
+  value = trim(value)
+  if value == "" then return nil, "empty" end
+  local lower = value:lower()
+  for _, item in ipairs(cache or {}) do
+    local id = tostring(item.id or "")
+    local title = tostring(item.title or "")
+    local label = M.label(item)
+    if value == id or lower == title:lower() or lower == label:lower() then
+      return item, "exact"
+    end
+  end
+  return nil, "none"
+end
+
+-- Order a list of set ids so ids present in `cache` come first in cache order
+-- (a stable, human-meaningful order), with any remaining/unknown ids appended
+-- in their original order. Deduplicates.
+function M.ordered_set_ids(cache, set_ids)
+  local wanted = {}
+  for _, set_id in ipairs(set_ids or {}) do
+    wanted[tostring(set_id)] = true
+  end
+
+  local ordered, used = {}, {}
+  for _, item in ipairs(cache or {}) do
+    local id = tostring(item and item.id or "")
+    if wanted[id] and not used[id] then
+      ordered[#ordered + 1] = id
+      used[id] = true
+    end
+  end
+  for _, set_id in ipairs(set_ids or {}) do
+    set_id = tostring(set_id)
+    if not used[set_id] then ordered[#ordered + 1] = set_id end
+  end
+  return ordered
+end
+
 -- Split a user-typed album field into individual album references. Parts are
 -- comma-separated (mirrors the panel's multi-add), trimmed, with empties
 -- dropped. Order is preserved; exact-duplicate raw parts (case-insensitive,
@@ -6159,76 +6287,16 @@ local function trim(value)
   return tostring(value or ""):match("^%s*(.-)%s*$")
 end
 
-local function natural_title_key(item)
-  local title = trim(item and item.title or "")
-  if title == "" then title = tostring(item and item.id or "") end
-  local prefix, rest = title:match("^(%d+)%s*(.*)$")
-  if prefix then
-    return 0, tonumber(prefix) or 0, rest:lower(), title:lower()
-  end
-  return 1, 0, title:lower(), title:lower()
-end
-
-local function sort_albums(items)
-  table.sort(items, function(a, b)
-    local ag, an, ar, at = natural_title_key(a)
-    local bg, bn, br, bt = natural_title_key(b)
-    if ag ~= bg then return ag < bg end
-    if an ~= bn then return an < bn end
-    if ar ~= br then return ar < br end
-    if at ~= bt then return at < bt end
-    return tostring(a.id or "") < tostring(b.id or "")
-  end)
-end
-
-local function ordered_set_ids(set_ids)
-  local wanted = {}
-  for _, set_id in ipairs(set_ids or {}) do
-    wanted[tostring(set_id)] = true
-  end
-
-  local ordered, used = {}, {}
-  for _, item in ipairs(album_cache) do
-    local id = tostring(item and item.id or "")
-    if wanted[id] and not used[id] then
-      ordered[#ordered + 1] = id
-      used[id] = true
-    end
-  end
-  for _, set_id in ipairs(set_ids or {}) do
-    set_id = tostring(set_id)
-    if not used[set_id] then ordered[#ordered + 1] = set_id end
-  end
-  return ordered
-end
-
-local function album_label(item)
-  local title = trim(item and item.title or "")
-  local id = tostring(item and item.id or "")
-  local count = item and item.photos and tostring(item.photos) or nil
-  if title == "" then title = id end
-  local label = string.format("%s (#%s)", title, id)
-  if count and count ~= "" then
-    return string.format("%s - %s photo(s)", label, count)
-  end
-  return label
-end
+-- Pure album-cache helpers now live in albums.lua (issue #45): albums.sort,
+-- albums.label, albums.matches_query, albums.find_match, albums.find_exact,
+-- albums.ordered_set_ids. The main module keeps the album_cache table and passes
+-- it in. The closures below adapt the cache-taking API to the old single-arg
+-- call shape used by panel/export code (and the __test hooks).
 
 local function album_input_value()
   local typed = trim(album_entry.text or "")
   if typed ~= "" then return typed end
   return trim(album_widget.value or "")
-end
-
-local function album_matches_query(item, query)
-  query = trim(query):lower()
-  if query == "" then return true end
-  local haystack = table.concat({
-    tostring(item.id or ""),
-    tostring(item.title or ""),
-    album_label(item),
-  }, " "):lower()
-  return haystack:find(query, 1, true) ~= nil
 end
 
 local ALBUM_MATCH_LIMIT = 25
@@ -6249,11 +6317,11 @@ local function update_album_match_widget(widget, query)
   local count = 0
   local shown = 0
   for _, item in ipairs(album_cache) do
-    if album_matches_query(item, query) then
+    if albums.matches_query(item, query) then
       count = count + 1
       if shown < ALBUM_MATCH_LIMIT then
         shown = shown + 1
-        widget[shown] = album_label(item)
+        widget[shown] = albums.label(item)
       end
     end
   end
@@ -6269,39 +6337,6 @@ local function update_album_choices(query)
   return count, shown
 end
 
-local function find_album_match(value)
-  value = trim(value)
-  if value == "" then return nil, "empty" end
-  local lower = value:lower()
-  local matches = {}
-  for _, item in ipairs(album_cache) do
-    local id = tostring(item.id or "")
-    local title = tostring(item.title or "")
-    local label = album_label(item)
-    if value == id or lower == title:lower() or lower == label:lower() then
-      return item, "exact"
-    end
-    if album_matches_query(item, value) then matches[#matches + 1] = item end
-  end
-  if #matches == 1 then return matches[1], "unique" end
-  if #matches > 1 then return nil, "ambiguous" end
-  return nil, "none"
-end
-
-local function find_album_exact(value)
-  value = trim(value)
-  if value == "" then return nil, "empty" end
-  local lower = value:lower()
-  for _, item in ipairs(album_cache) do
-    local id = tostring(item.id or "")
-    local title = tostring(item.title or "")
-    local label = album_label(item)
-    if value == id or lower == title:lower() or lower == label:lower() then
-      return item, "exact"
-    end
-  end
-  return nil, "none"
-end
 
 local function refresh_album_matches()
   local query = album_input_value()
@@ -6697,7 +6732,7 @@ end
 function panel_sets.update_current_choices(image, account_nsid)
   panel_sets.clear_current_choices()
   if not image or not account_nsid then return end
-  for _, set_id in ipairs(ordered_set_ids(state.get_sets(image, account_nsid))) do
+  for _, set_id in ipairs(albums.ordered_set_ids(album_cache, state.get_sets(image, account_nsid))) do
     panel_sets.current_ids[#panel_sets.current_ids + 1] = set_id
     panel_sets.current_widget[#panel_sets.current_widget + 1] = panel_sets.title_for_id(set_id)
   end
@@ -6725,7 +6760,7 @@ end
 function panel_sets.title_for_id(set_id)
   set_id = tostring(set_id or "")
   for _, item in ipairs(album_cache) do
-    if tostring(item.id or "") == set_id then return album_label(item) end
+    if tostring(item.id or "") == set_id then return albums.label(item) end
   end
   return set_id
 end
@@ -6733,7 +6768,7 @@ end
 function panel_sets.format_memberships(sets)
   if not sets or #sets == 0 then return _("in albums: none") end
   local labels = {}
-  for _, set_id in ipairs(ordered_set_ids(sets)) do labels[#labels + 1] = panel_sets.title_for_id(set_id) end
+  for _, set_id in ipairs(albums.ordered_set_ids(album_cache, sets)) do labels[#labels + 1] = panel_sets.title_for_id(set_id) end
   return _("in albums:") .. "\n" .. table.concat(labels, "\n")
 end
 
@@ -7096,7 +7131,7 @@ function panel_sets.refresh_memberships()
 end
 
 function panel_sets.resolve(value)
-  local match, kind = find_album_match(value)
+  local match, kind = albums.find_match(album_cache, value)
   if match then return match, kind end
   value = trim(value)
   if value:match("^%d+$") then return { id = value, title = value }, "manual-id" end
@@ -7174,7 +7209,7 @@ function panel_sets.create()
     return
   end
 
-  local existing = find_album_exact(title)
+  local existing = albums.find_exact(album_cache, title)
   if existing then
     panel_sets.status_label.label = _("album already exists")
     dt.print(string.format(_("Flickr: album '%s' already exists; use add existing album."), title))
@@ -8867,13 +8902,17 @@ local function current_album()
   if mode == 2 then
     local existing_value = album_input_value()
     if existing_value == "" then return { mode = "none", targets = {}, errors = {} } end
-    local targets, errors = albums.resolve_existing(existing_value, find_album_match)
+    local targets, errors = albums.resolve_existing(existing_value, function(part)
+      return albums.find_match(album_cache, part)
+    end)
     return { mode = "multi", targets = targets, errors = errors }
   end
   if mode == 3 then
     local new_value = trim(album_new_entry.text or "")
     if new_value == "" then return { mode = "none", targets = {}, errors = {} } end
-    local targets, errors = albums.resolve_create(new_value, find_album_exact)
+    local targets, errors = albums.resolve_create(new_value, function(title)
+      return albums.find_exact(album_cache, title)
+    end)
     return { mode = "multi", targets = targets, errors = errors }
   end
   return { mode = "none", targets = {}, errors = {} }
@@ -9516,11 +9555,11 @@ script_data.__test = {
   json_object = json_object,
   json_string_field = json_string_field,
   current_album = current_album,
-  album_label = album_label,
+  album_label = albums.label,
   set_album_cache = set_album_cache,
-  find_album_match = find_album_match,
-  sort_albums = sort_albums,
-  ordered_set_ids = ordered_set_ids,
+  find_album_match = function(value) return albums.find_match(album_cache, value) end,
+  sort_albums = albums.sort,
+  ordered_set_ids = function(set_ids) return albums.ordered_set_ids(album_cache, set_ids) end,
   refresh_album_cache_for_export = refresh_album_cache_for_export,
   current_safety = current_safety,
   current_content_type = current_content_type,
