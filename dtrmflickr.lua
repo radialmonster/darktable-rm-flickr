@@ -4719,6 +4719,45 @@ function M.photoset_url(owner, set_id)
   return string.format("%s/photos/%s/albums/%s", M.BASE, o, s)
 end
 
+-- Build the open/copy URL list for a panel selection (issue #38). `entries` is a
+-- list of { filename = <string?>, photo_id = <id?> } — one per selected image,
+-- with photo_id nil/blank for an image that is not published. `owner` is the
+-- active account's NSID/path_alias. Returns a result table:
+--   result.links       — ordered list of { filename, photo_id, url } for every
+--                        published entry that produced a usable URL
+--   result.published   — #result.links
+--   result.unpublished — count of entries that had no usable photo URL
+-- Pure and offline-testable (see tests/test_urls.lua); the panel maps its live
+-- darktable selection into `entries` and turns the URLs into open/copy actions.
+function M.selection_links(entries, owner)
+  local result = { links = {}, published = 0, unpublished = 0 }
+  for _, e in ipairs(entries or {}) do
+    local url = e and M.photo_url(owner, e.photo_id) or nil
+    if url then
+      result.links[#result.links + 1] = {
+        filename = e.filename,
+        photo_id = clean(e.photo_id),
+        url = url,
+      }
+    else
+      result.unpublished = result.unpublished + 1
+    end
+  end
+  result.published = #result.links
+  return result
+end
+
+-- Newline-joined URL text for a selection_links() result — the payload the panel
+-- copies to the clipboard and writes to the log (one URL per line, in order).
+-- Returns "" when there are no published links.
+function M.join_urls(result)
+  local lines = {}
+  for _, link in ipairs(result and result.links or {}) do
+    lines[#lines + 1] = link.url
+  end
+  return table.concat(lines, "\n")
+end
+
 return M
 end
 
@@ -7596,6 +7635,14 @@ panel_sets.batch_claim_entry = dt.new_widget("entry") {
   tooltip = _("paste a list of Flickr photo IDs or URLs; they are linked to the selected images in order"),
 }
 
+-- Open / copy the public Flickr URL(s) for the selected published photo(s)
+-- (issue #38). url_links caches the most recent urls.selection_links() result so
+-- the open/copy buttons act on exactly what panel_sets.url_label advertises. All
+-- state and widgets hang off panel_sets (table fields, not main-chunk locals) to
+-- stay under Lua's per-function local limit (see CLAUDE.md).
+panel_sets.url_links = { links = {}, published = 0, unpublished = 0 }
+panel_sets.url_label = dt.new_widget("label") { label = "" }
+
 local refresh_panel
 local panel_current = { image = nil, account = nil, photo_id = nil, selection_count = 0, remote_loaded = false }
 local panel_loading = false
@@ -7832,6 +7879,102 @@ function panel_sets.update_photo_link_buttons(selection, account, current_photo_
   end
   if panel_sets.claim_existing_button then panel_sets.claim_existing_button.sensitive = can_claim end
   if panel_sets.set_link_button then panel_sets.set_link_button.sensitive = account ~= nil and #selection == 1 and not current_photo_id end
+end
+
+-- Recompute the open/copy Flickr URL set for the current selection (issue #38).
+-- `owner` is the NSID/path_alias used to build the public URL; `account_nsid`,
+-- when set, is the account whose per-image photo IDs we look up (logged-in case,
+-- supports multi-select). When account_nsid is nil (not logged in) only the
+-- focused image's stored-tag photo ID — already in panel_current.photo_id — is
+-- known, so just that one is offered. Caches the result on panel_sets.url_links
+-- so open_links/copy_links act on exactly what url_label shows, and toggles the
+-- buttons' sensitivity to whether anything is publishable.
+function panel_sets.refresh_url_actions(selection, owner, account_nsid)
+  local u = require("dtrmflickr.urls")
+  selection = selection or {}
+  local entries = {}
+  if account_nsid and account_nsid ~= "" then
+    for _, img in ipairs(selection) do
+      if img then
+        entries[#entries + 1] = { filename = img.filename, photo_id = state.get_photo_id(img, account_nsid) }
+      end
+    end
+  else
+    local img = selection[1]
+    if img then entries[1] = { filename = img.filename, photo_id = panel_current.photo_id } end
+  end
+  local result = u.selection_links(entries, owner)
+  panel_sets.url_links = result
+  if result.published == 0 then
+    panel_sets.url_label.label = ""
+  elseif result.published == 1 then
+    panel_sets.url_label.label = result.links[1].url
+  else
+    panel_sets.url_label.label = string.format(_("%d Flickr URLs ready (open/copy)"), result.published)
+  end
+  local has = result.published > 0
+  if panel_sets.open_url_button then panel_sets.open_url_button.sensitive = has end
+  if panel_sets.copy_url_button then panel_sets.copy_url_button.sensitive = has end
+end
+
+-- Open each published Flickr page in the default browser. Capped per click so a
+-- huge selection can't spawn hundreds of browser tabs; the full set is always
+-- reachable via "copy URL(s)".
+function panel_sets.open_links()
+  local result = panel_sets.url_links or { links = {} }
+  local n = #result.links
+  if n == 0 then dt.print(_("Flickr: no published photo in the selection to open")); return end
+  local cap = 12
+  local opened = math.min(n, cap)
+  for i = 1, opened do open_url(result.links[i].url) end
+  if n > cap then
+    dt.print(string.format(_("Flickr: opened %d of %d URLs; use copy URL(s) for the rest"), opened, n))
+  else
+    dt.print(string.format(_("Flickr: opened %d Flickr page(s)"), opened))
+  end
+end
+
+-- Copy the published URL(s) to the OS clipboard. darktable's Lua API has no
+-- clipboard binding, so this writes the URLs to a temp file and pipes it to the
+-- platform clip tool (Windows clip / macOS pbcopy / Linux xclip|xsel|wl-copy).
+-- Returns true on a clean exit. The URLs are always logged by the caller too, so
+-- they remain recoverable if no clip tool is available.
+function panel_sets.copy_to_clipboard(text)
+  local osn = dt.configuration.running_os
+  local dir = dt.configuration.tmp_dir or dt.configuration.config_dir or "."
+  local path = dir .. "/dtrmflickr_clip.txt"
+  local f = io.open(path, "wb")
+  if not f then return false end
+  f:write(text or "")
+  f:close()
+  local q = '"' .. path .. '"'
+  local cmd
+  if osn == "windows" then
+    cmd = 'cmd /c "clip < ' .. q .. '"'
+  elseif osn == "macos" then
+    cmd = 'pbcopy < ' .. q
+  else
+    cmd = 'sh -c "xclip -selection clipboard -i < ' .. q
+      .. ' || xsel --clipboard --input < ' .. q
+      .. ' || wl-copy < ' .. q .. '"'
+  end
+  local rc = dt.control.execute(cmd)
+  os.remove(path)
+  return rc == 0
+end
+
+function panel_sets.copy_links()
+  local u = require("dtrmflickr.urls")
+  local result = panel_sets.url_links or { links = {} }
+  if #result.links == 0 then dt.print(_("Flickr: no published photo in the selection to copy")); return end
+  local text = u.join_urls(result)
+  -- Always log the URLs so they survive a failed clipboard shell-out.
+  dt.print_log("[dtrmflickr] Flickr URLs:\n" .. text)
+  if panel_sets.copy_to_clipboard(text) then
+    dt.print(string.format(_("Flickr: copied %d URL(s) to the clipboard"), #result.links))
+  else
+    dt.print(string.format(_("Flickr: could not reach the clipboard; %d URL(s) written to the log"), #result.links))
+  end
 end
 
 local function panel_privacy_index_from_flags(is_public, is_friend, is_family)
@@ -9883,6 +10026,7 @@ function refresh_panel(force, fetch_remote)
   panel_current = { image = image, account = nil, photo_id = nil, selection_count = #selection, remote_loaded = false }
   if not image then
     panel_sets.update_photo_link_buttons(selection, nil, nil)
+    panel_sets.refresh_url_actions(selection, nil, nil)
     panel_status_label.label = _("no image selected")
     panel_file_label.label = ""
     panel_account_label.label = ""
@@ -9904,6 +10048,7 @@ function refresh_panel(force, fetch_remote)
     local tag_account_nsid, tagged_photo_id = state.get_any_photo_id(image)
     panel_current = { image = image, account = nil, photo_id = tagged_photo_id, selection_count = #selection, remote_loaded = false }
     panel_sets.update_photo_link_buttons(selection, nil, tagged_photo_id)
+    panel_sets.refresh_url_actions(selection, tag_account_nsid, nil)
     panel_account_label.label = tag_account_nsid
       and string.format(_("account: %s (not logged in)"), tag_account_nsid)
       or _("account: not logged in")
@@ -9939,6 +10084,7 @@ function refresh_panel(force, fetch_remote)
   local sets = state.get_sets(image, acc.nsid)
   panel_current = { image = image, account = acc, photo_id = photo_id, selection_count = #selection, remote_loaded = false }
   panel_sets.update_photo_link_buttons(selection, acc, photo_id)
+  panel_sets.refresh_url_actions(selection, acc.nsid, acc.nsid)
   panel_account_label.label = string.format(_("account: %s"), acc.username or acc.nsid)
   panel_photo_label.label = photo_id
     and string.format(_("photo: %s"), photo_id)
@@ -9980,6 +10126,16 @@ panel_sets.claim_existing_button = dt.new_widget("button") {
 panel_sets.set_link_button = dt.new_widget("button") {
   label = _("set link"),
   clicked_callback = function() set_panel_photo_id_link() end,
+}
+panel_sets.open_url_button = dt.new_widget("button") {
+  label = _("open in browser"),
+  tooltip = _("open the Flickr photo page for each selected published photo in your web browser"),
+  clicked_callback = function() panel_sets.open_links() end,
+}
+panel_sets.copy_url_button = dt.new_widget("button") {
+  label = _("copy URL(s)"),
+  tooltip = _("copy the Flickr photo URL(s) for the selected published photo(s) to the clipboard"),
+  clicked_callback = function() panel_sets.copy_links() end,
 }
 panel_sets.refresh_queue_status()
 
@@ -10175,6 +10331,12 @@ local panel_widget = dt.new_widget("box") {
   panel_file_label,
   panel_account_label,
   panel_photo_label,
+  panel_sets.url_label,
+  dt.new_widget("box") {
+    orientation = "horizontal",
+    panel_sets.open_url_button,
+    panel_sets.copy_url_button,
+  },
   panel_sets.publish_label,
   panel_sets.queue_label,
   panel_sets.queue_detail_label,
