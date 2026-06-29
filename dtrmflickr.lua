@@ -5575,6 +5575,43 @@ function M.format_membership_status(result, translate)
   return table.concat(parts, ", ")
 end
 
+-- Plan a "create album from the current selection" action (issue #30).
+--
+-- `entries` is the selection in display order, one per selected image:
+--   { image = <opaque token>, photo_id = <string|nil> }
+-- where photo_id is the image's stored Flickr id for the active account (nil/""
+-- when the image is not published there). This is the pure core of the panel's
+-- create-from-selection button: it decides which photos go into the new album
+-- and in what order, without any darktable/REST state.
+--
+-- Returns a plan table:
+--   members     — ordered, de-duplicated list of { image, photo_id } to put in
+--                 the album (first occurrence of each photo_id wins). members[1]
+--                 is the primary photo used by flickr.photosets.create; the rest
+--                 are added with flickr.photosets.addPhoto.
+--   unlinked    — count of selected images with no Flickr id (skipped)
+--   duplicates  — count of entries dropped because their photo_id already
+--                 appeared earlier in the selection
+--   total       — #entries (the raw selection size)
+-- The caller treats an empty `members` (every image unlinked) as "nothing to do".
+function M.plan_selection_create(entries)
+  local plan = { members = {}, unlinked = 0, duplicates = 0, total = 0 }
+  local seen = {}
+  for _, entry in ipairs(entries or {}) do
+    plan.total = plan.total + 1
+    local photo_id = trim(entry and entry.photo_id or "")
+    if photo_id == "" then
+      plan.unlinked = plan.unlinked + 1
+    elseif seen[photo_id] then
+      plan.duplicates = plan.duplicates + 1
+    else
+      seen[photo_id] = true
+      plan.members[#plan.members + 1] = { image = entry.image, photo_id = photo_id }
+    end
+  end
+  return plan
+end
+
 -- Resolve a comma-separated list of NEW-album titles into targets. Each title
 -- is checked against the cache via `exact_resolver(title)` (find_album_exact):
 -- if a set with that exact title/id already exists we reuse it (kind="existing",
@@ -7717,6 +7754,111 @@ function panel_sets.create()
   end
 end
 
+-- Create a new album from the CURRENT lighttable selection (issue #30).
+--
+-- Unlike panel_sets.create (which acts on the single focused published photo),
+-- this gathers every selected image that is already published to the active
+-- account, creates the photoset with the first as primary, then adds the rest
+-- with flickr.photosets.addPhoto. Unpublished images in the selection are
+-- skipped and reported; duplicate Flickr ids collapse to one. As with the
+-- single create, photosets.create is NOT retried (non-idempotent, no dedupe
+-- key), but the per-photo addPhoto calls keep the default retry policy.
+function panel_sets.create_from_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection == 0 then
+    dt.print(_("Flickr: select one or more published images before creating an album."))
+    return
+  end
+  local acc = load_token()
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before creating an album."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+  local title = trim(panel_sets.new_entry.text or "")
+  if title == "" then
+    dt.print(_("Flickr: type a new album title first."))
+    return
+  end
+  if not album_cache_matches(acc) then clear_album_cache() end
+  if #album_cache == 0 then panel_sets.refresh_list() end
+  if albums.find_exact(album_cache, title) then
+    panel_sets.status_label.label = _("album already exists")
+    dt.print(string.format(_("Flickr: album '%s' already exists; use add existing album."), title))
+    return
+  end
+
+  -- Build the ordered, de-duplicated member list from the selection.
+  local entries = {}
+  for _, image in ipairs(selection) do
+    entries[#entries + 1] = { image = image, photo_id = state.get_photo_id(image, acc.nsid) }
+  end
+  local plan = albums.plan_selection_create(entries)
+  if #plan.members == 0 then
+    panel_sets.status_label.label = _("no published photos in selection")
+    dt.print(string.format(
+      _("Flickr: none of the %d selected image(s) are published to this account; nothing to put in the album."),
+      plan.total))
+    return
+  end
+
+  -- Create the set with the first member as the primary/cover photo.
+  local primary = plan.members[1]
+  local photoset_id, err = __dtrmflickr_call("flickr.photosets.create", function()
+    return rest.photosets_create(api_key, api_secret, acc, title, primary.photo_id)
+  end, { max_attempts = 1 })
+  if not photoset_id then
+    panel_sets.status_label.label = _("album create failed")
+    dt.print(string.format(_("Flickr: album create failed: %s"), tostring(err)))
+    return
+  end
+  state.add_set(primary.image, acc.nsid, photoset_id)
+
+  -- Add the remaining members.
+  local added, add_errors = 1, {}
+  for i = 2, #plan.members do
+    local m = plan.members[i]
+    local ok, aerr = __dtrmflickr_call("flickr.photosets.addPhoto", function()
+      return rest.photosets_add_photo(api_key, api_secret, acc, photoset_id, m.photo_id)
+    end)
+    if ok or photoset_add_is_already_present(aerr) then
+      state.add_set(m.image, acc.nsid, photoset_id)
+      added = added + 1
+    else
+      add_errors[#add_errors + 1] = string.format("%s: %s", tostring(m.photo_id), tostring(aerr))
+    end
+  end
+
+  table.insert(album_cache, 1, { id = photoset_id, title = title, photos = tostring(added) })
+  panel_sets.new_entry.text = ""
+  if panel_current.image and panel_current.account then
+    panel_sets_label.label = panel_sets.format_memberships(state.get_sets(panel_current.image, panel_current.account.nsid))
+    panel_sets.update_current_choices(panel_current.image, panel_current.account.nsid)
+  end
+
+  -- Report: created + added, plus any skipped/failed.
+  local notes = {}
+  if plan.unlinked > 0 then
+    notes[#notes + 1] = string.format(_("%d not published, skipped"), plan.unlinked)
+  end
+  if plan.duplicates > 0 then
+    notes[#notes + 1] = string.format(_("%d duplicate(s) collapsed"), plan.duplicates)
+  end
+  if #add_errors > 0 then
+    notes[#notes + 1] = string.format(_("%d add failed"), #add_errors)
+  end
+  local suffix = (#notes > 0) and (" (" .. table.concat(notes, ", ") .. ")") or ""
+  panel_sets.status_label.label = string.format(_("created '%s' with %d photo(s)"), title, added) .. suffix
+  dt.print(panel_sets.status_label.label)
+  if #add_errors > 0 then
+    dt.print(_("Flickr: some photos could not be added: ") .. table.concat(add_errors, "; "))
+  end
+end
+
 function panel_sets.remove_selected()
   local image, acc, photo_id, api_key, api_secret = panel_sets.api_context(_("removing an album"))
   if not image then return end
@@ -9359,7 +9501,13 @@ local panel_widget = dt.new_widget("box") {
     orientation = "horizontal",
     dt.new_widget("button") {
       label = _("create album"),
+      tooltip = _("create a new album containing the current published photo"),
       clicked_callback = function() panel_sets.create() end,
+    },
+    dt.new_widget("button") {
+      label = _("create from selection"),
+      tooltip = _("create a new album from every published image in the current selection"),
+      clicked_callback = function() panel_sets.create_from_selection() end,
     },
   },
   panel_sets.status_label,
