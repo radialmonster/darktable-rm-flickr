@@ -4309,6 +4309,45 @@ function M.finalize_detail_lines(extra_data, opts)
   return lines
 end
 
+-- Split the uploaded bucket into freshly-created vs replaced-in-place counts
+-- (issue #60). `store` records a re-export that updates an existing photo via
+-- the replace endpoint with `replaced = true`; everything else is a fresh
+-- upload. Returns `fresh, replaced` so the summary can read a mixed batch
+-- ("3 uploaded, 2 updated") instead of folding replaces into "5 uploaded".
+function M.uploaded_counts(extra_data)
+  local fresh, replaced = 0, 0
+  for _, up in ipairs((extra_data and extra_data.uploaded) or {}) do
+    if type(up) == "table" and up.replaced then
+      replaced = replaced + 1
+    else
+      fresh = fresh + 1
+    end
+  end
+  return fresh, replaced
+end
+
+-- Build the end-of-batch aggregate summary line. `counts` carries the already
+-- computed buckets: { uploaded (fresh), updated (replaced), skipped, failed,
+-- post_errors, album_errors, total }. When nothing was replaced the line is the
+-- historical "%d uploaded, ..." shape verbatim (no noise for the common fresh
+-- batch); a batch that replaced any photo gets an extra "%d updated" field so a
+-- mixed batch reads correctly. Pure/testable; `opts.translate` localizes.
+function M.finalize_summary(counts, opts)
+  opts = opts or {}
+  local tr = opts.translate
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  counts = counts or {}
+  local updated = tonumber(counts.updated) or 0
+  if updated > 0 then
+    return string.format(tr("Flickr: finished — %d uploaded, %d updated, %d skipped, %d failed, %d post-upload error(s), %d album error(s), %d total"),
+      counts.uploaded or 0, updated, counts.skipped or 0, counts.failed or 0,
+      counts.post_errors or 0, counts.album_errors or 0, counts.total or 0)
+  end
+  return string.format(tr("Flickr: finished — %d uploaded, %d skipped, %d failed, %d post-upload error(s), %d album error(s), %d total"),
+    counts.uploaded or 0, counts.skipped or 0, counts.failed or 0,
+    counts.post_errors or 0, counts.album_errors or 0, counts.total or 0)
+end
+
 ----------------------------------------------------------------------
 -- Per-image result table (issue #6).
 --
@@ -4393,6 +4432,7 @@ function M.result_rows(extra_data, owner)
       kind = "uploaded",
       filename = name_of(up),
       photo_id = up.photo_id,
+      replaced = (type(up) == "table" and up.replaced) and true or false,
       failed_actions = actions or {},
       attempts = tonumber(up.attempts),
       url = owner and urls.photo_url(owner, up.photo_id) or nil,
@@ -4413,10 +4453,13 @@ function M.result_rows(extra_data, owner)
 end
 
 -- Display status word for a result row: "partial" for an uploaded row that had
--- a post-upload metadata error, otherwise the row's kind verbatim.
+-- a post-upload metadata error, "updated" for a clean replace-in-place row
+-- (issue #60), otherwise the row's kind verbatim. "partial" wins over "updated"
+-- so a replaced photo whose metadata setter failed is still flagged as partial.
 local function row_status(row)
-  if row.kind == "uploaded" and row.failed_actions and #row.failed_actions > 0 then
-    return "partial"
+  if row.kind == "uploaded" then
+    if row.failed_actions and #row.failed_actions > 0 then return "partial" end
+    if row.replaced then return "updated" end
   end
   return row.kind
 end
@@ -4439,7 +4482,8 @@ M.attempts_suffix = attempts_suffix
 -- appended so the result table doubles as a copyable link list.
 local function row_detail(row)
   if row.kind == "uploaded" then
-    local photo = row.photo_id and ("photo " .. tostring(row.photo_id)) or "uploaded"
+    local verb = row.replaced and "updated" or "uploaded"
+    local photo = row.photo_id and ((row.replaced and "updated photo " or "photo ") .. tostring(row.photo_id)) or verb
     local url_suffix = (row.url and row.url ~= "") and ("  " .. row.url) or ""
     if row.failed_actions and #row.failed_actions > 0 then
       return string.format("%s (%s update failed)%s%s", photo,
@@ -8255,8 +8299,15 @@ local function finalize(storage, image_table, extra_data)
     dt.print(rules.format_keyword_conflict(conflict))
   end
 
-  dt.print(string.format(_("Flickr: finished — %d uploaded, %d skipped, %d failed, %d post-upload error(s), %d album error(s), %d total"),
-    uploaded, skipped, failed, post_errors, album_errors, total))
+  -- Split uploads into freshly-created vs replaced-in-place so a mixed batch
+  -- reads "3 uploaded, 2 updated" rather than folding replaces into the
+  -- uploaded count (issue #60). When nothing was replaced the summary keeps its
+  -- historical single-count shape.
+  local fresh_uploads, replaced_uploads = report.uploaded_counts(extra_data)
+  dt.print(report.finalize_summary({
+    uploaded = fresh_uploads, updated = replaced_uploads, skipped = skipped,
+    failed = failed, post_errors = post_errors, album_errors = album_errors, total = total,
+  }, { translate = _ }))
   -- Name *which* images failed/were skipped, not just how many. The per-image
   -- dt.print messages emitted during store scroll out of view on a large batch,
   -- so without this the count line is the only end-state the user sees.
@@ -8277,8 +8328,8 @@ local function finalize(storage, image_table, extra_data)
     dt.print(string.format(_("Flickr: %d image(s) had keywords truncated to Flickr's %d-tag limit"),
       tag_limit_warnings, FLICKR_TAG_LIMIT))
   end
-  dt.print_log(string.format("[dtrmflickr] finalize: uploaded=%d skipped=%d failed=%d post_errors=%d album_errors=%d keyword_conflicts=%d tag_limit_warnings=%d total=%d",
-    uploaded, skipped, failed, post_errors, album_errors, keyword_conflicts, tag_limit_warnings, total))
+  dt.print_log(string.format("[dtrmflickr] finalize: uploaded=%d updated=%d skipped=%d failed=%d post_errors=%d album_errors=%d keyword_conflicts=%d tag_limit_warnings=%d total=%d",
+    fresh_uploads, replaced_uploads, skipped, failed, post_errors, album_errors, keyword_conflicts, tag_limit_warnings, total))
   -- Full per-image result grid (status + id/reason/error per row) goes to the
   -- log rather than the transient panel toast: it is the complete record for a
   -- large batch, where a multi-line grid in a toast would be unreadable. The
