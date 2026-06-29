@@ -6770,6 +6770,258 @@ M.publish_state_label = publish_state_label
 return M
 end
 
+package.preload["dtrmflickr.account_ui"] = function(...)
+-- account_ui.lua — the "Flickr: account login" Lua-options widget and its live
+-- session state, lifted out of the main module so it stops consuming the main
+-- chunk's tight per-function local budget (Lua caps locals per function; see
+-- tests/test_lua_limits.lua). The main module used to hold ~12 main-chunk locals
+-- for this one widget (status/verifier labels, the verifier entry, the
+-- pending-verifier and last-error session vars, the three buttons, the
+-- delete-permission opt-in check_button, short_error/refresh_status, and
+-- account_widget); they now live inside the build() closure below, leaving the
+-- main module a single handle to the returned table.
+--
+-- This is NOT a pure module: it constructs live darktable widgets and reads/writes
+-- the saved token, so it cannot run without darktable. To keep it offline-testable
+-- (tests/test_account_ui.lua), every darktable-side dependency is injected through
+-- build(deps) rather than reached for as a global:
+--   deps.dt              darktable (new_widget, preferences, print, print_log, gettext-free)
+--   deps.translate       gettext-style _(msgid) the caller already defined
+--   deps.PLUGIN          conf namespace ("dtrmflickr")
+--   deps.load_token      () -> account|nil   (reads the saved OAuth token)
+--   deps.save_token      (acc) -> ok, err    (used only to read back; callbacks call it)
+--   deps.clear_token     ()                  (logout)
+--   deps.get_credentials () -> key, secret   (API key/secret from prefs)
+--   deps.open_url        (url)               (launch the browser for authorize)
+-- The OAuth handshake (flickr_auth) and the token-expiry classifier (flickr_rest)
+-- are pure and required directly.
+--
+-- Shared globals (set elsewhere in the main module, by save_token/clear_token):
+--   __dtrmflickr_auth_revoked   bool — a saved token Flickr has since rejected.
+-- refresh_status reads it so a revoked session surfaces the re-login prompt; the
+-- note_auth_failure hook (returned for the main module to install as the global
+-- __dtrmflickr_note_auth_failure) sets it when a signed call fails with an
+-- expired/revoked token. save_token/clear_token clear it on a fresh login/logout.
+
+local auth = require "dtrmflickr.flickr_auth"
+local rest = require "dtrmflickr.flickr_rest"
+
+local M = {}
+
+-- build(deps) -> { widget, refresh_status, note_auth_failure }
+--   widget             the account-login box to register as the "lua" preference
+--   refresh_status     re-render the status line + widget visibility from current
+--                      token/session state; call once at startup and after any change
+--   note_auth_failure  install as __dtrmflickr_note_auth_failure; called from the
+--                      signed-call wrapper to flag an expired/revoked token
+function M.build(deps)
+  local dt = deps.dt
+  local _ = deps.translate
+  local PLUGIN = deps.PLUGIN
+  local load_token = deps.load_token
+  local save_token = deps.save_token
+  local clear_token = deps.clear_token
+  local get_credentials = deps.get_credentials
+  local open_url = deps.open_url
+
+  local status_label = dt.new_widget("label") { label = "" }
+  local verifier_label = dt.new_widget("label") { label = _("verifier code") }
+
+  local verifier_entry = dt.new_widget("entry") {
+    text = "",
+    placeholder = _("9-digit code from Flickr"),
+    tooltip = _("paste the code Flickr shows after you authorize"),
+  }
+
+  local pending = nil   -- { token, secret } held between 'log in' and 'complete login'
+  local last_error = nil
+  local complete_button
+  local login_button
+  local logout_button
+
+  local function short_error(err)
+    local s = tostring(err or ""):gsub("%s+", " ")
+    if #s > 160 then s = s:sub(1, 157) .. "..." end
+    return s
+  end
+
+  local function refresh_status()
+    local acc = load_token()
+    local logged_in = acc ~= nil
+    local waiting_for_verifier = pending ~= nil and not logged_in
+    -- A saved token that Flickr has since rejected (expired/revoked, code 98 or a
+    -- 401 on a signed call). We keep the token so the account name still shows, but
+    -- surface the re-login prompt loudly instead of pretending we are still logged
+    -- in. Cleared on a fresh login (save_token) and on logout (clear_token).
+    local revoked = logged_in and __dtrmflickr_auth_revoked == true
+
+    status_label.label = revoked
+        and string.format(_("status: login for %s expired or was revoked — log out and log in again"),
+          acc.username or acc.nsid)
+      or logged_in
+      and (last_error
+        and string.format(_("status: logged in as %s (not saved)"), acc.username or acc.nsid)
+        or string.format(_("status: logged in as %s"), acc.username or acc.nsid))
+      or last_error
+        and string.format(_("status: login failed: %s"), last_error)
+      or waiting_for_verifier
+        and _("status: authorize in browser, paste the code, then 'complete login'")
+        or  _("status: not logged in")
+
+    verifier_label.visible = waiting_for_verifier
+    verifier_entry.visible = waiting_for_verifier
+    if complete_button then complete_button.visible = waiting_for_verifier end
+    -- Offer the re-login button whenever there is no usable session: either no
+    -- token at all, or a saved-but-revoked one the user must replace.
+    if login_button then login_button.visible = (not logged_in) or revoked end
+    if logout_button then logout_button.visible = logged_in end
+  end
+
+  -- Called from the signed-call wrapper when a Flickr call fails. If the failure
+  -- is an expired/revoked token (NOT an ambiguous permission error — see
+  -- flickr_rest.AUTH_ERROR_CODES), mark the session as needing re-login, refresh
+  -- the account status, and print a one-time prompt so the user notices even when
+  -- the Lua-options pane is closed. Idempotent: re-flagging an already-revoked
+  -- session does not re-spam the prompt. A successful login clears the flag.
+  local function note_auth_failure(err)
+    if not rest.is_token_expired(err) then return end
+    -- Only meaningful while a token is actually saved; a call that fails with 98
+    -- after the user already logged out needs no prompt.
+    if not load_token() then return end
+    local already = __dtrmflickr_auth_revoked == true
+    __dtrmflickr_auth_revoked = true
+    refresh_status()
+    if not already then
+      dt.print(_("Flickr rejected your saved login — it has expired or been revoked. "
+        .. "Open Lua options > 'Flickr: account login' and log in again."))
+      dt.print_log("[dtrmflickr] auth token expired/revoked: " .. tostring(err))
+    end
+  end
+
+  -- "Request delete permission" toggle lives HERE, in the login area, rather than
+  -- as a standalone bool preference — on purpose. darktable only commits a bool
+  -- *preference* to config when the preferences dialog is closed: its value is
+  -- written by the dialog "response" handler, not on toggle (see darktable
+  -- src/lua/preferences.c response_callback_bool, wired in update_widget_bool). The
+  -- login button is embedded in that same dialog, so a freshly-ticked preference
+  -- checkbox is invisible to a login click in the same session, and the plugin
+  -- would silently fall back to write-only scope (issue: delete login asked for
+  -- write perms). A live check_button's `.value` is readable immediately, so
+  -- reading it at click time is correct without closing/reopening preferences. The
+  -- choice is mirrored into a hidden pref so it persists across restarts (written
+  -- immediately on toggle, unlike the dialog checkbox; read back to seed `value`).
+  local delete_perm_check = dt.new_widget("check_button") {
+    label = _("request delete permission on next login"),
+    tooltip = _("when on, the next Flickr login asks Flickr for permission to delete photos (required for 'delete from Flickr'). Leave off for normal use; tick this, then click 'log in to Flickr' — no need to close preferences first"),
+    value = dt.preferences.read(PLUGIN, "request_delete_perm", "bool") == true,
+  }
+  -- check_button fires clicked_callback (not changed_callback); see hidden_widget.
+  delete_perm_check.clicked_callback = function(widget)
+    dt.preferences.write(PLUGIN, "request_delete_perm", "bool", widget.value == true)
+    dt.print_log(string.format("[dtrmflickr] request_delete_perm toggled -> %s", tostring(widget.value == true)))
+  end
+
+  login_button = dt.new_widget("button") {
+    label = _("log in to Flickr…"),
+    clicked_callback = function()
+      last_error = nil
+      local key, secret = get_credentials()
+      if not key then
+        dt.print(_("Enter your Flickr API key and secret first."))
+        return
+      end
+      dt.print(_("Requesting Flickr authorization…"))
+      local tok, sec_or_err = auth.get_request_token(key, secret)
+      if not tok then
+        dt.print(_("Flickr request-token failed: ") .. tostring(sec_or_err))
+        dt.print_log("[dtrmflickr] request_token error: " .. tostring(sec_or_err))
+        return
+      end
+      pending = { token = tok, secret = sec_or_err }
+      -- Default to write scope; only request delete scope when the user explicitly
+      -- opted in (issue #19). Delete is never requested silently. Read the LIVE
+      -- check_button value, not the preference: a preference toggled in the same
+      -- still-open dialog has not been committed yet (see delete_perm_check above).
+      local want_delete = delete_perm_check.value == true
+      local url = auth.authorize_url(tok, auth.login_perms(want_delete))
+      open_url(url)
+      refresh_status()
+      if want_delete then
+        dt.print(_("Requesting DELETE permission — Flickr will ask to allow deleting your photos."))
+      end
+      dt.print(_("Opened Flickr in your browser. Paste the verifier code and click 'complete login'."))
+      dt.print_log("[dtrmflickr] authorize URL (open manually if browser didn't): " .. url)
+    end,
+  }
+
+  complete_button = dt.new_widget("button") {
+    label = _("complete login"),
+    clicked_callback = function()
+      if not pending then dt.print(_("Click 'log in to Flickr' first.")); return end
+      last_error = nil
+      local code = (verifier_entry.text or ""):gsub("%D", "")
+      if code == "" then dt.print(_("Enter the verifier code from Flickr.")); return end
+      local key, secret = get_credentials()
+      if not key then dt.print(_("Enter your Flickr API key and secret first.")); return end
+      local acc, err = auth.get_access_token(key, secret, pending.token, pending.secret, code)
+      if not acc then
+        last_error = short_error(err)
+        refresh_status()
+        dt.print(_("Flickr access-token failed: ") .. last_error)
+        dt.print_log("[dtrmflickr] access_token error: " .. tostring(err))
+        return
+      end
+      local saved, save_err = save_token(acc)
+      if not saved then
+        last_error = save_err
+        pending = nil
+        verifier_entry.text = ""
+        refresh_status()
+        dt.print(_("Flickr authorized for this session, but login was not saved: ") .. tostring(save_err))
+        dt.print_log("[dtrmflickr] password_save error: " .. tostring(save_err))
+        return
+      end
+      pending = nil
+      last_error = nil
+      verifier_entry.text = ""
+      refresh_status()
+      dt.print(string.format(_("Logged in to Flickr as %s"), acc.username or acc.nsid))
+      dt.print_log("[dtrmflickr] logged in, nsid=" .. tostring(acc.nsid))
+    end,
+  }
+
+  logout_button = dt.new_widget("button") {
+    label = _("log out"),
+    clicked_callback = function()
+      clear_token()
+      pending = nil
+      last_error = nil
+      refresh_status()
+      dt.print(_("Logged out of Flickr."))
+    end,
+  }
+
+  local account_widget = dt.new_widget("box") {
+    orientation = "vertical",
+    status_label,
+    delete_perm_check,
+    login_button,
+    verifier_label,
+    verifier_entry,
+    complete_button,
+    logout_button,
+  }
+
+  return {
+    widget = account_widget,
+    refresh_status = refresh_status,
+    note_auth_failure = note_auth_failure,
+  }
+end
+
+return M
+end
+
 package.preload["dtrmflickr.dtrmflickr"] = function(...)
 --[[ dtrmflickr — Flickr export/storage for darktable
 
@@ -6802,8 +7054,6 @@ package.preload["dtrmflickr.dtrmflickr"] = function(...)
 ]]
 
 local dt   = require "darktable"
-local auth = require "dtrmflickr.flickr_auth"   -- OAuth flow (tests/test_auth.lua);
-                                                -- pulls in dtrmflickr.oauth + dtrmflickr.http
 local http = require "dtrmflickr.http"
 local upload = require "dtrmflickr.flickr_upload"
 local rest = require "dtrmflickr.flickr_rest"
@@ -6820,6 +7070,7 @@ local groups = require "dtrmflickr.groups"  -- group/pool submission helpers (#3
 local widgets = require "dtrmflickr.widgets"
 local remote_pull = require "dtrmflickr.remote_pull"  -- pull remote edits back (#20)
 local panel_helpers = require "dtrmflickr.panel_helpers"  -- pure panel parse/index/label helpers (#46)
+local account_ui = require "dtrmflickr.account_ui"  -- account-login widget + session state (#47)
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -7137,193 +7388,27 @@ local function master_sync_fields()
   return fields
 end
 
-local status_label = dt.new_widget("label") { label = "" }
-local verifier_label = dt.new_widget("label") { label = _("verifier code") }
-
-local verifier_entry = dt.new_widget("entry") {
-  text = "",
-  placeholder = _("9-digit code from Flickr"),
-  tooltip = _("paste the code Flickr shows after you authorize"),
-}
-
-local pending = nil   -- { token, secret } held between 'log in' and 'complete login'
-local last_error = nil
-local complete_button
-local login_button
-local logout_button
-
-local function short_error(err)
-  local s = tostring(err or ""):gsub("%s+", " ")
-  if #s > 160 then s = s:sub(1, 157) .. "..." end
-  return s
-end
-
-local function refresh_status()
-  local acc = load_token()
-  local logged_in = acc ~= nil
-  local waiting_for_verifier = pending ~= nil and not logged_in
-  -- A saved token that Flickr has since rejected (expired/revoked, code 98 or a
-  -- 401 on a signed call). We keep the token so the account name still shows, but
-  -- surface the re-login prompt loudly instead of pretending we are still logged
-  -- in. Cleared on a fresh login (save_token) and on logout (clear_token).
-  local revoked = logged_in and __dtrmflickr_auth_revoked == true
-
-  status_label.label = revoked
-      and string.format(_("status: login for %s expired or was revoked — log out and log in again"),
-        acc.username or acc.nsid)
-    or logged_in
-    and (last_error
-      and string.format(_("status: logged in as %s (not saved)"), acc.username or acc.nsid)
-      or string.format(_("status: logged in as %s"), acc.username or acc.nsid))
-    or last_error
-      and string.format(_("status: login failed: %s"), last_error)
-    or waiting_for_verifier
-      and _("status: authorize in browser, paste the code, then 'complete login'")
-      or  _("status: not logged in")
-
-  verifier_label.visible = waiting_for_verifier
-  verifier_entry.visible = waiting_for_verifier
-  if complete_button then complete_button.visible = waiting_for_verifier end
-  -- Offer the re-login button whenever there is no usable session: either no
-  -- token at all, or a saved-but-revoked one the user must replace.
-  if login_button then login_button.visible = (not logged_in) or revoked end
-  if logout_button then logout_button.visible = logged_in end
-end
-
--- Called from __dtrmflickr_call when a signed Flickr call fails. If the failure
--- is an expired/revoked token (NOT an ambiguous permission error — see
--- flickr_rest.AUTH_ERROR_CODES), mark the session as needing re-login, refresh
--- the account status, and print a one-time prompt so the user notices even when
--- the Lua-options pane is closed. Idempotent: re-flagging an already-revoked
--- session does not re-spam the prompt. A successful login clears the flag.
-function __dtrmflickr_note_auth_failure(err)
-  if not rest.is_token_expired(err) then return end
-  -- Only meaningful while a token is actually saved; a call that fails with 98
-  -- after the user already logged out needs no prompt.
-  if not load_token() then return end
-  local already = __dtrmflickr_auth_revoked == true
-  __dtrmflickr_auth_revoked = true
-  refresh_status()
-  if not already then
-    dt.print(_("Flickr rejected your saved login — it has expired or been revoked. "
-      .. "Open Lua options > 'Flickr: account login' and log in again."))
-    dt.print_log("[dtrmflickr] auth token expired/revoked: " .. tostring(err))
-  end
-end
-
--- "Request delete permission" toggle lives HERE, in the login area, rather than
--- as a standalone bool preference — on purpose. darktable only commits a bool
--- *preference* to config when the preferences dialog is closed: its value is
--- written by the dialog "response" handler, not on toggle (see darktable
--- src/lua/preferences.c response_callback_bool, wired in update_widget_bool). The
--- login button is embedded in that same dialog, so a freshly-ticked preference
--- checkbox is invisible to a login click in the same session, and the plugin
--- would silently fall back to write-only scope (issue: delete login asked for
--- write perms). A live check_button's `.value` is readable immediately, so
--- reading it at click time is correct without closing/reopening preferences. The
--- choice is mirrored into a hidden pref so it persists across restarts (written
--- immediately on toggle, unlike the dialog checkbox; read back to seed `value`).
-local delete_perm_check = dt.new_widget("check_button") {
-  label = _("request delete permission on next login"),
-  tooltip = _("when on, the next Flickr login asks Flickr for permission to delete photos (required for 'delete from Flickr'). Leave off for normal use; tick this, then click 'log in to Flickr' — no need to close preferences first"),
-  value = dt.preferences.read(PLUGIN, "request_delete_perm", "bool") == true,
-}
--- check_button fires clicked_callback (not changed_callback); see hidden_widget.
-delete_perm_check.clicked_callback = function(widget)
-  dt.preferences.write(PLUGIN, "request_delete_perm", "bool", widget.value == true)
-  dt.print_log(string.format("[dtrmflickr] request_delete_perm toggled -> %s", tostring(widget.value == true)))
-end
-
-login_button = dt.new_widget("button") {
-  label = _("log in to Flickr…"),
-  clicked_callback = function()
-    last_error = nil
-    local key, secret = get_credentials()
-    if not key then
-      dt.print(_("Enter your Flickr API key and secret first."))
-      return
-    end
-    dt.print(_("Requesting Flickr authorization…"))
-    local tok, sec_or_err = auth.get_request_token(key, secret)
-    if not tok then
-      dt.print(_("Flickr request-token failed: ") .. tostring(sec_or_err))
-      dt.print_log("[dtrmflickr] request_token error: " .. tostring(sec_or_err))
-      return
-    end
-    pending = { token = tok, secret = sec_or_err }
-    -- Default to write scope; only request delete scope when the user explicitly
-    -- opted in (issue #19). Delete is never requested silently. Read the LIVE
-    -- check_button value, not the preference: a preference toggled in the same
-    -- still-open dialog has not been committed yet (see delete_perm_check above).
-    local want_delete = delete_perm_check.value == true
-    local url = auth.authorize_url(tok, auth.login_perms(want_delete))
-    open_url(url)
-    refresh_status()
-    if want_delete then
-      dt.print(_("Requesting DELETE permission — Flickr will ask to allow deleting your photos."))
-    end
-    dt.print(_("Opened Flickr in your browser. Paste the verifier code and click 'complete login'."))
-    dt.print_log("[dtrmflickr] authorize URL (open manually if browser didn't): " .. url)
-  end,
-}
-
-complete_button = dt.new_widget("button") {
-  label = _("complete login"),
-  clicked_callback = function()
-    if not pending then dt.print(_("Click 'log in to Flickr' first.")); return end
-    last_error = nil
-    local code = (verifier_entry.text or ""):gsub("%D", "")
-    if code == "" then dt.print(_("Enter the verifier code from Flickr.")); return end
-    local key, secret = get_credentials()
-    if not key then dt.print(_("Enter your Flickr API key and secret first.")); return end
-    local acc, err = auth.get_access_token(key, secret, pending.token, pending.secret, code)
-    if not acc then
-      last_error = short_error(err)
-      refresh_status()
-      dt.print(_("Flickr access-token failed: ") .. last_error)
-      dt.print_log("[dtrmflickr] access_token error: " .. tostring(err))
-      return
-    end
-    local saved, save_err = save_token(acc)
-    if not saved then
-      last_error = save_err
-      pending = nil
-      verifier_entry.text = ""
-      refresh_status()
-      dt.print(_("Flickr authorized for this session, but login was not saved: ") .. tostring(save_err))
-      dt.print_log("[dtrmflickr] password_save error: " .. tostring(save_err))
-      return
-    end
-    pending = nil
-    last_error = nil
-    verifier_entry.text = ""
-    refresh_status()
-    dt.print(string.format(_("Logged in to Flickr as %s"), acc.username or acc.nsid))
-    dt.print_log("[dtrmflickr] logged in, nsid=" .. tostring(acc.nsid))
-  end,
-}
-
-logout_button = dt.new_widget("button") {
-  label = _("log out"),
-  clicked_callback = function()
-    clear_token()
-    pending = nil
-    last_error = nil
-    refresh_status()
-    dt.print(_("Logged out of Flickr."))
-  end,
-}
-
-local account_widget = dt.new_widget("box") {
-  orientation = "vertical",
-  status_label,
-  delete_perm_check,
-  login_button,
-  verifier_label,
-  verifier_entry,
-  complete_button,
-  logout_button,
-}
+-- The account-login widget and its live session state (status/verifier widgets,
+-- pending-verifier + last-error vars, the login/complete/logout callbacks, the
+-- delete-permission opt-in, refresh_status, and the auth-failure hook) live in
+-- account_ui.lua (#47) so they no longer consume ~12 main-chunk locals here. Every
+-- darktable-side dependency is injected; the OAuth handshake and token-expiry
+-- classifier are required inside the module. `account.widget` is registered as the
+-- "lua" preference below; `account.refresh_status()` is called once at startup;
+-- `account.note_auth_failure` is installed as the global the signed-call wrapper
+-- invokes (it sets/reads __dtrmflickr_auth_revoked, which save_token/clear_token
+-- clear on a fresh login/logout).
+local account = account_ui.build({
+  dt = dt,
+  translate = _,
+  PLUGIN = PLUGIN,
+  load_token = load_token,
+  save_token = save_token,
+  clear_token = clear_token,
+  get_credentials = get_credentials,
+  open_url = open_url,
+})
+__dtrmflickr_note_auth_failure = account.note_auth_failure
 
 dt.preferences.register(PLUGIN, "api_secret", "string",
   _("Flickr: API secret"), _("Flickr app API secret used for OAuth request signing"), "")
@@ -7341,7 +7426,7 @@ dt.preferences.register(PLUGIN, "account_login", "lua",
   _("Flickr: account login"),
   _("authorize the default Flickr account used for uploads and lighttable sync"),
   "info",
-  account_widget,
+  account.widget,
   keep_label_pref)
 register_keyword_rule_preferences_reverse("keyword_license", _("license"), settings.license_values)
 register_keyword_rule_preferences_reverse("keyword_content_type", _("content type"), settings.content_type_values)
@@ -11604,7 +11689,7 @@ dt.register_event(PLUGIN .. "_selection_changed", "selection-changed", function(
   refresh_panel(false, http.quiet_rest_available())
 end)
 
-refresh_status()
+account.refresh_status()
 refresh_panel(false, http.quiet_rest_available())
 dt.print_log("[dtrmflickr] registered Flickr export storage (step 3); " .. TRANSPORT_MSG)
 
