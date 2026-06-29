@@ -1754,6 +1754,22 @@ function M.set_published_at(image, account_nsid, stamp)
   return stamp
 end
 
+-- Re-mark an already-linked image as published/current without re-uploading
+-- pixels (issue #17). Fixes up drifted stored state: refreshes the image and
+-- metadata publish stamps, clears any needs-republish reasons, and — unlike a
+-- bare set_published_at — snapshots the supplied metadata fingerprints so a later
+-- evaluate_publish_state compares edits against a real baseline instead of
+-- flipping the photo back to "needs-sync"/"unknown". Returns false (without
+-- touching anything) when the image is not linked to this account: there is no
+-- published photo to re-mark.
+function M.mark_published(image, account_nsid, stamp, fingerprints)
+  assert_component("account id", account_nsid)
+  if not M.get_photo_id(image, account_nsid) then return false end
+  local applied = M.set_published_at(image, account_nsid, stamp)
+  if fingerprints then M.set_fingerprints(image, account_nsid, fingerprints) end
+  return true, applied
+end
+
 function M.mark_reason(image, account_nsid, reason)
   assert_component("account id", account_nsid)
   assert_component("reason", reason)
@@ -7024,6 +7040,40 @@ function panel_sets.clear_needs_republish()
   dt.print(_("Flickr: cleared selected photo's needs-sync marker."))
 end
 
+-- "mark as published" (issue #17): re-mark the linked photo(s) in the current
+-- selection as published/current without re-uploading pixels. Reconciles drifted
+-- state — refreshes the publish stamps, clears needs-sync, and snapshots the
+-- current metadata fingerprints so the photo stays "current" instead of drifting
+-- back to needs-sync/unknown. Unlinked images are skipped and reported. Works on
+-- a multi-selection, not just a single image like "clear needs sync".
+function panel_sets.mark_published_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection == 0 then
+    dt.print(_("Flickr: select one or more linked images before marking as published."))
+    return
+  end
+  local acc = load_token()
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before marking as published."))
+    return
+  end
+  local sync = master_sync_fields()
+  local marked, skipped = 0, 0
+  for _, image in ipairs(selection) do
+    local fingerprints = effective_metadata_fingerprints
+      and effective_metadata_fingerprints(image, sync) or nil
+    if state.mark_published(image, acc.nsid, image.change_timestamp or nil, fingerprints) then
+      marked = marked + 1
+    else
+      skipped = skipped + 1
+    end
+  end
+  refresh_panel(true, false)
+  panel_remote_label.label = string.format(
+    _("Flickr: marked %d photo(s) as published (%d not linked, skipped)"), marked, skipped)
+  dt.print(panel_remote_label.label)
+end
+
 function panel_sets.scan_selected_publish_state()
   local selection = dt.gui.selection and dt.gui.selection() or {}
   if #selection == 0 then
@@ -7448,6 +7498,11 @@ local panel_widget = dt.new_widget("box") {
       label = _("clear needs sync"),
       clicked_callback = function() panel_sets.clear_needs_republish() end,
     },
+  },
+  dt.new_widget("button") {
+    label = _("mark as published"),
+    tooltip = _("re-mark the linked photo(s) as published/current without re-uploading; reconciles drifted state"),
+    clicked_callback = function() panel_sets.mark_published_selection() end,
   },
   dt.new_widget("button") {
     label = _("scan selected"),
