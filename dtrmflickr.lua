@@ -1462,13 +1462,22 @@ function M.photos_set_perms(api_key, api_secret, account, photo_id, is_public, i
   return true
 end
 
-function M.photos_set_safety_level(api_key, api_secret, account, photo_id, safety_level)
+-- Set a photo's safety level and/or its hide-from-public-search flag.
+-- flickr.photos.setSafetyLevel accepts BOTH params; each is optional but at least
+-- one must be present (Flickr error 2 otherwise). `hidden` uses this method's own
+-- mapping: 1 = hide from public searches, 0 = include. We only ever send 1 (hide)
+-- on a resend — see the replace path — so an unset/nil `hidden` leaves the photo's
+-- current visibility untouched (the REST layer omits nil params).
+function M.photos_set_safety_level(api_key, api_secret, account, photo_id, safety_level, hidden)
   if not photo_id or photo_id == "" then return nil, "missing photo id" end
-  if safety_level == nil or safety_level == "" then return nil, "missing safety level" end
+  if (safety_level == nil or safety_level == "") and (hidden == nil or hidden == "") then
+    return nil, "missing safety level or hidden flag"
+  end
 
   local body, err = M.call(api_key, api_secret, account, "flickr.photos.setSafetyLevel", {
     photo_id = photo_id,
     safety_level = safety_level,
+    hidden = hidden,
   })
   if not body then return nil, err end
   return true
@@ -8951,10 +8960,21 @@ local function store(storage, image, format, filename, number, total, high_quali
             sync.permissions and permissions.perm_addmeta or nil)
         end)
       end
-      if sync.safety or forced.safety then
+      -- setSafetyLevel carries the safety level AND the hide-from-public-search
+      -- flag (issue #61). A fresh upload sends hidden=1 only when the user checked
+      -- the hide-from-search box; a replace carries no metadata, so re-assert that
+      -- intent here through the same call. hidden is sent ONLY when the box is
+      -- checked (hide_from_search) — matching fresh-upload semantics so a resend
+      -- never silently un-hides a photo whose box happens to be unchecked. The
+      -- call runs whenever safety is being synced OR a hide is requested, so the
+      -- hide can land even when the safety level itself is not being pushed.
+      local want_safety = sync.safety or forced.safety
+      local hidden_param = hide_from_search and 1 or nil
+      if want_safety or hidden_param then
         push_meta("flickr.photos.setSafetyLevel", { "safety" }, "safety", function()
           return rest.photos_set_safety_level(extra_data.api_key, extra_data.api_secret,
-            extra_data.account, photo_id, safety.flickr_value)
+            extra_data.account, photo_id,
+            want_safety and safety.flickr_value or nil, hidden_param)
         end)
       end
       if sync.content_type or forced.content_type then
