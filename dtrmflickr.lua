@@ -721,7 +721,11 @@ end
 local function parse_upload_response(body)
   body = tostring(body or "")
   if body:find('stat%s*=%s*"ok"') or body:find("stat%s*=%s*'ok'") then
-    local photo_id = body:match("<photoid>(.-)</photoid>")
+    -- The upload endpoint returns a bare <photoid>ID</photoid>; the replace
+    -- endpoint returns it with attributes
+    -- (<photoid secret=".." originalsecret="..">ID</photoid>). Tolerate
+    -- attributes on the open tag so this parser handles both responses.
+    local photo_id = body:match("<photoid[^>]*>(.-)</photoid>")
     if photo_id and photo_id ~= "" then return xml_unescape(photo_id) end
     local ticket_id = body:match("<ticketid>(.-)</ticketid>")
     if ticket_id and ticket_id ~= "" then
@@ -833,6 +837,50 @@ function M.upload_photo(api_key, api_secret, account, filename, opts)
 
   local photo_id, err, ticket_id = parse_upload_response(body)
   if photo_id then return photo_id end
+  if ticket_id then return resolve_ticket(api_key, ticket_id, opts) end
+  return nil, err
+end
+
+M.REPLACE_URL = "https://up.flickr.com/services/replace/"
+
+-- replace_photo(...) -> photo_id | nil, err
+--
+-- Replaces the pixels of an existing Flickr photo in place, keeping its id,
+-- URL, comments, faves, and stats. This is how a re-export updates an
+-- already-published image instead of creating a duplicate (the upload endpoint
+-- has no dedupe key and always makes a new photo).
+--
+-- The replace endpoint signs and accepts only `photo_id` plus the OAuth params;
+-- the binary `photo` part is excluded from the signature exactly like upload. It
+-- carries NO metadata (title/tags/privacy/...), so callers push those via REST
+-- after a successful replace. Like upload it can return an async ticket; resolve
+-- it through the same idempotent checkTickets poll. On success Flickr echoes the
+-- same photo id (with secret attributes); we still return it for the caller.
+--
+-- account: { token = "...", secret = "..." }
+-- opts: sleep_fn / ticket_attempts / ticket_poll_ms (see resolve_ticket)
+function M.replace_photo(api_key, api_secret, account, filename, photo_id, opts)
+  if not account or not account.token or not account.secret then
+    return nil, "not logged in to Flickr"
+  end
+  if not filename or filename == "" then
+    return nil, "missing upload filename"
+  end
+  photo_id = tostring(photo_id or "")
+  if photo_id == "" then
+    return nil, "missing photo id to replace"
+  end
+  opts = opts or {}
+
+  local params = base_params(api_key, account.token)
+  params.photo_id = photo_id
+
+  params.oauth_signature = oauth.signature("POST", M.REPLACE_URL, params, api_secret, account.secret)
+  local body, transport_err = M.http.post_multipart(M.REPLACE_URL, params, "photo", filename)
+  if not body then return nil, transport_err end
+
+  local new_id, err, ticket_id = parse_upload_response(body)
+  if new_id then return new_id end
   if ticket_id then return resolve_ticket(api_key, ticket_id, opts) end
   return nil, err
 end
@@ -7516,38 +7564,57 @@ local function store(storage, image, format, filename, number, total, high_quali
     tags, truncated_tags = rules.image_keyword_tags(image)
     record_tag_limit_warning(extra_data, image, truncated_tags)
   end
-  dt.print(string.format(_("Flickr: uploading %d/%d — %s"), number, total, image.filename or "?"))
-  -- Do NOT auto-retry the upload itself. Flickr's upload endpoint is not
-  -- idempotent and exposes no dedupe key, so a transient timeout *after* the
-  -- pixels reached Flickr would create a duplicate photo on retry. We cannot
-  -- tell "never sent" from "sent but the ack was lost" from the error string,
-  -- so the safe choice is one attempt: a transient upload failure fails just
-  -- this image (reported, the batch continues) and the user re-exports it. The
-  -- idempotent post-upload REST calls below keep their normal retry/backoff.
-  local photo_id, err = __dtrmflickr_call("flickr.upload", function()
-    return upload.upload_photo(extra_data.api_key, extra_data.api_secret, extra_data.account, filename, {
-      title = sync.title and metadata.image_title(image, filename) or nil,
-      description = sync.description and image and image.description or nil,
-      tags = tags,
-      is_public = (sync.privacy or forced.privacy) and privacy.is_public or nil,
-      is_friend = (sync.privacy or forced.privacy) and privacy.is_friend or nil,
-      is_family = (sync.privacy or forced.privacy) and privacy.is_family or nil,
-      safety_level = (sync.safety or forced.safety) and safety.flickr_value or nil,
-      content_type = (sync.content_type or forced.content_type) and content_type.flickr_value or nil,
-      perm_comment = sync.permissions and permissions.perm_comment or nil,
-      perm_addmeta = sync.permissions and permissions.perm_addmeta or nil,
-      -- Upload-only option (no resend equivalent): omit unless the user opted in,
-      -- so Flickr keeps the account's default search visibility otherwise.
-      hidden = hide_from_search and 1 or nil,
-      -- If Flickr returns an async ticket instead of a photo id, resolve it
-      -- (idempotent checkTickets poll) rather than reporting a false failure
-      -- that would prompt a duplicate-creating re-export. Poll waits use
-      -- darktable's millisecond sleep.
-      sleep_fn = function(ms)
-        if dt.control and dt.control.sleep then dt.control.sleep(math.floor(tonumber(ms) or 0)) end
-      end,
-    })
-  end, { max_attempts = 1 })
+  -- If this image already carries a stored Flickr photo id for the active
+  -- account, a re-export must UPDATE that photo in place (Flickr replace
+  -- endpoint) instead of uploading a fresh copy, which would duplicate it.
+  -- Replace keeps the id/URL/comments/faves/stats; the current darktable
+  -- metadata is pushed via REST below so the existing photo ends up matching
+  -- what a fresh upload of this image now would produce.
+  local existing_photo_id = state.get_photo_id(image, extra_data.account.nsid)
+  local is_replace = existing_photo_id ~= nil and existing_photo_id ~= ""
+  -- Do NOT auto-retry the pixel op. Flickr's upload endpoint is not idempotent
+  -- and exposes no dedupe key, so a transient timeout *after* the pixels reached
+  -- Flickr would create a duplicate photo on retry. We cannot tell "never sent"
+  -- from "sent but the ack was lost" from the error string, so the safe choice
+  -- is one attempt: a transient failure fails just this image (reported, the
+  -- batch continues) and the user re-exports it. Replace targets a fixed
+  -- photo_id and cannot duplicate, but a partial transfer is still ambiguous, so
+  -- it also keeps a single attempt. The idempotent post-upload REST calls below
+  -- keep their normal retry/backoff. A sleep_fn lets either endpoint resolve an
+  -- async ticket via the idempotent checkTickets poll rather than reporting a
+  -- false failure that would invite a duplicate-creating re-export.
+  local function pixel_sleep(ms)
+    if dt.control and dt.control.sleep then dt.control.sleep(math.floor(tonumber(ms) or 0)) end
+  end
+  local photo_id, err
+  if is_replace then
+    dt.print(string.format(_("Flickr: updating %d/%d — %s (photo %s)"),
+      number, total, image.filename or "?", existing_photo_id))
+    photo_id, err = __dtrmflickr_call("flickr.replace", function()
+      return upload.replace_photo(extra_data.api_key, extra_data.api_secret,
+        extra_data.account, filename, existing_photo_id, { sleep_fn = pixel_sleep })
+    end, { max_attempts = 1 })
+  else
+    dt.print(string.format(_("Flickr: uploading %d/%d — %s"), number, total, image.filename or "?"))
+    photo_id, err = __dtrmflickr_call("flickr.upload", function()
+      return upload.upload_photo(extra_data.api_key, extra_data.api_secret, extra_data.account, filename, {
+        title = sync.title and metadata.image_title(image, filename) or nil,
+        description = sync.description and image and image.description or nil,
+        tags = tags,
+        is_public = (sync.privacy or forced.privacy) and privacy.is_public or nil,
+        is_friend = (sync.privacy or forced.privacy) and privacy.is_friend or nil,
+        is_family = (sync.privacy or forced.privacy) and privacy.is_family or nil,
+        safety_level = (sync.safety or forced.safety) and safety.flickr_value or nil,
+        content_type = (sync.content_type or forced.content_type) and content_type.flickr_value or nil,
+        perm_comment = sync.permissions and permissions.perm_comment or nil,
+        perm_addmeta = sync.permissions and permissions.perm_addmeta or nil,
+        -- Upload-only option (no resend equivalent): omit unless the user opted in,
+        -- so Flickr keeps the account's default search visibility otherwise.
+        hidden = hide_from_search and 1 or nil,
+        sleep_fn = pixel_sleep,
+      })
+    end, { max_attempts = 1 })
+  end
   -- Track the worst (max) attempt count across this image's upload and its
   -- post-upload setters so the per-image result row can report how many tries
   -- the image took. Upload is max_attempts=1 (always 1); a retry only shows up
@@ -7558,6 +7625,71 @@ local function store(storage, image, format, filename, number, total, high_quali
     state.set_image_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
     local post_failed = false
     local failed_metadata_fields = {}
+    -- A replace carries no metadata (the endpoint only accepts the photo id and
+    -- pixels), so push the current darktable values to the existing photo via
+    -- REST, gated by the same sync/forced flags a fresh upload uses. The REST
+    -- layer omits nil params, so an unsynced field is left untouched on Flickr.
+    -- A fresh upload already sent these inline in its multipart body, so this
+    -- block runs only for the replace path. Each push folds into the same
+    -- post_failed / failed_metadata_fields / reason bookkeeping as the
+    -- license/date/geo setters below.
+    local function push_meta(method, reasons, action_label, fn)
+      local ok, perr = __dtrmflickr_call(method, fn)
+      image_attempts = math.max(image_attempts, __dtrmflickr_queue:last_attempts())
+      for _, reason in ipairs(reasons) do
+        if not ok then
+          failed_metadata_fields[reason] = true
+          state.mark_reason(image, extra_data.account.nsid, reason)
+        else
+          state.clear_reason(image, extra_data.account.nsid, reason)
+        end
+      end
+      if not ok then
+        post_failed = true
+        record_post_error(extra_data, image, photo_id, action_label, perr)
+      end
+    end
+    if is_replace then
+      local meta_title = sync.title and metadata.image_title(image, filename) or nil
+      local meta_desc = sync.description and image and image.description or nil
+      if meta_title ~= nil or meta_desc ~= nil then
+        push_meta("flickr.photos.setMeta", { "title_description" }, "title/description", function()
+          return rest.photos_set_meta(extra_data.api_key, extra_data.api_secret,
+            extra_data.account, photo_id, meta_title, meta_desc)
+        end)
+      end
+      if sync.tags then
+        push_meta("flickr.photos.setTags", { "keywords" }, "tags", function()
+          return rest.photos_set_tags(extra_data.api_key, extra_data.api_secret,
+            extra_data.account, photo_id, tags or "")
+        end)
+      end
+      if sync.privacy or forced.privacy then
+        -- setPerms requires the privacy triple, so it can only run when privacy
+        -- is being synced; the comment/addmeta perms ride along when their own
+        -- sync flag is on (nil otherwise leaves them untouched).
+        local perm_reasons = { "visibility" }
+        if sync.permissions then perm_reasons[#perm_reasons + 1] = "permissions" end
+        push_meta("flickr.photos.setPerms", perm_reasons, "privacy/permissions", function()
+          return rest.photos_set_perms(extra_data.api_key, extra_data.api_secret,
+            extra_data.account, photo_id, privacy.is_public, privacy.is_friend, privacy.is_family,
+            sync.permissions and permissions.perm_comment or nil,
+            sync.permissions and permissions.perm_addmeta or nil)
+        end)
+      end
+      if sync.safety or forced.safety then
+        push_meta("flickr.photos.setSafetyLevel", { "safety" }, "safety", function()
+          return rest.photos_set_safety_level(extra_data.api_key, extra_data.api_secret,
+            extra_data.account, photo_id, safety.flickr_value)
+        end)
+      end
+      if sync.content_type or forced.content_type then
+        push_meta("flickr.photos.setContentType", { "content_type" }, "content type", function()
+          return rest.photos_set_content_type(extra_data.api_key, extra_data.api_secret,
+            extra_data.account, photo_id, content_type.flickr_value)
+        end)
+      end
+    end
     if sync.license or forced.license then
       local license_ok, license_err = __dtrmflickr_call("flickr.photos.licenses.setLicense", function()
         return rest.photos_licenses_set_license(extra_data.api_key, extra_data.api_secret,
@@ -7629,9 +7761,14 @@ local function store(storage, image, format, filename, number, total, high_quali
       state.set_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
       store_metadata_fingerprints(image, extra_data.account.nsid, upload_fingerprints)
     end
-    extra_data.uploaded[#extra_data.uploaded + 1] = { image = image, filename = filename, photo_id = photo_id, attempts = image_attempts }
-    dt.print(string.format(_("Flickr: uploaded %s as photo %s"), image.filename or "image", photo_id))
-    dt.print_log(string.format("[dtrmflickr] store: uploaded '%s' -> photo_id=%s", filename, photo_id))
+    extra_data.uploaded[#extra_data.uploaded + 1] = { image = image, filename = filename, photo_id = photo_id, attempts = image_attempts, replaced = is_replace }
+    if is_replace then
+      dt.print(string.format(_("Flickr: updated %s (photo %s) in place"), image.filename or "image", photo_id))
+      dt.print_log(string.format("[dtrmflickr] store: replaced '%s' -> photo_id=%s", filename, photo_id))
+    else
+      dt.print(string.format(_("Flickr: uploaded %s as photo %s"), image.filename or "image", photo_id))
+      dt.print_log(string.format("[dtrmflickr] store: uploaded '%s' -> photo_id=%s", filename, photo_id))
+    end
   else
     extra_data.failed[#extra_data.failed + 1] = { image = image, filename = filename, error = err, attempts = image_attempts }
     dt.print(string.format(_("Flickr: upload failed for %s: %s"), image.filename or "image", tostring(err)))
