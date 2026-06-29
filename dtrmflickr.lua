@@ -1825,6 +1825,82 @@ function M.classify_reasons(reasons)
   return "none"
 end
 
+-- Human-friendly labels for diff reasons, surfaced in the panel (issue #18).
+-- `image` is the pixel reupload; the rest mirror the metadata reason keys.
+local reason_labels = {
+  image = "image pixels",
+  keywords = "keywords",
+  title_description = "title/description",
+  gps = "GPS location",
+  date_taken = "date taken",
+  visibility = "visibility",
+  safety = "safety level",
+  content_type = "content type",
+  license = "license",
+  permissions = "permissions",
+}
+
+-- Stable display order: pixels first, then metadata fields in a fixed sequence
+-- so the panel breakdown reads the same way every refresh regardless of the
+-- alphabetical tag order get_reasons returns.
+local reason_order = {
+  "image", "title_description", "keywords", "gps", "date_taken",
+  "visibility", "safety", "content_type", "license", "permissions",
+}
+local reason_rank = {}
+for i, reason in ipairs(reason_order) do reason_rank[reason] = i end
+
+function M.reason_label(reason)
+  reason = tostring(reason or "")
+  return reason_labels[reason] or reason
+end
+
+-- describe_reasons(reasons) -> friendly, de-duplicated, stably ordered string
+-- (e.g. "title/description, GPS location"). Unknown reasons fall through to
+-- their raw key and sort after the known ones. Returns "" for an empty set.
+function M.describe_reasons(reasons)
+  local seen, ordered = {}, {}
+  for _, reason in ipairs(reasons or {}) do
+    reason = tostring(reason or "")
+    if reason ~= "" and not seen[reason] then
+      seen[reason] = true
+      ordered[#ordered + 1] = reason
+    end
+  end
+  table.sort(ordered, function(a, b)
+    local ra, rb = reason_rank[a], reason_rank[b]
+    if ra and rb then return ra < rb end
+    if ra then return true end
+    if rb then return false end
+    return a < b
+  end)
+  local labels = {}
+  for _, reason in ipairs(ordered) do labels[#labels + 1] = M.reason_label(reason) end
+  return table.concat(labels, ", ")
+end
+
+-- describe_reason_tally(tally) -> friendly per-field breakdown with counts
+-- (e.g. "title/description (3), GPS location (1)"). `tally` maps reason key ->
+-- count; zero/negative counts are skipped. Returns "" when nothing tallied.
+function M.describe_reason_tally(tally)
+  local keys = {}
+  for reason, count in pairs(tally or {}) do
+    if (tonumber(count) or 0) > 0 then keys[#keys + 1] = tostring(reason) end
+  end
+  table.sort(keys, function(a, b)
+    local ra, rb = reason_rank[a], reason_rank[b]
+    if ra and rb then return ra < rb end
+    if ra then return true end
+    if rb then return false end
+    return a < b
+  end)
+  local parts = {}
+  for _, reason in ipairs(keys) do
+    parts[#parts + 1] = string.format("%s (%d)", M.reason_label(reason), tonumber(tally[reason]))
+  end
+  return table.concat(parts, ", ")
+end
+
 function M.clear_metadata_reasons(image, account_nsid)
   local removed = 0
   for reason in pairs(metadata_reasons) do
@@ -6156,6 +6232,9 @@ local function panel_reset_remote(message)
   panel_comment_perm_widget.sensitive = false
   panel_addmeta_perm_widget.sensitive = false
   panel_current.remote_loaded = false
+  -- The remote widgets no longer reflect any loaded photo, so drop the
+  -- "already loaded" marker; the next selection must re-fetch.
+  panel_sets.last_remote_load = nil
 end
 
 function panel_sets.update_photo_link_buttons(selection, account, current_photo_id)
@@ -6687,6 +6766,11 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   panel_comment_perm_widget.sensitive = acc ~= nil and not perms_unavailable
   panel_addmeta_perm_widget.sensitive = acc ~= nil and not perms_unavailable
   panel_current.remote_loaded = true
+  -- Remember exactly which (image, photo_id, account) we just pulled so a
+  -- repeated/duplicate selection of the SAME published photo doesn't re-issue
+  -- the getInfo/getPerms/getContentType trio (3 queue jobs per click). Any
+  -- panel_reset_remote (selection actually moving, logout, edit) clears this.
+  panel_sets.last_remote_load = { image = panel_current.image, photo_id = photo_id, nsid = acc and acc.nsid or nil }
   panel_remote_label.label = perms_unavailable
     and _("Flickr: remote settings loaded; permissions unavailable")
     or content_type_index
@@ -7173,7 +7257,9 @@ end
 local function publish_state_label(status, published_at, reasons)
   local suffix = published_at and (" (" .. published_at .. ")") or ""
   if reasons and #reasons > 0 then
-    suffix = suffix .. ": " .. table.concat(reasons, ", ")
+    local described = state.describe_reasons and state.describe_reasons(reasons)
+      or table.concat(reasons, ", ")
+    suffix = suffix .. ": " .. described
   end
   if status == "current" then
     return string.format(_("publish state: current%s"), suffix)
@@ -7295,16 +7381,30 @@ function panel_sets.scan_selected_publish_state()
     return
   end
   local counts = { ["needs-republish"] = 0, current = 0, unknown = 0, unpublished = 0 }
+  local field_tally = {}
   local sync = master_sync_fields()
   for _, image in ipairs(selection) do
-    local status = state.evaluate_publish_state(image, acc.nsid, {
+    local status, _published_at, _photo_id, reasons = state.evaluate_publish_state(image, acc.nsid, {
       metadata_fingerprints = effective_metadata_fingerprints and effective_metadata_fingerprints(image, sync) or nil,
     })
     counts[status] = (counts[status] or 0) + 1
+    -- Tally each distinct diff reason once per image so the per-field breakdown
+    -- counts photos, not duplicate reason tags on a single photo.
+    local seen = {}
+    for _, reason in ipairs(reasons or {}) do
+      if not seen[reason] then
+        seen[reason] = true
+        field_tally[reason] = (field_tally[reason] or 0) + 1
+      end
+    end
   end
   refresh_panel(true, false)
   dt.print(string.format(_("Flickr: scanned %d selected photo(s): %d need sync, %d current, %d unknown, %d unpublished"),
     #selection, counts["needs-republish"] or 0, counts.current or 0, counts.unknown or 0, counts.unpublished or 0))
+  local breakdown = state.describe_reason_tally and state.describe_reason_tally(field_tally) or ""
+  if breakdown ~= "" then
+    dt.print(string.format(_("Flickr: fields needing sync: %s"), breakdown))
+  end
 end
 
 -- Clear the ambiguous-candidate picker (issue #16).
@@ -7528,6 +7628,11 @@ function refresh_panel(force, fetch_remote)
       panel_reset_remote(_("Flickr: API key required for public photo info"))
       return
     end
+    local lr = panel_sets.last_remote_load
+    if not force and lr and lr.image == image and lr.photo_id == tagged_photo_id and lr.nsid == nil then
+      panel_current.remote_loaded = true  -- same photo already loaded; don't re-hit Flickr
+      return
+    end
     load_remote_settings(api_key, nil, nil, tagged_photo_id)
     return
   end
@@ -7549,6 +7654,16 @@ function refresh_panel(force, fetch_remote)
   end
   if not fetch_remote then
     panel_reset_remote(_("Flickr: stored photo ID found; click refresh to load remote settings"))
+    return
+  end
+
+  -- Skip the remote fetch when this exact (image, photo_id, account) is already
+  -- loaded and the caller did not force a refresh (the explicit refresh button
+  -- and post-edit refreshes pass force=true). Stops re-selecting the same
+  -- published photo from re-issuing getInfo + getPerms + getContentType.
+  local lr = panel_sets.last_remote_load
+  if not force and lr and lr.image == image and lr.photo_id == photo_id and lr.nsid == acc.nsid then
+    panel_current.remote_loaded = true
     return
   end
 
