@@ -1524,6 +1524,47 @@ function M.photos_geo_set_location(api_key, api_secret, account, photo_id, lat, 
   return true
 end
 
+-- Remove the geo (location) data from a photo (flickr.photos.geo.removeLocation).
+-- This is the privacy "strip GPS" / "remove location" operation (issue #23).
+-- Flickr returns REST error 2 ("Photo has no location information") when the
+-- photo was never geotagged; for an idempotent strip that is the desired end
+-- state, so we treat code 2 as success (nothing to remove = already stripped).
+-- Requires a token with 'write' permission.
+function M.photos_geo_remove_location(api_key, api_secret, account, photo_id)
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+
+  local body, err = M.call(api_key, api_secret, account, "flickr.photos.geo.removeLocation", {
+    photo_id = photo_id,
+  })
+  if not body then
+    if tonumber(tostring(err or ""):match("Flickr REST failed %((%d+)%)")) == 2 then
+      return true   -- already has no location; the strip is a no-op success
+    end
+    return nil, err
+  end
+  return true
+end
+
+-- Set who may view the geo data of a photo (flickr.photos.geo.setPerms). All four
+-- audience flags are required by Flickr; pass 1/0. Provided for geo-privacy
+-- overrides (issue #23) — e.g. keep the location on Flickr but restrict who sees
+-- it, rather than removing it outright. Requires 'write' permission.
+function M.photos_geo_set_perms(api_key, api_secret, account, photo_id, is_public, is_contact, is_friend, is_family)
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+
+  local function flag(v) return (v == true or tostring(v) == "1") and "1" or "0" end
+  local body, err = M.call(api_key, api_secret, account, "flickr.photos.geo.setPerms", {
+    photo_id = photo_id,
+    is_public = flag(is_public),
+    is_contact = flag(is_contact),
+    is_friend = flag(is_friend),
+    is_family = flag(is_family),
+    _allow_empty = { is_public = true, is_contact = true, is_friend = true, is_family = true },
+  })
+  if not body then return nil, err end
+  return true
+end
+
 -- Parse a flickr.photos.upload.checkTickets response into a map keyed by ticket
 -- id. Each entry: { id, complete = 0|1|2|nil, photo_id = "..."|nil, invalid }.
 -- Flickr's status attribute is historically named `complete` (0 = processing,
@@ -2580,6 +2621,22 @@ function M.geo_date_resend_plan(sync, date_taken, lat, lon)
   return { send_date = send_date or false, send_gps = send_gps or false }
 end
 
+-- geo_resend_action(gps_enabled, strip, has_coords): decide what an upload or
+-- resend should do with a photo's location (issue #23). Privacy-first: when the
+-- "strip GPS on resend" toggle is on it always wins over "sync GPS location", so
+-- a (re)upload/resend can never leak coordinates the user asked to strip — even if
+-- Flickr auto-geotagged the photo from the file's EXIF. Returns:
+--   "remove" — strip is on; call flickr.photos.geo.removeLocation (idempotent).
+--   "send"   — GPS sync on, not stripping, and the image carries usable coords;
+--              call flickr.photos.geo.setLocation.
+--   "skip"   — nothing to do (sync off, or no coords to send).
+-- Pure/offline-testable.
+function M.geo_resend_action(gps_enabled, strip, has_coords)
+  if strip == true then return "remove" end
+  if gps_enabled == true and has_coords == true then return "send" end
+  return "skip"
+end
+
 -- metadata_resend_plan(sync, reasons): decide which metadata-only operations a
 -- batch/multi-select resend should push for one photo (issue #18). It sends only
 -- fields that BOTH changed (a needs-sync reason is present) AND are enabled by the
@@ -2596,7 +2653,10 @@ function M.metadata_resend_plan(sync, reasons)
     send_meta = ((sync.title == true) or (sync.description == true)) and flagged.title_description == true,
     send_tags = (sync.tags == true) and flagged.keywords == true,
     send_date = (sync.date_taken == true) and flagged.date_taken == true,
-    send_gps  = (sync.gps == true) and flagged.gps == true,
+    -- Privacy-first: "strip GPS on resend" suppresses the metadata-only GPS push so
+    -- a batch resend never re-sends coordinates the user asked to strip (issue #23).
+    -- Explicit removal is the dedicated "remove Flickr location" panel action.
+    send_gps  = (sync.gps == true) and flagged.gps == true and (sync.strip_gps ~= true),
   }
   plan.any = plan.send_meta or plan.send_tags or plan.send_date or plan.send_gps
   return plan
@@ -4180,6 +4240,10 @@ M.sync_field_defaults = {
   tags = true,
   date_taken = true,
   gps = false,
+  -- strip_gps: privacy-first "strip GPS on resend" toggle (issue #23). When on it
+  -- wins over `gps`, so every upload/resend removes the photo's location on Flickr
+  -- (geo.removeLocation) instead of sending coordinates. Default off.
+  strip_gps = false,
   privacy = true,
   safety = true,
   content_type = true,
@@ -5849,6 +5913,8 @@ local sync_description_widget = sync_check_button("description", _("description"
 local sync_tags_widget = sync_check_button("tags", _("keywords"), _("send darktable keywords/tags to Flickr"))
 local sync_date_taken_widget = sync_check_button("date_taken", _("date taken"), _("send darktable date taken to Flickr"))
 local sync_gps_widget = sync_check_button("gps", _("GPS location"), _("send darktable GPS location to Flickr"))
+local sync_strip_gps_widget = sync_check_button("strip_gps", _("strip GPS on resend (privacy)"),
+  _("remove the photo's location on Flickr on every upload/resend instead of sending coordinates; overrides 'GPS location' above"))
 
 local function apply_default_privacy()
   local pref = read_default_pref("default_privacy", "private")
@@ -6264,6 +6330,7 @@ local storage_widget = dt.new_widget("box") {
   sync_tags_widget,
   sync_date_taken_widget,
   sync_gps_widget,
+  sync_strip_gps_widget,
   dt.new_widget("label") { label = _("Flickr upload settings") },
   privacy_widget,
   safety_widget,
@@ -7445,11 +7512,14 @@ function panel_sets.sync_geo_date()
   if sync.gps then lat, lon = metadata.image_location(image) end
 
   local plan = metadata.geo_date_resend_plan(sync, date_taken, lat, lon)
-  if plan.disabled then
+  -- "strip GPS on resend" can act even when "sync GPS location" is off, so derive
+  -- the geo op independently and gate on it rather than only on plan.send_gps (#23).
+  local geo_action = metadata.geo_resend_action(sync.gps, sync.strip_gps, lat ~= nil and lon ~= nil)
+  if not sync.date_taken and not sync.gps and not sync.strip_gps then
     dt.print(_("Flickr: GPS/date sync disabled in Lua Options."))
     return
   end
-  if plan.nothing then
+  if not plan.send_date and geo_action == "skip" then
     dt.print(_("Flickr: selected image has no GPS/date taken to sync."))
     return
   end
@@ -7471,17 +7541,25 @@ function panel_sets.sync_geo_date()
     end
   end
 
-  if plan.send_gps then
-    local ok, err = __dtrmflickr_call("flickr.photos.geo.setLocation", function()
+  if geo_action ~= "skip" then
+    local geo_method = geo_action == "remove"
+      and "flickr.photos.geo.removeLocation" or "flickr.photos.geo.setLocation"
+    local friendly = geo_action == "remove" and _("GPS location (stripped)") or _("GPS location")
+    local ok, err = __dtrmflickr_call(geo_method, function()
+      if geo_action == "remove" then
+        return rest.photos_geo_remove_location(api_key, api_secret, acc, photo_id)
+      end
       return rest.photos_geo_set_location(api_key, api_secret, acc, photo_id, lat, lon, 16)
     end)
     if ok then
       state.clear_reason(image, acc.nsid, "gps")
-      store_metadata_fingerprints(image, acc.nsid, fingerprints, { "gps" })
-      done[#done + 1] = _("GPS location")
+      if geo_action == "send" then
+        store_metadata_fingerprints(image, acc.nsid, fingerprints, { "gps" })
+      end
+      done[#done + 1] = friendly
     else
       state.mark_reason(image, acc.nsid, "gps")
-      failed[#failed + 1] = _("GPS location") .. ": " .. tostring(err)
+      failed[#failed + 1] = friendly .. ": " .. tostring(err)
     end
   end
 
@@ -8083,6 +8161,59 @@ function panel_sets.push_selected_metadata()
   end
 end
 
+-- Remove the Flickr location (geo data) from every selected published photo
+-- (issue #23) — the explicit per-photo "remove location" / geo-privacy override.
+-- This is a deliberate one-off action, distinct from the "strip GPS on resend"
+-- toggle that strips automatically on upload/resend. removeLocation is idempotent
+-- (rest.photos_geo_remove_location treats Flickr error 2 "no location" as success),
+-- so re-running it over a mixed selection is safe. Photos with no linked Flickr id
+-- are skipped (never touched). On success the "gps" needs-sync reason is cleared.
+function panel_sets.remove_geo_location()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection == 0 then
+    dt.print(_("Flickr: select one or more published images before removing location."))
+    return
+  end
+  local acc = load_token()
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before removing location."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+
+  local removed, unlinked, failed = 0, 0, 0
+  local fail_notes = {}
+  for _, image in ipairs(selection) do
+    local photo_id = state.get_photo_id(image, acc.nsid)
+    if not photo_id then
+      unlinked = unlinked + 1
+    else
+      local ok, err = __dtrmflickr_call("flickr.photos.geo.removeLocation", function()
+        return rest.photos_geo_remove_location(api_key, api_secret, acc, photo_id)
+      end)
+      if ok then
+        state.clear_reason(image, acc.nsid, "gps")
+        removed = removed + 1
+      else
+        failed = failed + 1
+        fail_notes[#fail_notes + 1] = string.format("%s: %s", tostring(photo_id), tostring(err))
+      end
+    end
+  end
+
+  refresh_panel(true, false)
+  dt.print(string.format(
+    _("Flickr: remove location — %d cleared, %d not linked, %d with errors (of %d selected)"),
+    removed, unlinked, failed, #selection))
+  if #fail_notes > 0 then
+    dt.print(_("Flickr: remove location errors: ") .. table.concat(fail_notes, "; "))
+  end
+end
+
 -- Clear the ambiguous-candidate picker (issue #16).
 function panel_sets.clear_candidates()
   panel_sets.candidate_ids = {}
@@ -8464,6 +8595,11 @@ local panel_widget = dt.new_widget("box") {
     label = _("sync GPS/date taken"),
     tooltip = _("push darktable GPS location and date taken to the linked Flickr photo without re-uploading"),
     clicked_callback = function() panel_sets.sync_geo_date() end,
+  },
+  dt.new_widget("button") {
+    label = _("remove Flickr location"),
+    tooltip = _("remove the geotag/location from the selected published photo(s) on Flickr (privacy); idempotent and does not re-upload"),
+    clicked_callback = function() panel_sets.remove_geo_location() end,
   },
   dt.new_widget("label") { label = _("people tags") },
   panel_sets.people_entry,
@@ -9059,8 +9195,18 @@ local function store(storage, image, format, filename, number, total, high_quali
 
     local lat, lon = nil, nil
     if sync.gps then lat, lon = metadata.image_location(image) end
-    if lat and lon then
-      local geo_ok, geo_err = __dtrmflickr_call("flickr.photos.geo.setLocation", function()
+    -- Privacy-first: "strip GPS on resend" wins over "sync GPS location", so after
+    -- a (re)upload we remove any location Flickr may have auto-geotagged from the
+    -- file's EXIF rather than sending coordinates (issue #23).
+    local geo_action = metadata.geo_resend_action(sync.gps, sync.strip_gps, lat ~= nil and lon ~= nil)
+    if geo_action ~= "skip" then
+      local geo_method = geo_action == "remove"
+        and "flickr.photos.geo.removeLocation" or "flickr.photos.geo.setLocation"
+      local geo_ok, geo_err = __dtrmflickr_call(geo_method, function()
+        if geo_action == "remove" then
+          return rest.photos_geo_remove_location(extra_data.api_key, extra_data.api_secret,
+            extra_data.account, photo_id)
+        end
         return rest.photos_geo_set_location(extra_data.api_key, extra_data.api_secret,
           extra_data.account, photo_id, lat, lon, 16)
       end)
@@ -9069,7 +9215,8 @@ local function store(storage, image, format, filename, number, total, high_quali
         post_failed = true
         failed_metadata_fields.gps = true
         state.mark_reason(image, extra_data.account.nsid, "gps")
-        record_post_error(extra_data, image, photo_id, "location", geo_err)
+        record_post_error(extra_data, image, photo_id,
+          geo_action == "remove" and "strip location" or "location", geo_err)
       else
         state.clear_reason(image, extra_data.account.nsid, "gps")
       end
