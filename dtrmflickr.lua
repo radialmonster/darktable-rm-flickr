@@ -636,6 +636,18 @@ function M.authorize_url(request_token, perms)
     .. "&perms=" .. oauth.encode(perms or "write")
 end
 
+-- Choose the OAuth permission scope to request for a login.
+--
+-- Flickr scopes are hierarchical (read < write < delete), so a "delete" token
+-- can also do everything a "write" token can. The plugin defaults to "write"
+-- and only asks for "delete" when the user has explicitly opted in (issue #19) —
+-- delete scope is never requested silently. Pure so the gating can be
+-- unit-tested without darktable's preferences/widgets.
+function M.login_perms(want_delete)
+  if want_delete then return "delete" end
+  return "write"
+end
+
 ----------------------------------------------------------------------
 -- step 3: exchange the verifier for a permanent access token
 --   -> { token, secret, nsid, username, fullname }   |   nil, error_body
@@ -1354,6 +1366,23 @@ function M.photos_licenses_set_license(api_key, api_secret, account, photo_id, l
   local body, err = M.call(api_key, api_secret, account, "flickr.photos.licenses.setLicense", {
     photo_id = photo_id,
     license_id = license_id,
+  })
+  if not body then return nil, err end
+  return true
+end
+
+-- Permanently remove a photo from Flickr (flickr.photos.delete).
+--
+-- DESTRUCTIVE and irreversible on Flickr's side. Requires a token authorized
+-- with perms=delete; a write-only token returns REST code 99 ("permission",
+-- see AUTH_ERROR_CODES). Returns true on success, or (nil, err) on failure so
+-- callers can distinguish a permission error (re-auth needed) from a transport
+-- error and avoid clearing the local mapping when the remote photo still exists.
+function M.photos_delete(api_key, api_secret, account, photo_id)
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+
+  local body, err = M.call(api_key, api_secret, account, "flickr.photos.delete", {
+    photo_id = photo_id,
   })
   if not body then return nil, err end
   return true
@@ -2196,9 +2225,20 @@ function M.clear_sets(image, account_nsid)
   return removed
 end
 
+-- Forget everything this plugin stored for `account_nsid` on `image`: the
+-- photo-id link, album memberships, published stamps, needs-sync markers,
+-- diff reasons, and cached metadata fingerprints. Used both when switching the
+-- active account away from an image and when a photo is deleted from Flickr
+-- (issue #19), where the local mapping must be removed so the photo reads as
+-- unpublished with no stale needs-sync state left behind.
 function M.clear_account(image, account_nsid)
   local removed = M.clear_sets(image, account_nsid)
   removed = removed + M.clear_published_at(image, account_nsid)
+  removed = removed + M.clear_metadata_reasons(image, account_nsid)
+  if M.clear_reason(image, account_nsid, "image") then removed = removed + 1 end
+  for _, field in ipairs(known_metadata_reasons()) do
+    removed = removed + M.clear_fingerprint(image, account_nsid, field)
+  end
   if M.clear_needs_republish(image, account_nsid) then removed = removed + 1 end
   if M.clear_photo_id(image, account_nsid) then removed = removed + 1 end
   return removed
@@ -5499,9 +5539,15 @@ login_button = dt.new_widget("button") {
       return
     end
     pending = { token = tok, secret = sec_or_err }
-    local url = auth.authorize_url(tok, "write")
+    -- Default to write scope; only request delete scope when the user explicitly
+    -- opted in via the preference (issue #19). Delete is never requested silently.
+    local want_delete = dt.preferences.read(PLUGIN, "request_delete_perm", "bool")
+    local url = auth.authorize_url(tok, auth.login_perms(want_delete))
     open_url(url)
     refresh_status()
+    if want_delete then
+      dt.print(_("Requesting DELETE permission — Flickr will ask to allow deleting your photos."))
+    end
     dt.print(_("Opened Flickr in your browser. Paste the verifier code and click 'complete login'."))
     dt.print_log("[dtrmflickr] authorize URL (open manually if browser didn't): " .. url)
   end,
@@ -5568,6 +5614,14 @@ dt.preferences.register(PLUGIN, "api_secret", "string",
   _("Flickr: API secret"), _("Flickr app API secret used for OAuth request signing"), "")
 dt.preferences.register(PLUGIN, "api_key", "string",
   _("Flickr: API key"), _("Flickr app API key used for OAuth and upload requests"), "")
+-- Opt-in (default off) to request perms=delete on the *next* login. Delete scope
+-- lets the panel's "delete from Flickr" action call flickr.photos.delete; it is
+-- never requested silently. Changing this only takes effect after logging in
+-- again. See issue #19.
+dt.preferences.register(PLUGIN, "request_delete_perm", "bool",
+  _("Flickr: request delete permission on next login"),
+  _("when on, the next Flickr login asks for permission to delete photos (required for 'delete from Flickr'). Leave off for normal use; you must log in again after changing this"),
+  false)
 dt.preferences.register(PLUGIN, "account_login", "lua",
   _("Flickr: account login"),
   _("authorize the default Flickr account used for uploads and lighttable sync"),
@@ -6154,6 +6208,14 @@ panel_sets.status_label = dt.new_widget("label") { label = "" }
 panel_sets.publish_label = dt.new_widget("label") { label = "" }
 panel_sets.queue_label = dt.new_widget("label") { label = "" }
 panel_sets.queue_detail_label = dt.new_widget("label") { label = "" }
+-- Per-action confirm gate for the destructive "delete from Flickr" button
+-- (issue #19): the button refuses unless this is checked, and it is reset after
+-- every attempt so each deletion requires a deliberate re-check.
+panel_sets.delete_confirm = dt.new_widget("check_button") {
+  label = _("confirm permanent deletion from Flickr"),
+  tooltip = _("must be checked to enable 'delete from Flickr'; deletion is permanent and cannot be undone"),
+  value = false,
+}
 local panel_remote_label = dt.new_widget("label") { label = "" }
 local panel_tags_label = dt.new_widget("label") { label = "" }
 -- Tag reconciler (issue #3): side-by-side local-keyword vs Flickr-tag view plus
@@ -7299,6 +7361,68 @@ function panel_sets.sync_geo_date()
   end
 end
 
+-- Permanently delete the selected published photo from Flickr (issue #19).
+--
+-- Destructive and irreversible, and it needs a delete-scope token (write-only
+-- tokens fail with REST code 99). Two guards before any network call: a single
+-- selected published image, and the per-action "confirm permanent deletion"
+-- checkbox. The checkbox is always reset afterwards so each deletion is a fresh,
+-- deliberate act. On success the local mapping is fully forgotten
+-- (state.clear_account) so the photo reads as unpublished; a permission failure
+-- is surfaced with guidance to re-login with delete permission enabled rather
+-- than as a generic error, and the local mapping is left intact because the
+-- remote photo still exists.
+function panel_sets.delete_selected()
+  local acc, photo_id, image = panel_current.account, panel_current.photo_id, panel_current.image
+  local confirm_checked = panel_sets.delete_confirm and panel_sets.delete_confirm.value
+  -- Always clear the confirm gate, whatever path we take, so it never stays armed.
+  if panel_sets.delete_confirm then panel_sets.delete_confirm.value = false end
+  if (panel_current.selection_count or 0) ~= 1 then
+    dt.print(_("Flickr: select exactly one image before deleting from Flickr."))
+    return
+  end
+  if not image or not photo_id then
+    dt.print(_("Flickr: select a published image first."))
+    return
+  end
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before deleting from Flickr."))
+    return
+  end
+  if not confirm_checked then
+    panel_remote_label.label = _("Flickr: check 'confirm permanent deletion' first")
+    dt.print(_("Flickr: tick 'confirm permanent deletion from Flickr', then click 'delete from Flickr' again."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+
+  local ok, err = __dtrmflickr_call("flickr.photos.delete", function()
+    return rest.photos_delete(api_key, api_secret, acc, photo_id)
+  end)
+  if ok then
+    state.clear_account(image, acc.nsid)
+    panel_remote_label.label = string.format(_("Flickr: deleted photo %s and cleared its local link"), photo_id)
+    dt.print(panel_remote_label.label)
+    dt.print_log("[dtrmflickr] deleted photo " .. tostring(photo_id) .. " from Flickr")
+    refresh_panel(true, false)
+  else
+    local _code, kind = rest.is_auth_error(err)
+    if kind == "permission" then
+      panel_remote_label.label = _("Flickr: delete needs delete permission — re-login enabling it")
+      dt.print(_("Flickr could not delete the photo: your login lacks delete permission. "
+        .. "Open Lua options, turn on 'Flickr: request delete permission on next login', then log in again."))
+    else
+      panel_remote_label.label = _("Flickr: delete failed")
+      dt.print(_("Flickr: delete failed: ") .. tostring(err))
+    end
+    dt.print_log("[dtrmflickr] delete photo " .. tostring(photo_id) .. " failed: " .. tostring(err))
+  end
+end
+
 -- People tagging (issues #24, #18): tag Flickr members on the selected published
 -- photo. The user types one or more Flickr usernames/emails (comma- or
 -- newline-separated) into panel_sets.people_entry; each is resolved to an NSID via
@@ -8261,6 +8385,16 @@ local panel_widget = dt.new_widget("box") {
   dt.new_widget("button") {
     label = _("refresh"),
     clicked_callback = function() refresh_panel(true, true) end,
+  },
+  -- Destructive delete section (issue #19): the confirm checkbox gates the
+  -- button, which permanently removes the photo from Flickr and forgets the
+  -- local link. Needs a delete-scope login (Lua options > 'request delete
+  -- permission on next login').
+  panel_sets.delete_confirm,
+  dt.new_widget("button") {
+    label = _("delete from Flickr"),
+    tooltip = _("permanently delete the selected published photo from Flickr and clear its local link; requires a delete-permission login and the confirm checkbox above"),
+    clicked_callback = function() panel_sets.delete_selected() end,
   },
 }
 
