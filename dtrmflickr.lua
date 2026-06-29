@@ -2083,6 +2083,31 @@ function M.tag_matches_filter(tag_name, filter)
   return tostring(tag_name or ""):lower():find(filter, 1, true) ~= nil
 end
 
+-- Split a (possibly hierarchical) tag name into lowercased, trimmed segments.
+local function tag_hierarchy_segments(name)
+  local segments = {}
+  for seg in tostring(name or ""):gmatch("[^|]+") do
+    seg = seg:match("^%s*(.-)%s*$"):lower()
+    if seg ~= "" then segments[#segments + 1] = seg end
+  end
+  return segments
+end
+
+-- True when `name`'s hierarchy is at or under `root`: the root's segments must be
+-- a leading prefix of the tag's segments (case-insensitive). So root "places"
+-- matches "Places", "Places|USA", "Places|USA|VA" but NOT "Marketplaces" (segment
+-- compare, not substring) and NOT "Travel|Places" (anchored at the top). Used for
+-- omitting auto location-keyword hierarchies from published Flickr tags.
+function M.tag_under_location_root(name, root)
+  local tag = tag_hierarchy_segments(name)
+  local prefix = tag_hierarchy_segments(root)
+  if #prefix == 0 or #prefix > #tag then return false end
+  for i = 1, #prefix do
+    if tag[i] ~= prefix[i] then return false end
+  end
+  return true
+end
+
 local function flickr_quote_tag(tag)
   tag = tostring(tag or "")
   if tag:find("%s") then return '"' .. tag .. '"' end
@@ -2130,7 +2155,8 @@ local function tag_is_publishable_keyword(tag)
 end
 
 -- Compute the publishable Flickr keyword leaf names for an image: plugin/state,
--- darktable|..., private/category, and filter-excluded tags removed; hierarchical
+-- darktable|..., private/category, filter-excluded, and (when opts.location_roots
+-- is set) location-hierarchy tags removed; hierarchical
 -- tags reduced to their leaf; duplicates collapsed case-insensitively; sorted
 -- alphabetically. Returns (names, truncated_count) where `truncated_count` is the
 -- number dropped by opts.max_tags. This is the single source of truth shared by
@@ -2155,6 +2181,11 @@ function M.image_keyword_names(image, excluded_filters, tag_names, opts)
       local excluded = not tag_is_publishable_keyword(tag)
       for _, filter in ipairs(excluded_filters or {}) do
         if M.tag_matches_filter(name, filter) then excluded = true; break end
+      end
+      if not excluded then
+        for _, root in ipairs(opts.location_roots or {}) do
+          if M.tag_under_location_root(name, root) then excluded = true; break end
+        end
       end
       if not excluded then
         local publish_name = publish_tag_name(name)
@@ -3954,15 +3985,26 @@ function M.apply_keyword_overrides(tag_names, privacy, safety, content_type, lic
     conflicts
 end
 
+-- Location-keyword hierarchy roots the user has opted to omit from published
+-- tags. Empty/<none> disables the feature. Matched hierarchy-aware (anchored at
+-- the tag's top segment), not as a substring — see metadata.tag_under_location_root.
+function M.location_keyword_roots()
+  return M.split_filter_list(dt.preferences.read(PLUGIN, "location_keyword_roots", "string"))
+end
+
+local function keyword_opts()
+  return { max_tags = FLICKR_TAG_LIMIT, location_roots = M.location_keyword_roots() }
+end
+
 function M.image_keyword_tags(image, tag_names)
-  return metadata.image_keyword_tags(image, M.keyword_rule_filters(), tag_names, { max_tags = FLICKR_TAG_LIMIT })
+  return metadata.image_keyword_tags(image, M.keyword_rule_filters(), tag_names, keyword_opts())
 end
 
 -- Publishable Flickr keyword leaf names (same filtering as image_keyword_tags,
 -- but the name list rather than the encoded `tags` string). Used by the
 -- lighttable tag reconciler.
 function M.image_keyword_names(image, tag_names)
-  return metadata.image_keyword_names(image, M.keyword_rule_filters(), tag_names, { max_tags = FLICKR_TAG_LIMIT })
+  return metadata.image_keyword_names(image, M.keyword_rule_filters(), tag_names, keyword_opts())
 end
 
 return M
@@ -5014,6 +5056,8 @@ dt.preferences.register(PLUGIN, "skip_upload_keyword_filters", "string",
   _("Flickr: skip-upload keywords"), _("enter one keyword or comma-separated keywords; matching images are not uploaded to Flickr"), EMPTY_FILTER_PREF)
 dt.preferences.register(PLUGIN, "exclude_keyword_filters", "string",
   _("Flickr: never-sync keywords"), _("enter one keyword or comma-separated keywords; matching photo keywords are not sent to Flickr"), EMPTY_FILTER_PREF)
+dt.preferences.register(PLUGIN, "location_keyword_roots", "string",
+  _("Flickr: omit location keyword roots"), _("enter one or comma-separated keyword hierarchy roots (e.g. Places, Locations|Travel); keywords at or under a root are omitted from published Flickr tags. Matched on full hierarchy path, not substring"), EMPTY_FILTER_PREF)
 dt.preferences.register(PLUGIN, "keyword_rules_help", "lua",
   _("Flickr: keyword rules"),
   _("how keyword-driven Flickr settings work"),
