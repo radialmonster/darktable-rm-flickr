@@ -6377,6 +6377,19 @@ local panel_addmeta_perm_widget = dt.new_widget("combobox") {
   tooltip = _("who can add tags, notes, and people tags to the selected published photo"),
   _("only you"), _("friends & family"), _("people you follow"), _("any Flickr member"),
 }
+-- Hide-from-public-search panel control (issue #71). Flickr exposes NO read API for
+-- a photo's search-hidden state (getInfo's <visibility> is ispublic/isfriend/isfamily
+-- only; getPerms is comment/meta perms only), so this is a write-only toggle: it
+-- starts unchecked on every selection and never reflects the photo's current remote
+-- state. It is pushed via setSafetyLevel's `hidden` param ONLY when the user actually
+-- toggles it (panel_dirty.hidden), so an untouched panel never un-hides a photo. Lives
+-- on panel_sets (table field, not a main-chunk local) to stay under Lua's per-function
+-- local limit (see CLAUDE.md). check_button fires clicked_callback, not changed_callback.
+panel_sets.hidden_widget = dt.new_widget("check_button") {
+  label = _("hide from public site searches"),
+  tooltip = _("check then save to hide the selected photo from public Flickr searches; uncheck then save to include it again. Flickr provides no way to read the current state, so this box always starts unchecked and only acts when you change it."),
+  value = false,
+}
 local panel_photo_id_entry = dt.new_widget("entry") {
   text = "",
   placeholder = _("Flickr photo ID or URL"),
@@ -6403,7 +6416,7 @@ panel_sets.batch_claim_entry = dt.new_widget("entry") {
 local refresh_panel
 local panel_current = { image = nil, account = nil, photo_id = nil, selection_count = 0, remote_loaded = false }
 local panel_loading = false
-local panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
+local panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false, hidden = false }
 panel_privacy_widget.changed_callback = function()
   if not panel_loading then panel_dirty.privacy = true end
 end
@@ -6421,6 +6434,12 @@ panel_comment_perm_widget.changed_callback = function()
 end
 panel_addmeta_perm_widget.changed_callback = function()
   if not panel_loading then panel_dirty.addmeta_perm = true end
+end
+-- check_button uses clicked_callback (changed_callback is invalid for this type and
+-- aborts script load — see the export hidden_widget note). Guard with panel_loading
+-- so the programmatic resets in panel_reset_remote/load_remote_settings don't mark dirty.
+panel_sets.hidden_widget.clicked_callback = function()
+  if not panel_loading then panel_dirty.hidden = true end
 end
 
 local function panel_is_visible()
@@ -6574,14 +6593,16 @@ local function panel_reset_remote(message)
   panel_license_widget.selected = 0
   panel_comment_perm_widget.selected = 0
   panel_addmeta_perm_widget.selected = 0
+  panel_sets.hidden_widget.value = false
   panel_loading = false
-  panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
+  panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false, hidden = false }
   panel_privacy_widget.sensitive = false
   panel_safety_widget.sensitive = false
   panel_content_type_widget.sensitive = false
   panel_license_widget.sensitive = false
   panel_comment_perm_widget.sensitive = false
   panel_addmeta_perm_widget.sensitive = false
+  panel_sets.hidden_widget.sensitive = false
   panel_current.remote_loaded = false
   -- The remote widgets no longer reflect any loaded photo, so drop the
   -- "already loaded" marker; the next selection must re-fetch.
@@ -7079,6 +7100,9 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
     visibility and remote_attr(visibility, "isfriend"),
     visibility and remote_attr(visibility, "isfamily")) or 0
   panel_safety_widget.selected = panel_safety_index_from_remote(remote_attr(body, "safety_level")) or 0
+  -- Flickr exposes no read for the search-hidden state, so the panel toggle always
+  -- starts unchecked on a fresh load (see its definition / issue #71).
+  panel_sets.hidden_widget.value = false
   panel_license_widget.selected = panel_license_index_from_id(remote_attr(body, "license")) or 0
   local remote_dateuploaded = remote_attr(body, "dateuploaded")
   -- Persist Flickr's authoritative upload date/time (issue #21). This is the
@@ -7121,9 +7145,10 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
     or _("Flickr tags: none")
   if panel_reconcile.refresh then panel_reconcile.refresh(panel_current.image, remote_tags) end
   panel_loading = false
-  panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
+  panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false, hidden = false }
   panel_privacy_widget.sensitive = acc ~= nil
   panel_safety_widget.sensitive = acc ~= nil
+  panel_sets.hidden_widget.sensitive = acc ~= nil
   panel_content_type_widget.sensitive = acc ~= nil
   panel_license_widget.sensitive = acc ~= nil
   panel_comment_perm_widget.sensitive = acc ~= nil and not perms_unavailable
@@ -7198,16 +7223,30 @@ local function save_panel_settings()
     skipped[#skipped + 1] = "permissions"
   end
   local safety = panel_safety_value()
-  if panel_dirty.safety and sync.safety then
+  -- setSafetyLevel carries the safety level AND the hide-from-public-search flag
+  -- (issue #71). Fold both into one call, mirroring the resend path: safety is gated
+  -- by its sync master toggle, but hide-from-search is NOT a sync.* field (it follows
+  -- the upload model — see design-notes "Hide-from-public-search"), so it pushes
+  -- whenever the user toggled the box. We send the explicit value the user chose
+  -- (1 = hide, 0 = include) only when panel_dirty.hidden is set, so an untouched box
+  -- never alters the photo's current visibility.
+  local push_safety = panel_dirty.safety and sync.safety
+  local push_hidden = panel_dirty.hidden == true
+  if push_safety or push_hidden then
+    local safety_arg = push_safety and safety or nil
+    local hidden_arg = push_hidden and (panel_sets.hidden_widget.value == true and "1" or "0") or nil
     local ok, err = __dtrmflickr_call("flickr.photos.setSafetyLevel", function()
-      return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety)
+      return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety_arg, hidden_arg)
     end)
     if not ok then
-      state.mark_reason(panel_current.image, acc.nsid, "safety")
-      errors[#errors + 1] = "safety: " .. tostring(err)
+      if push_safety then state.mark_reason(panel_current.image, acc.nsid, "safety") end
+      errors[#errors + 1] = "safety/visibility: " .. tostring(err)
     else
-      state.clear_reason(panel_current.image, acc.nsid, "safety")
-      saved_fields[#saved_fields + 1] = "safety"
+      if push_safety then
+        state.clear_reason(panel_current.image, acc.nsid, "safety")
+        saved_fields[#saved_fields + 1] = "safety"
+      end
+      if push_hidden then saved_fields[#saved_fields + 1] = "hide_from_search" end
     end
   elseif panel_dirty.safety then
     skipped[#skipped + 1] = "safety"
@@ -8404,6 +8443,7 @@ local panel_widget = dt.new_widget("box") {
   panel_tags_label,
   panel_privacy_widget,
   panel_safety_widget,
+  panel_sets.hidden_widget,
   panel_content_type_widget,
   panel_license_widget,
   panel_comment_perm_widget,
