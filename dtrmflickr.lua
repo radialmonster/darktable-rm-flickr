@@ -5480,6 +5480,157 @@ end
 return M
 end
 
+package.preload["dtrmflickr.remote_pull"] = function(...)
+-- remote_pull.lua — pull-side helpers for issue #20 (pull remote edits back into
+-- darktable). Pure / offline-testable: no darktable, no network. The live panel
+-- action wires these to flickr.photos.getInfo and to darktable's writable
+-- image.title / image.description fields.
+--
+-- Scope of this module (issue #20, phase 1):
+--   * parse_info   — turn a flickr.photos.getInfo response body into a structured
+--                    remote record (title, description, tags, views, comments,
+--                    dateuploaded). Remote-tag pull itself stays owned by the tag
+--                    reconciler (#3); the tags here are exposed only for callers
+--                    that want the full remote snapshot.
+--   * classify_error — map a getInfo failure to "deleted" / "permission" / "other"
+--                      so the panel can tell "this photo was removed on Flickr"
+--                      apart from a transient/auth error.
+--   * title_description_pull — decide which of title/description differ between the
+--                    remote photo and the local image, honouring the same per-field
+--                    sync toggles the push path uses, and return the proposed new
+--                    values. The caller writes them back.
+
+local M = {}
+
+-- Minimal XML entity decode for element text / attribute values. Mirrors the
+-- decoder used in the main module and flickr_rest so pulled strings match what is
+-- shown elsewhere. utf8.char is wrapped in pcall because out-of-range code points
+-- would otherwise raise.
+local function xml_unescape(s)
+  return tostring(s or "")
+    :gsub("&#x(%x+);", function(h)
+      local n = tonumber(h, 16)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
+    :gsub("&#(%d+);", function(d)
+      local n = tonumber(d, 10)
+      if not n then return "" end
+      local ok, c = pcall(utf8.char, n)
+      return ok and c or ""
+    end)
+    :gsub("&quot;", '"')
+    :gsub("&apos;", "'")
+    :gsub("&lt;", "<")
+    :gsub("&gt;", ">")
+    :gsub("&amp;", "&")
+end
+
+-- Extract the text content of the first <name>...</name> element. Returns the
+-- decoded string (possibly "") when the element is present, or nil when the
+-- element is absent or self-closing (<name />) — so callers can distinguish
+-- "Flickr says the field is empty" from "Flickr did not report the field".
+local function element_text(body, name)
+  body = tostring(body or "")
+  -- self-closing => present but empty
+  if body:match("<" .. name .. "%s*/>") then return "" end
+  local inner = body:match("<" .. name .. "[^>]*>(.-)</" .. name .. ">")
+  if inner == nil then return nil end
+  return xml_unescape(inner)
+end
+
+local function attr(body, name)
+  body = tostring(body or "")
+  return body:match(name .. '="(.-)"') or body:match(name .. "='(.-)'") or nil
+end
+
+-- Parse the raw tags out of a getInfo <tags> block (raw="..." preserves the
+-- user-entered form, matching the reconciler's expectations). Sorted for stable
+-- comparison/display.
+local function parse_tags(body)
+  local block = tostring(body or ""):match("<tags>(.-)</tags>")
+  if not block then return {} end
+  local tags = {}
+  for raw in block:gmatch('<tag[^>]-raw="(.-)"[^>]*>') do
+    tags[#tags + 1] = xml_unescape(raw)
+  end
+  for raw in block:gmatch("<tag[^>]-raw='(.-)'[^>]*>") do
+    tags[#tags + 1] = xml_unescape(raw)
+  end
+  table.sort(tags)
+  return tags
+end
+
+-- parse_info(body): structured snapshot of a flickr.photos.getInfo response.
+-- Returns nil for an empty/garbage body. Fields:
+--   title, description  — strings (may be ""); nil only if the element was absent
+--   tags                — array of raw tag strings (possibly empty)
+--   views, comments     — numbers or nil when not reported
+--   dateuploaded        — the raw dateuploaded attribute string or nil
+function M.parse_info(body)
+  body = tostring(body or "")
+  if not body:match("<photo[%s>]") then return nil end
+  -- views appears either as a photo attribute (views="N") or, on some responses,
+  -- as a <views>N</views> element; comments is the <comments>N</comments> count.
+  local views = attr(body, "views") or element_text(body, "views")
+  local comments = element_text(body, "comments")
+  return {
+    title = element_text(body, "title"),
+    description = element_text(body, "description"),
+    tags = parse_tags(body),
+    views = tonumber(views),
+    comments = tonumber(comments),
+    dateuploaded = attr(body, "dateuploaded"),
+  }
+end
+
+-- classify_error(err): map a flickr.photos.getInfo failure to a category.
+--   "deleted"    — Flickr error 1 ("Photo not found"): the id is invalid or the
+--                  photo is no longer viewable, i.e. it was deleted/removed on
+--                  Flickr. The panel uses this to offer clearing the stale link.
+--   "permission" — Flickr error 2 ("Permission denied").
+--   "other"      — anything else (transient/auth/network); not deletion.
+function M.classify_error(err)
+  local code = tonumber(tostring(err or ""):match("%((%d+)%)"))
+  if code == 1 then return "deleted" end
+  if code == 2 then return "permission" end
+  return "other"
+end
+
+local function norm(v)
+  return tostring(v == nil and "" or v)
+end
+
+-- title_description_pull(remote, local_vals, sync): decide which of title/
+-- description should be pulled from Flickr down into the local image. `remote` is
+-- a parse_info() result (or any table with .title/.description); `local_vals`
+-- carries the image's current { title, description }. `sync` is the master
+-- per-field toggle set ({ title = bool, description = bool }); a field is only
+-- considered when its toggle is not explicitly false, mirroring the push path so
+-- "I manage this field locally" is honoured in both directions. A field is pulled
+-- only when the remote value is actually present (parse_info returned non-nil)
+-- AND differs from the local value. Returns:
+--   { title = { old, new } or nil, description = { old, new } or nil, any = bool }
+function M.title_description_pull(remote, local_vals, sync)
+  remote = remote or {}
+  local_vals = local_vals or {}
+  sync = sync or { title = true, description = true }
+  local plan = { title = nil, description = nil, any = false }
+  if sync.title ~= false and remote.title ~= nil and norm(remote.title) ~= norm(local_vals.title) then
+    plan.title = { old = local_vals.title or "", new = remote.title }
+  end
+  if sync.description ~= false and remote.description ~= nil
+      and norm(remote.description) ~= norm(local_vals.description) then
+    plan.description = { old = local_vals.description or "", new = remote.description }
+  end
+  plan.any = plan.title ~= nil or plan.description ~= nil
+  return plan
+end
+
+return M
+end
+
 package.preload["dtrmflickr.dtrmflickr"] = function(...)
 --[[ dtrmflickr — Flickr export/storage for darktable
 
@@ -5527,6 +5678,7 @@ local tag_reconcile = require "dtrmflickr.tag_reconcile"
 local people = require "dtrmflickr.people"
 local albums = require "dtrmflickr.albums"
 local widgets = require "dtrmflickr.widgets"
+local remote_pull = require "dtrmflickr.remote_pull"  -- pull remote edits back (#20)
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -7303,7 +7455,17 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
     end, { coalesce_key = "panel-refresh:" .. tostring(photo_id) })
   end
   if not body then
-    panel_reset_remote(string.format(_("Flickr: remote settings unavailable: %s"), tostring(err)))
+    -- Tell "the photo was deleted/removed on Flickr" (error 1, Photo not found)
+    -- apart from a transient/auth failure, so the user knows the local link is now
+    -- stale and can clear it (issue #20). Permission errors get their own hint.
+    local kind = remote_pull.classify_error(err)
+    if kind == "deleted" then
+      panel_reset_remote(_("Flickr: this photo no longer exists on Flickr (deleted/removed). Use 'clear Flickr link' to drop the stale local link."))
+    elseif kind == "permission" then
+      panel_reset_remote(_("Flickr: no permission to read this photo on Flickr."))
+    else
+      panel_reset_remote(string.format(_("Flickr: remote settings unavailable: %s"), tostring(err)))
+    end
     return
   end
 
@@ -7625,6 +7787,81 @@ local function sync_panel_tags()
     panel_remote_label.label = _("Flickr: keyword sync failed")
     dt.print(_("Flickr: keyword sync failed: ") .. tostring(err))
   end
+end
+
+-- Pull remote title/description from Flickr back into the selected darktable image
+-- (issue #20). The opposite direction of sync_panel_meta: it reads the linked
+-- photo's current title/description via flickr.photos.getInfo and writes any that
+-- differ onto the local image, honouring the same per-field sync toggles so a
+-- field the user manages locally (toggle off) is never overwritten. A field of
+-- this is a panel_sets.* method (not a top-level local) to stay clear of the main
+-- chunk's local-variable ceiling. Remote-tag pull stays owned by the tag
+-- reconciler; this touches title/description only. Live-gated (needs in-app verify).
+function panel_sets.pull_remote_meta()
+  local acc, photo_id, image = panel_current.account, panel_current.photo_id, panel_current.image
+  if (panel_current.selection_count or 0) ~= 1 then
+    dt.print(_("Flickr: select exactly one image before pulling remote edits."))
+    return
+  end
+  if not image or not photo_id then
+    dt.print(_("Flickr: select a published image first."))
+    return
+  end
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before pulling remote edits."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+  local sync = master_sync_fields()
+  if not sync.title and not sync.description then
+    dt.print(_("Flickr: title/description sync disabled in Lua Options."))
+    return
+  end
+
+  local body, err = __dtrmflickr_call("flickr.photos.getInfo", function()
+    return rest.call(api_key, api_secret, acc, "flickr.photos.getInfo", { photo_id = photo_id })
+  end, { coalesce_key = "panel-pull:" .. tostring(photo_id) })
+  if not body then
+    local kind = remote_pull.classify_error(err)
+    if kind == "deleted" then
+      panel_remote_label.label = _("Flickr: photo no longer exists on Flickr (deleted/removed)")
+      dt.print(_("Flickr: this photo no longer exists on Flickr; nothing to pull. Consider clearing the local link."))
+    else
+      panel_remote_label.label = _("Flickr: pull failed")
+      dt.print(string.format(_("Flickr: could not read remote edits: %s"), tostring(err)))
+    end
+    return
+  end
+
+  local remote = remote_pull.parse_info(body)
+  if not remote then
+    panel_remote_label.label = _("Flickr: pull failed")
+    dt.print(_("Flickr: could not parse the remote photo info."))
+    return
+  end
+
+  local plan = remote_pull.title_description_pull(
+    remote, { title = image.title, description = image.description }, sync)
+  if not plan.any then
+    panel_remote_label.label = _("Flickr: title/description already match Flickr")
+    dt.print(_("Flickr: title/description already match Flickr; nothing pulled."))
+    return
+  end
+
+  local changed = {}
+  if plan.title then image.title = plan.title.new; changed[#changed + 1] = "title" end
+  if plan.description then image.description = plan.description.new; changed[#changed + 1] = "description" end
+  -- Local copies now match the remote that was just pushed/edited; refresh the
+  -- per-image publish-state label so title/description no longer reads as drifted.
+  if panel_sets.refresh_publish_state_label then
+    panel_sets.refresh_publish_state_label(image, acc, photo_id)
+  end
+  panel_remote_label.label = string.format(_("Flickr: pulled %s from Flickr"), table.concat(changed, ", "))
+  dt.print(panel_remote_label.label)
 end
 
 -- Single-image GPS / date-taken resend (issue #18). Mirrors sync_panel_meta /
@@ -8733,6 +8970,11 @@ local panel_widget = dt.new_widget("box") {
   dt.new_widget("button") {
     label = _("sync title/description"),
     clicked_callback = function() sync_panel_meta() end,
+  },
+  dt.new_widget("button") {
+    label = _("pull title/description from Flickr"),
+    tooltip = _("overwrite the local title/description with the linked Flickr photo's current values (only fields whose sync toggle is on; tags use the reconciler)"),
+    clicked_callback = function() panel_sets.pull_remote_meta() end,
   },
   dt.new_widget("button") {
     label = _("sync keywords"),
