@@ -4795,6 +4795,32 @@ local function name_of(entry)
 end
 M.name_of = name_of
 
+-- Join a directory and a basename with the separator the directory already uses
+-- (Windows paths come back with "\", POSIX with "/"). Pure/nil-safe: a blank dir
+-- yields the bare basename, and an already-trailing separator is not doubled.
+local function join_path(dir, base)
+  if not dir or dir == "" then return base end
+  local sep = dir:find("\\", 1, true) and "\\" or "/"
+  if dir:sub(-#sep) == sep then return dir .. base end
+  return dir .. sep .. base
+end
+
+-- The user-facing name for a result row: the **original source file**, not the
+-- export temp path. `store` records both the export `filename` (a throwaway temp
+-- path like .../Temp/20260102_..._rdl.jpg) and the darktable `image`, whose
+-- `.path`/`.filename` are the real file on disk. Prefer the original (full path
+-- when `image.path` is known, else its basename); fall back to name_of (the temp
+-- filename) only when no image is attached. Nil-safe.
+local function display_name(entry)
+  if type(entry) ~= "table" then return "?" end
+  local image = entry.image
+  if type(image) == "table" and image.filename and image.filename ~= "" then
+    return join_path(image.path, image.filename)
+  end
+  return name_of(entry)
+end
+M.display_name = display_name
+
 -- Join up to `max` names from a list of result entries into a comma-separated
 -- string, appending " (+N more)" when the list is longer than `max`. Returns
 -- "" for an empty/absent list so the caller can skip the line entirely.
@@ -4964,7 +4990,7 @@ function M.result_rows(extra_data, owner)
     end
     rows[#rows + 1] = {
       kind = "uploaded",
-      filename = name_of(up),
+      filename = display_name(up),
       photo_id = up.photo_id,
       replaced = (type(up) == "table" and up.replaced) and true or false,
       failed_actions = actions or {},
@@ -4973,12 +4999,12 @@ function M.result_rows(extra_data, owner)
     }
   end
   for _, sk in ipairs(extra_data.skipped or {}) do
-    rows[#rows + 1] = { kind = "skipped", filename = name_of(sk), reason = skip_reason(sk) }
+    rows[#rows + 1] = { kind = "skipped", filename = display_name(sk), reason = skip_reason(sk) }
   end
   for _, fa in ipairs(extra_data.failed or {}) do
     rows[#rows + 1] = {
       kind = "failed",
-      filename = name_of(fa),
+      filename = display_name(fa),
       error = (fa and fa.error and tostring(fa.error)) or "unknown error",
       attempts = tonumber(fa.attempts),
     }
@@ -5101,6 +5127,26 @@ function M.result_panel_text(counts, extra_data, opts)
   return table.concat(parts, "\n")
 end
 
+-- The uploaded photos that have a public Flickr URL, as a structured list of
+-- { name = <recognizable filename>, url = <photo page URL> } (issue #40 open/copy
+-- buttons; issue #37 toast). Needs the active account's `owner` (NSID/path_alias);
+-- without it (or with no uploads) returns an empty list. Prefers the original
+-- image basename (e.g. "IMG_1234.cr2") over the export temp path. Pure/testable.
+function M.uploaded_links(extra_data, owner)
+  local links = {}
+  if not owner or owner == "" then return links end
+  for _, up in ipairs((extra_data and extra_data.uploaded) or {}) do
+    local url = urls.photo_url(owner, up.photo_id)
+    if url then
+      local img = type(up) == "table" and up.image
+      local name = (type(img) == "table" and img.filename and img.filename ~= "")
+        and img.filename or name_of(up)
+      links[#links + 1] = { name = name, url = url }
+    end
+  end
+  return links
+end
+
 -- Compact "resulting Flickr URL" lines for the panel toast (issue #37). The
 -- per-image result table above is the full record and goes to the log; this is
 -- the user-facing "here's where it landed" line per uploaded photo. Needs the
@@ -5117,21 +5163,9 @@ function M.uploaded_url_lines(extra_data, opts)
   local owner = opts.owner
   local lines = {}
   if not owner or owner == "" then return lines end
-  local uploaded = (extra_data and extra_data.uploaded) or {}
 
-  -- Only uploads that actually have a usable URL count toward the cap. For the
-  -- user-facing toast prefer the original image filename (recognizable, e.g.
-  -- "IMG_1234.cr2") over the export temp path that `name_of` favours.
-  local linkable = {}
-  for _, up in ipairs(uploaded) do
-    local url = urls.photo_url(owner, up.photo_id)
-    if url then
-      local img = type(up) == "table" and up.image
-      local name = (type(img) == "table" and img.filename and img.filename ~= "")
-        and img.filename or name_of(up)
-      linkable[#linkable + 1] = { name = name, url = url }
-    end
-  end
+  -- Only uploads that actually have a usable URL count toward the cap.
+  local linkable = M.uploaded_links(extra_data, owner)
 
   local max = tonumber(opts.max) or 10
   if max < 1 then max = 1 end
@@ -7757,6 +7791,48 @@ local album_search_button = dt.new_widget("button") {
 -- "last upload result" section of storage_widget below.
 local upload_result_label = dt.new_widget("label") { label = "" }
 
+-- The most recent export's uploaded photo links ({ name, url }), stashed by
+-- finalize so the open/copy buttons below can act on them. darktable label
+-- widgets render plain text, not clickable hyperlinks, so the result table shows
+-- the URLs but these buttons are how the user actually opens/copies them.
+local last_upload_links = {}
+
+local upload_open_button = dt.new_widget("button") {
+  label = _("open uploaded URL(s)"),
+  tooltip = _("open each photo from the last export on Flickr in your browser"),
+  sensitive = false,
+  clicked_callback = function()
+    local n = #last_upload_links
+    if n == 0 then dt.print(_("Flickr: no uploaded URLs from the last export")); return end
+    local cap = 12
+    local opened = math.min(n, cap)
+    for i = 1, opened do open_url(last_upload_links[i].url) end
+    if n > cap then
+      dt.print(string.format(_("Flickr: opened %d of %d URLs; use copy for the rest"), opened, n))
+    else
+      dt.print(string.format(_("Flickr: opened %d Flickr page(s)"), opened))
+    end
+  end,
+}
+
+local upload_copy_button = dt.new_widget("button") {
+  label = _("copy uploaded URL(s)"),
+  tooltip = _("copy the last export's Flickr photo URLs to the clipboard"),
+  sensitive = false,
+  clicked_callback = function()
+    local n = #last_upload_links
+    if n == 0 then dt.print(_("Flickr: no uploaded URLs from the last export")); return end
+    local u = require("dtrmflickr.urls")
+    local text = u.join_urls({ links = last_upload_links })
+    dt.print_log("[dtrmflickr] last upload URLs:\n" .. text)
+    if panel_sets.copy_to_clipboard(text) then
+      dt.print(string.format(_("Flickr: copied %d URL(s) to the clipboard"), n))
+    else
+      dt.print(string.format(_("Flickr: could not reach the clipboard; %d URL(s) written to the log"), n))
+    end
+  end,
+}
+
 local storage_widget = dt.new_widget("box") {
   orientation = "vertical",
   dt.new_widget("label") { label = _("upload metadata") },
@@ -7794,6 +7870,13 @@ local storage_widget = dt.new_widget("box") {
   -- buried log. Blank until the first export of the session.
   dt.new_widget("label") { label = _("last upload result") },
   upload_result_label,
+  -- darktable labels are plain text, so the URLs in the table above are not
+  -- clickable; these buttons open/copy the just-uploaded photos' Flickr pages.
+  dt.new_widget("box") {
+    orientation = "horizontal",
+    upload_open_button,
+    upload_copy_button,
+  },
 }
 
 ----------------------------------------------------------------------
@@ -11411,6 +11494,13 @@ local function finalize(storage, image_table, extra_data)
     uploaded = fresh_uploads, updated = replaced_uploads, skipped = skipped,
     failed = failed, post_errors = post_errors, album_errors = album_errors, total = total,
   }, extra_data, { translate = _, owner = report_owner })
+  -- darktable labels are not clickable, so stash this batch's uploaded Flickr
+  -- URLs for the export panel's open/copy buttons and enable them when there is
+  -- at least one (issue #40 follow-up).
+  last_upload_links = report.uploaded_links(extra_data, report_owner)
+  local has_upload_links = #last_upload_links > 0
+  upload_open_button.sensitive = has_upload_links
+  upload_copy_button.sensitive = has_upload_links
   -- Fill the batch progress bar and remove it from the background-jobs area.
   -- Guarded against an absent/invalidated job (older darktable, or a cancel).
   if extra_data.progress_job and extra_data.progress_job.valid then
