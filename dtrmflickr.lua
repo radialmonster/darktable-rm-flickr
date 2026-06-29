@@ -5099,6 +5099,21 @@ local addmeta_perm_widget = dt.new_widget("combobox") {
   _("only you"), _("friends & family"), _("people you follow"), _("any Flickr member"),
 }
 
+-- Hide-from-public-search is a boolean upload option (Flickr's `hidden`). Like
+-- the comboboxes above, the export widget both controls it per export and saves
+-- the choice as the sticky default. Off (the sane default) omits the param so
+-- Flickr applies the account's own search-visibility setting; on sends hidden=1.
+local hidden_widget = dt.new_widget("check_button") {
+  label = _("hide from public site searches"),
+  tooltip = _("keep uploaded photos out of public Flickr searches (they stay reachable via direct link and your photostream)"),
+  value = dt.preferences.read(PLUGIN, "default_hide_from_search", "bool") == true,
+}
+hidden_widget.changed_callback = function(widget)
+  dt.preferences.write(PLUGIN, "default_hide_from_search", "bool", widget.value == true)
+  dt.print_log(string.format("[dtrmflickr] hide-from-search changed -> default_hide_from_search=%s",
+    tostring(widget.value == true)))
+end
+
 local function sync_check_button(name, label, tooltip)
   local widget = dt.new_widget("check_button") {
     label = label,
@@ -5535,6 +5550,7 @@ local storage_widget = dt.new_widget("box") {
   license_widget,
   comment_perm_widget,
   addmeta_perm_widget,
+  hidden_widget,
   dt.new_widget("label") { label = _("album") },
   album_mode_widget,
   dt.new_widget("label") { label = _("existing album") },
@@ -7181,6 +7197,11 @@ local function current_permissions()
   }
 end
 
+-- true when the export should hide uploads from public Flickr searches.
+local function current_hidden()
+  return hidden_widget.value == true
+end
+
 local function current_album()
   local mode = album_mode_widget.selected or 1
   local existing_value = album_input_value()
@@ -7239,6 +7260,7 @@ local function initialize(storage, format, images, high_quality, extra_data)
   extra_data.content_type = current_content_type()
   extra_data.license = current_license()
   extra_data.permissions = current_permissions()
+  extra_data.hide_from_search = current_hidden()
   extra_data.sync = current_sync_fields()
   extra_data.post_errors = {}
   extra_data.keyword_conflicts = {}
@@ -7376,6 +7398,10 @@ local function store(storage, image, format, filename, number, total, high_quali
   local content_type = extra_data.content_type or current_content_type()
   local license = extra_data.license or current_license()
   local permissions = extra_data.permissions or current_permissions()
+  -- Boolean upload option, so `or` would mistake a captured `false` for "unset";
+  -- fall back to the live widget only when the key was never recorded.
+  local hide_from_search = extra_data.hide_from_search
+  if hide_from_search == nil then hide_from_search = current_hidden() end
   local sync = extra_data.sync or current_sync_fields()
   local tag_names = metadata.image_tag_names(image)
   local skip_filter, skip_tag = should_skip_upload_by_keyword(tag_names)
@@ -7466,6 +7492,9 @@ local function store(storage, image, format, filename, number, total, high_quali
       content_type = (sync.content_type or forced.content_type) and content_type.flickr_value or nil,
       perm_comment = sync.permissions and permissions.perm_comment or nil,
       perm_addmeta = sync.permissions and permissions.perm_addmeta or nil,
+      -- Upload-only option (no resend equivalent): omit unless the user opted in,
+      -- so Flickr keeps the account's default search visibility otherwise.
+      hidden = hide_from_search and 1 or nil,
       -- If Flickr returns an async ticket instead of a photo id, resolve it
       -- (idempotent checkTickets poll) rather than reporting a false failure
       -- that would prompt a duplicate-creating re-export. Poll waits use
@@ -7716,6 +7745,7 @@ script_data.__test = {
   current_safety = current_safety,
   current_content_type = current_content_type,
   current_license = current_license,
+  current_hidden = current_hidden,
   image_tag_names = metadata.image_tag_names,
   apply_keyword_overrides = rules.apply_keyword_overrides,
   format_keyword_conflict = rules.format_keyword_conflict,
