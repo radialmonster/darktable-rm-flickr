@@ -1676,6 +1676,10 @@ local function needs_republish_tag(account_nsid)
   return table.concat({ PREFIX, tostring(account_nsid), "needs-republish" }, "|")
 end
 
+local function uploaded_tag(account_nsid, stamp)
+  return table.concat({ PREFIX, tostring(account_nsid), "uploaded", tostring(stamp) }, "|")
+end
+
 local function reason_tag(account_nsid, reason)
   return table.concat({ PREFIX, tostring(account_nsid), "reason", tostring(reason) }, "|")
 end
@@ -1694,7 +1698,8 @@ local function assert_component(kind, value)
 end
 
 local function is_reserved_account_component(value)
-  return value == "set" or value == "published" or value == "needs-republish" or value == "reason"
+  return value == "set" or value == "published" or value == "needs-republish"
+    or value == "reason" or value == "uploaded"
 end
 
 local function ensure_tag(name)
@@ -1834,6 +1839,52 @@ function M.clear_published_at(image, account_nsid, kind)
     end
   end
   return removed
+end
+
+-- Flickr upload date/time (issue #21). Stored separately from the publish stamps
+-- (which record when *this plugin* last pushed the image/metadata): `uploaded` is
+-- Flickr's own authoritative upload time for the photo, captured from getInfo's
+-- `dateuploaded`, or approximated by the local publish time on a fresh upload. It
+-- is kept as a per-image tag so it survives in XMP sidecars and is filterable via
+-- darktable's collections tag filter for sorting/grouping by when a photo went up.
+function M.get_uploaded_at(image, account_nsid)
+  local prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|uploaded|"
+  local latest
+  for _, tag in ipairs(image_tags(image) or {}) do
+    local name = tag_name(tag)
+    local stamp = name and name:sub(1, #prefix) == prefix and name:sub(#prefix + 1) or nil
+    if stamp and normalize_stamp(stamp) and (not latest or stamp_is_newer(stamp, latest)) then latest = stamp end
+  end
+  return latest
+end
+
+function M.clear_uploaded_at(image, account_nsid)
+  assert_component("account id", account_nsid)
+  local prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|uploaded|"
+  local removed = 0
+  for _, tag in ipairs(image_tags(image) or {}) do
+    local name = tag_name(tag)
+    if name and name:sub(1, #prefix) == prefix then
+      detach(image, tag)
+      removed = removed + 1
+    end
+  end
+  return removed
+end
+
+-- Record Flickr's upload date/time for the photo. `stamp` may be a compact stamp
+-- (YYYYMMDDTHHMMSSZ) or a MySQL-style datetime; it is normalized to the compact
+-- form. Returns the stored stamp, or nil when `stamp` is unparseable (so a bad
+-- getInfo value leaves any existing record untouched). Idempotent: a single
+-- uploaded tag is kept per account.
+function M.set_uploaded_at(image, account_nsid, stamp)
+  assert_component("account id", account_nsid)
+  stamp = compact_stamp(stamp)
+  if not stamp then return nil end
+  if M.get_uploaded_at(image, account_nsid) == stamp then return stamp end
+  M.clear_uploaded_at(image, account_nsid)
+  attach(image, ensure_tag(uploaded_tag(account_nsid, stamp)))
+  return stamp
 end
 
 local function set_published_kind_at(image, account_nsid, kind, stamp)
@@ -2185,6 +2236,7 @@ function M.clear_photo_id(image, account_nsid)
   local old_tag = dt.tags.find(photo_tag(account_nsid, old_id))
   if old_tag then detach(image, old_tag) end
   M.clear_published_at(image, account_nsid)
+  M.clear_uploaded_at(image, account_nsid)
   M.clear_needs_republish(image, account_nsid)
   for _, reason in ipairs(known_metadata_reasons()) do M.clear_fingerprint(image, account_nsid, reason) end
   return true
@@ -2539,6 +2591,37 @@ function M.metadata_resend_plan(sync, reasons)
   }
   plan.any = plan.send_meta or plan.send_tags or plan.send_date or plan.send_gps
   return plan
+end
+
+-- Convert a Flickr `dateuploaded` value (the UTC epoch-seconds string returned by
+-- flickr.photos.getInfo) into a compact UTC stamp matching state.now_stamp()'s
+-- format (YYYYMMDDTHHMMSSZ), so it can be stored as the per-image upload-date tag
+-- (issue #21). Flickr's dateuploaded is the authoritative server upload time; we
+-- normalize it through os.date("!...") so it lands in the same UTC stamp grammar
+-- the state module already parses. Returns nil for empty/garbage/non-positive
+-- input (e.g. Flickr returning "0" or a malformed value), so callers can simply
+-- skip storage when there is nothing real to record. Pure/offline-testable.
+function M.flickr_upload_stamp(dateuploaded)
+  local n = tonumber(dateuploaded)
+  if not n or n ~= n or n <= 0 then return nil end
+  n = math.floor(n)
+  return os.date("!%Y%m%dT%H%M%SZ", n)
+end
+
+-- Human-readable form of a stored upload stamp (or a raw Flickr dateuploaded),
+-- for surfacing in the panel: "YYYY-MM-DD HH:MM:SS UTC". Accepts either the
+-- compact stamp grammar (YYYYMMDDTHHMMSSZ) or a Flickr epoch-seconds value, and
+-- returns nil when neither parses. Pure/offline-testable.
+function M.format_upload_datetime(value)
+  local s = tostring(value or ""):match("^%s*(.-)%s*$")
+  if s == "" then return nil end
+  local y, mo, d, h, mi, sec = s:match("^(%d%d%d%d)(%d%d)(%d%d)T(%d%d)(%d%d)(%d%d)Z$")
+  if y then
+    return string.format("%s-%s-%s %s:%s:%s UTC", y, mo, d, h, mi, sec)
+  end
+  local stamp = M.flickr_upload_stamp(s)
+  if not stamp then return nil end
+  return M.format_upload_datetime(stamp)
 end
 
 function M.fingerprints_from_values(values)
@@ -6988,7 +7071,19 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
     visibility and remote_attr(visibility, "isfamily")) or 0
   panel_safety_widget.selected = panel_safety_index_from_remote(remote_attr(body, "safety_level")) or 0
   panel_license_widget.selected = panel_license_index_from_id(remote_attr(body, "license")) or 0
-  local content_type_index = load_remote_content_type(api_key, api_secret, acc, photo_id, remote_attr(body, "dateuploaded"))
+  local remote_dateuploaded = remote_attr(body, "dateuploaded")
+  -- Persist Flickr's authoritative upload date/time (issue #21). This is the
+  -- truth source: it refines the local stamp a fresh upload seeded, and — more
+  -- importantly — backfills the real date for photos that were claimed/linked
+  -- long after they were first uploaded. Best-effort: a missing/garbage value
+  -- (flickr_upload_stamp returns nil) leaves any existing record untouched.
+  if acc and panel_current.image then
+    local upload_stamp = metadata.flickr_upload_stamp(remote_dateuploaded)
+    if upload_stamp then
+      state.set_uploaded_at(panel_current.image, acc.nsid, upload_stamp)
+    end
+  end
+  local content_type_index = load_remote_content_type(api_key, api_secret, acc, photo_id, remote_dateuploaded)
   panel_content_type_widget.selected = content_type_index or 0
   local perms_unavailable = false
   if acc then
@@ -8794,6 +8889,14 @@ local function store(storage, image, format, filename, number, total, high_quali
   if photo_id then
     state.set_photo_id(image, extra_data.account.nsid, photo_id)
     state.set_image_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
+    -- Record the Flickr upload date/time (issue #21). A fresh upload's
+    -- authoritative dateuploaded is, within seconds, the moment we just sent it,
+    -- so seed it from the local publish stamp; the panel's load-remote path later
+    -- refines it with Flickr's exact value. A replace keeps the original photo's
+    -- upload date on Flickr, so do NOT overwrite the stored stamp there.
+    if not is_replace then
+      state.set_uploaded_at(image, extra_data.account.nsid, extra_data.publish_stamp)
+    end
     local post_failed = false
     local failed_metadata_fields = {}
     -- A replace carries no metadata (the endpoint only accepts the photo id and
