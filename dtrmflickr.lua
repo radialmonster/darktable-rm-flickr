@@ -5280,6 +5280,73 @@ function M.matches_query(item, query)
   return haystack:find(query, 1, true) ~= nil
 end
 
+-- Relevance score for `item` against an already-lowercased `query` (lower bins
+-- sort first). Used by filter_matches so the most relevant albums surface within
+-- a display cap on large libraries:
+--   0  exact match on id / title / rendered label
+--   1  title starts with the query (prefix)
+--   2  a word inside the title starts with the query
+--   3  some other substring hit (id, mid-word in title, or label)
+-- Returns nil when the item does not match at all.
+local function match_score(item, query)
+  if query == "" then return 3 end
+  local id = tostring(item.id or ""):lower()
+  local title = tostring(item.title or ""):lower()
+  local label = M.label(item):lower()
+  if query == id or query == title or query == label then return 0 end
+  if title:sub(1, #query) == query then return 1 end
+  -- word-boundary prefix inside the title (after a space or punctuation)
+  if (" " .. title):find("[%s%p]" .. query:gsub("(%W)", "%%%1"), 1, false) then return 2 end
+  if id:find(query, 1, true) or title:find(query, 1, true) or label:find(query, 1, true) then
+    return 3
+  end
+  return nil
+end
+M.match_score = match_score
+
+-- Filter `cache` to the items matching `query`, ranked by relevance (see
+-- match_score: exact > title-prefix > word-prefix > other substring), with the
+-- cache's existing natural-title order as a stable tiebreak. An empty/whitespace
+-- query returns the whole cache in its current order.
+--
+-- Returns (matches, total) where `total` is the full match count (before the
+-- limit) and `matches` is capped to `limit` (no cap when limit is nil/<=0). The
+-- ranking is what makes large libraries usable: the album a user is typing
+-- toward stays visible within the cap instead of being hidden behind dozens of
+-- earlier-in-the-alphabet substring hits.
+function M.filter_matches(cache, query, limit)
+  query = trim(query):lower()
+  cache = cache or {}
+  if query == "" then
+    local all = {}
+    for _, item in ipairs(cache) do all[#all + 1] = item end
+    local total = #all
+    if limit and limit > 0 and total > limit then
+      local capped = {}
+      for i = 1, limit do capped[i] = all[i] end
+      return capped, total
+    end
+    return all, total
+  end
+
+  local scored = {}
+  for index, item in ipairs(cache) do
+    local score = match_score(item, query)
+    if score then
+      scored[#scored + 1] = { item = item, score = score, index = index }
+    end
+  end
+  table.sort(scored, function(a, b)
+    if a.score ~= b.score then return a.score < b.score end
+    return a.index < b.index
+  end)
+
+  local matches, total = {}, #scored
+  local n = (limit and limit > 0) and math.min(limit, total) or total
+  for i = 1, n do matches[i] = scored[i].item end
+  return matches, total
+end
+
 -- Resolve a free-text album reference against `cache`. Returns (item, kind):
 --   "exact"     id/title/label matched exactly
 --   "unique"    a single fuzzy match
@@ -6690,16 +6757,15 @@ local function update_album_match_widget(widget, query)
     widget.value = nil
     return #album_cache, 0
   end
-  local count = 0
+  -- Rank matches by relevance (exact > title-prefix > word-prefix > other
+  -- substring) and cap to ALBUM_MATCH_LIMIT, so on large libraries the album the
+  -- user is typing toward stays within the shown set instead of being hidden
+  -- behind dozens of earlier-in-the-alphabet substring hits (issue #29).
+  local matches, count = albums.filter_matches(album_cache, query, ALBUM_MATCH_LIMIT)
   local shown = 0
-  for _, item in ipairs(album_cache) do
-    if albums.matches_query(item, query) then
-      count = count + 1
-      if shown < ALBUM_MATCH_LIMIT then
-        shown = shown + 1
-        widget[shown] = albums.label(item)
-      end
-    end
+  for _, item in ipairs(matches) do
+    shown = shown + 1
+    widget[shown] = albums.label(item)
   end
   widget.selected = 0
   widget.value = nil
