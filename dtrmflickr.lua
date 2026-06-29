@@ -2510,10 +2510,91 @@ function M.choose_existing_match(candidates, terms, taken)
   return nil, #candidates > 0 and "no strong unique match" or "no match"
 end
 
-function M.claim_existing_for_image(api_key, api_secret, acc, image)
-  if state.get_photo_id(image, acc.nsid) then return "skipped", "already linked" end
+-- Parse a single Flickr photo ID from a raw ID or a Flickr URL/permalink. Pure
+-- helper shared by the panel's manual-link entry and the batch-claim list parser.
+function M.parse_photo_id(value)
+  value = tostring(value or ""):match("^%s*(.-)%s*$")
+  if value == "" then return nil end
+  if value:match("^%d+$") then return value end
+  return value:match("[?&]photo_id=(%d+)")
+    or value:match("/photos/[^/]+/(%d+)")
+    or value:match("/photo%.gne%?id=(%d+)")
+    or value:match("(%d%d%d%d%d%d%d%d+)")
+end
+
+-- Parse a pasted list of Flickr photo IDs/URLs separated by any mix of
+-- whitespace, commas, or semicolons. Order is preserved and duplicates are kept
+-- (batch claim maps tokens positionally onto the selection, so dropping a
+-- duplicate would silently shift every later pairing). Tokens that contain no
+-- recognizable ID are skipped. Issue #16.
+function M.parse_photo_id_list(text)
+  local ids = {}
+  for token in tostring(text or ""):gmatch("[^%s,;]+") do
+    local id = M.parse_photo_id(token)
+    if id then ids[#ids + 1] = id end
+  end
+  return ids
+end
+
+-- Pair selected images with parsed photo IDs positionally (image[i] -> id[i]).
+-- Returns the paired list plus leftover counts so the caller can warn when the
+-- list and the selection are different lengths. Pure. Issue #16.
+function M.plan_batch_claim(images, ids)
+  images = images or {}
+  ids = ids or {}
+  local paired = {}
+  local n = math.min(#images, #ids)
+  for i = 1, n do
+    paired[i] = { image = images[i], id = ids[i] }
+  end
+  return {
+    pairs = paired,
+    image_count = #images,
+    id_count = #ids,
+    paired = n,
+    leftover_ids = #ids - n,
+    leftover_images = #images - n,
+  }
+end
+
+-- Human-readable label for an ambiguous-match candidate, for the panel picker.
+-- Title is already XML-unescaped by parse_search_photos; preserve its case. Pure.
+function M.format_candidate_label(candidate, index)
+  candidate = candidate or {}
+  local label = string.format("%d. %s", tonumber(index) or 0, tostring(candidate.id or "?"))
+  local title = tostring(candidate.title or ""):match("^%s*(.-)%s*$")
+  if title ~= "" then label = label .. " — " .. title end
+  local date = candidate.datetaken or candidate.dateupload
+  date = date and tostring(date):match("^%s*(.-)%s*$") or ""
+  if date ~= "" then label = label .. " (" .. date .. ")" end
+  return label
+end
+
+-- Run the candidate search and best-match selection for one image without
+-- committing a link. The panel uses this to drive the ambiguous-candidate
+-- picker (issue #16): when `match` is nil but `candidates` is non-empty, the
+-- user chooses one manually. claim_existing_for_image is the auto-claim wrapper.
+function M.collect_candidates_for_image(api_key, api_secret, acc, image)
+  if state.get_photo_id(image, acc.nsid) then
+    return { status = "skipped", reason = "already linked", candidates = {}, errors = {} }
+  end
   local candidates, terms, taken, errors, transient = search_existing_candidates(api_key, api_secret, acc, image)
   local match, reason = M.choose_existing_match(candidates, terms, taken)
+  return {
+    match = match,
+    reason = reason,
+    candidates = candidates,
+    terms = terms,
+    taken = taken,
+    errors = errors,
+    transient = transient,
+  }
+end
+
+function M.claim_existing_for_image(api_key, api_secret, acc, image)
+  local result = M.collect_candidates_for_image(api_key, api_secret, acc, image)
+  if result.status == "skipped" then return "skipped", result.reason end
+  local match, reason, errors, transient = result.match, result.reason, result.errors, result.transient
   if match then
     state.set_photo_id(image, acc.nsid, match.id)
     return "claimed", string.format("%s (%s)", tostring(match.id), reason)
@@ -5740,6 +5821,23 @@ local panel_photo_id_entry = dt.new_widget("entry") {
   placeholder = _("Flickr photo ID or URL"),
   tooltip = _("paste a Flickr photo ID or URL to replace the selected image's stored Flickr link"),
 }
+-- Ambiguous-candidate picker + batch claim (issue #16). Widgets and state live
+-- on panel_sets (table fields, not main-chunk locals) to stay under Lua's
+-- per-function local limit (see CLAUDE.md). candidate_ids[i] holds the Flickr
+-- photo ID behind candidate_widget entry i.
+panel_sets.candidate_ids = {}
+panel_sets.candidate_image = nil
+panel_sets.candidate_account_nsid = nil
+panel_sets.candidate_widget = dt.new_widget("combobox") {
+  label = _("duplicate candidates"),
+  tooltip = _("possible Flickr matches for the selected image; choose one and click \"link chosen candidate\""),
+  selected = 0,
+}
+panel_sets.batch_claim_entry = dt.new_widget("entry") {
+  text = "",
+  placeholder = _("photo IDs/URLs, separated by spaces or commas"),
+  tooltip = _("paste a list of Flickr photo IDs or URLs; they are linked to the selected images in order"),
+}
 
 local refresh_panel
 local panel_current = { image = nil, account = nil, photo_id = nil, selection_count = 0, remote_loaded = false }
@@ -6096,15 +6194,7 @@ local function parse_search_content_type(body, photo_id)
   return nil
 end
 
-local function parse_photo_id_or_url(value)
-  value = tostring(value or ""):match("^%s*(.-)%s*$")
-  if value == "" then return nil end
-  if value:match("^%d+$") then return value end
-  return value:match("[?&]photo_id=(%d+)")
-    or value:match("/photos/[^/]+/(%d+)")
-    or value:match("/photo%.gne%?id=(%d+)")
-    or value:match("(%d%d%d%d%d%d%d%d+)")
-end
+local parse_photo_id_or_url = claim.parse_photo_id
 
 local function set_panel_photo_id_link()
   local selection = dt.gui.selection and dt.gui.selection() or {}
@@ -6958,6 +7048,83 @@ function panel_sets.scan_selected_publish_state()
     #selection, counts["needs-republish"] or 0, counts.current or 0, counts.unknown or 0, counts.unpublished or 0))
 end
 
+-- Clear the ambiguous-candidate picker (issue #16).
+function panel_sets.clear_candidates()
+  panel_sets.candidate_ids = {}
+  panel_sets.candidate_image = nil
+  panel_sets.candidate_account_nsid = nil
+  if panel_sets.candidate_widget then
+    clear_widget_items(panel_sets.candidate_widget)
+    panel_sets.candidate_widget.selected = 0
+  end
+end
+
+-- Fill the picker with the ambiguous candidates for a single image so the user
+-- can choose one and click "link chosen candidate" (issue #16).
+function panel_sets.populate_candidates(image, account_nsid, candidates)
+  panel_sets.candidate_ids = {}
+  panel_sets.candidate_image = image
+  panel_sets.candidate_account_nsid = account_nsid
+  clear_widget_items(panel_sets.candidate_widget)
+  for i, candidate in ipairs(candidates or {}) do
+    panel_sets.candidate_widget[i] = claim.format_candidate_label(candidate, i)
+    panel_sets.candidate_ids[i] = candidate.id
+  end
+  panel_sets.candidate_widget.selected = #panel_sets.candidate_ids > 0 and 1 or 0
+end
+
+-- "link chosen candidate": commit the picker selection as the image's link.
+function panel_sets.link_candidate()
+  local image = panel_sets.candidate_image
+  local account_nsid = panel_sets.candidate_account_nsid
+  local index = panel_sets.candidate_widget and panel_sets.candidate_widget.selected or 0
+  local photo_id = index and panel_sets.candidate_ids[index]
+  if not image or not account_nsid or not photo_id then
+    dt.print(_("Flickr: no candidate selected. Click \"claim existing\" on one image first."))
+    return
+  end
+  state.set_photo_id(image, account_nsid, photo_id)
+  panel_sets.clear_candidates()
+  panel_remote_label.label = string.format(_("Flickr: linked to chosen candidate %s"), photo_id)
+  dt.print(panel_remote_label.label)
+  refresh_panel(true, http.quiet_rest_available())
+end
+
+-- Batch claim from a pasted list of photo IDs/URLs, mapped positionally onto the
+-- selected images (issue #16). Does not search Flickr; the user supplies the IDs.
+function panel_sets.batch_claim_from_list()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection == 0 then
+    dt.print(_("Flickr: select the images to claim, then paste their Flickr IDs/URLs in order."))
+    return
+  end
+  local acc = load_token()
+  local account_nsid = acc and acc.nsid or state.get_any_photo_id(selection[1])
+  if not account_nsid or account_nsid == "" then
+    dt.print(_("Flickr: log in first, or select photos that already have a Flickr link."))
+    return
+  end
+  local ids = claim.parse_photo_id_list(panel_sets.batch_claim_entry.text)
+  if #ids == 0 then
+    dt.print(_("Flickr: no Flickr photo IDs or URLs found in the list."))
+    return
+  end
+  local plan = claim.plan_batch_claim(selection, ids)
+  local linked = 0
+  for _, pair in ipairs(plan.pairs) do
+    state.set_photo_id(pair.image, account_nsid, pair.id)
+    linked = linked + 1
+    dt.print(string.format(_("Flickr: linked %s to photo %s"),
+      (pair.image and pair.image.filename) or "image", pair.id))
+  end
+  panel_sets.batch_claim_entry.text = ""
+  panel_remote_label.label = string.format(
+    _("Flickr: batch claim linked %d photo(s) (%d image(s) left over, %d ID(s) left over)"),
+    linked, plan.leftover_images, plan.leftover_ids)
+  dt.print(panel_remote_label.label)
+  refresh_panel(true, false)
+end
+
 local function claim_existing_selection()
   local selection = dt.gui.selection and dt.gui.selection() or {}
   if #selection == 0 then
@@ -6975,6 +7142,53 @@ local function claim_existing_selection()
     return
   end
 
+  -- Single image: if there is no confident unique match but Flickr returned
+  -- candidates, surface them in the picker instead of silently skipping so the
+  -- user can pick the right one (issue #16).
+  if #selection == 1 then
+    panel_sets.clear_candidates()
+    local image = selection[1]
+    local result = __dtrmflickr_call("flickr.photos.search", function()
+      return claim.collect_candidates_for_image(api_key, api_secret, acc, image)
+    end)
+    if type(result) ~= "table" then
+      dt.print(string.format(_("Flickr: could not search %s: %s"),
+        (image and image.filename) or "image", tostring(result)))
+      return
+    end
+    if result.match then
+      state.set_photo_id(image, acc.nsid, result.match.id)
+      panel_remote_label.label = string.format(_("Flickr: linked %s to photo %s (%s)"),
+        (image and image.filename) or "image", result.match.id, result.reason)
+      dt.print(panel_remote_label.label)
+      refresh_panel(true)
+      return
+    end
+    if result.transient then
+      dt.print(string.format(_("Flickr: could not search %s: %s"),
+        (image and image.filename) or "image", result.transient))
+      return
+    end
+    if result.candidates and #result.candidates > 0 then
+      panel_sets.populate_candidates(image, acc.nsid, result.candidates)
+      panel_remote_label.label = string.format(
+        _("Flickr: %d possible match(es) for %s (%s); choose one below and click \"link chosen candidate\""),
+        #result.candidates, (image and image.filename) or "image", tostring(result.reason))
+      dt.print(panel_remote_label.label)
+      return
+    end
+    if result.errors and #result.errors > 0 then
+      dt.print(string.format(_("Flickr: could not search %s: %s"),
+        (image and image.filename) or "image", table.concat(result.errors, "; ")))
+      return
+    end
+    panel_remote_label.label = string.format(_("Flickr: no match found for %s (%s)"),
+      (image and image.filename) or "image", tostring(result.reason))
+    dt.print(panel_remote_label.label)
+    return
+  end
+
+  panel_sets.clear_candidates()
   local counts = { claimed = 0, skipped = 0, error = 0 }
   for _index, image in ipairs(selection) do
     local status, detail = __dtrmflickr_call("flickr.photos.search", function()
@@ -7004,6 +7218,11 @@ function refresh_panel(force, fetch_remote)
 
   local selection = dt.gui.selection and dt.gui.selection() or {}
   local image = selection[1]
+  -- Drop a stale ambiguous-candidate picker when the selection moves off the
+  -- image it was populated for (issue #16).
+  if panel_sets.candidate_image and (#selection ~= 1 or panel_sets.candidate_image ~= image) then
+    panel_sets.clear_candidates()
+  end
   panel_current = { image = image, account = nil, photo_id = nil, selection_count = #selection, remote_loaded = false }
   if not image then
     panel_sets.update_photo_link_buttons(selection, nil, nil)
@@ -7156,6 +7375,19 @@ local panel_widget = dt.new_widget("box") {
       label = _("clear link"),
       clicked_callback = function() clear_panel_photo_id_link() end,
     },
+  },
+  panel_sets.candidate_widget,
+  dt.new_widget("button") {
+    label = _("link chosen candidate"),
+    tooltip = _("link the selected image to the candidate chosen above"),
+    clicked_callback = function() panel_sets.link_candidate() end,
+  },
+  dt.new_widget("label") { label = _("batch claim from list") },
+  panel_sets.batch_claim_entry,
+  dt.new_widget("button") {
+    label = _("batch claim from list"),
+    tooltip = _("link the selected images, in order, to the pasted Flickr photo IDs/URLs"),
+    clicked_callback = function() panel_sets.batch_claim_from_list() end,
   },
   panel_remote_label,
   panel_tags_label,
@@ -7947,6 +8179,11 @@ script_data.__test = {
   claim_match_terms = claim.claim_match_terms,
   choose_existing_match = claim.choose_existing_match,
   claim_existing_for_image = claim.claim_existing_for_image,
+  collect_candidates_for_image = claim.collect_candidates_for_image,
+  parse_photo_id = claim.parse_photo_id,
+  parse_photo_id_list = claim.parse_photo_id_list,
+  plan_batch_claim = claim.plan_batch_claim,
+  format_candidate_label = claim.format_candidate_label,
   parse_photo_id_or_url = parse_photo_id_or_url,
   panel_content_type_index_from_search_value = panel_content_type_index_from_search_value,
   flickr_queue = __dtrmflickr_queue,
