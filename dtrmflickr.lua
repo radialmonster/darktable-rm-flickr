@@ -5404,6 +5404,110 @@ function M.resolve_existing(value, resolver)
   return targets, errors
 end
 
+-- Membership preview for a typed target-album field (issue #28).
+--
+-- As the user types/selects an album to ADD the current photo to, the panel
+-- wants to say whether that photo is already in the named album(s) — before the
+-- add attempt, instead of only discovering it from Flickr's error 3 ("already in
+-- set"). This is the pure core: it resolves the typed value against the cache
+-- (via the same `resolver(part)` shape add() uses) and compares each resolved
+-- target id to `member_ids` (the photo's current set ids, e.g. state.get_sets).
+--
+-- `member_ids` may be a list or a set-like table; ids are compared as strings.
+-- Returns a result table:
+--   entries  — per-target { query, id?, title?, status }, in input order, where
+--              status is "member" / "not_member" / "ambiguous" / "none"
+--   members      — count of status == "member"
+--   non_members  — count of status == "not_member"
+--   unresolved   — count of "ambiguous" + "none"
+--   total        — #entries
+-- An empty/whitespace value returns an empty result (total == 0).
+function M.target_membership_status(value, resolver, member_ids)
+  local result = { entries = {}, members = 0, non_members = 0, unresolved = 0, total = 0 }
+
+  -- Normalize member_ids into a string-keyed set, accepting either a list
+  -- ({"100","200"}) or a set ({ ["100"] = true }).
+  local member_set = {}
+  if type(member_ids) == "table" then
+    local is_list = member_ids[1] ~= nil
+    if is_list then
+      for _, id in ipairs(member_ids) do
+        local s = tostring(id or "")
+        if s ~= "" then member_set[s] = true end
+      end
+    else
+      for id, present in pairs(member_ids) do
+        if present then
+          local s = tostring(id or "")
+          if s ~= "" then member_set[s] = true end
+        end
+      end
+    end
+  end
+
+  for _, part in ipairs(M.split_album_input(value)) do
+    local m, k
+    if resolver then m, k = resolver(part) end
+    local entry
+    if m and m.id and tostring(m.id) ~= "" then
+      local id = tostring(m.id)
+      local is_member = member_set[id] == true
+      entry = {
+        query = part,
+        id = id,
+        title = m.title or id,
+        status = is_member and "member" or "not_member",
+      }
+      if is_member then result.members = result.members + 1
+      else result.non_members = result.non_members + 1 end
+    else
+      local status = (k == "ambiguous") and "ambiguous" or "none"
+      entry = { query = part, status = status }
+      result.unresolved = result.unresolved + 1
+    end
+    result.entries[#result.entries + 1] = entry
+  end
+
+  result.total = #result.entries
+  return result
+end
+
+-- Short human label for a target_membership_status result, for the panel's
+-- live add-to-album indicator. `translate` is an optional gettext-style fn (it
+-- receives plain English and may localize); when absent the English is used.
+-- Returns "" for an empty result so the panel can blank the indicator.
+function M.format_membership_status(result, translate)
+  local t = translate or function(s) return s end
+  if not result or (result.total or 0) == 0 then return "" end
+
+  -- Single typed target: a precise, photo-centric sentence.
+  if result.total == 1 then
+    local e = result.entries[1]
+    if e.status == "member" then
+      return string.format(t("already in '%s'"), e.title or e.query)
+    elseif e.status == "not_member" then
+      return string.format(t("not yet in '%s'"), e.title or e.query)
+    elseif e.status == "ambiguous" then
+      return string.format(t("'%s': too many matching albums"), e.query)
+    else
+      return string.format(t("'%s': no matching album"), e.query)
+    end
+  end
+
+  -- Multiple typed targets: a compact tally.
+  local parts = {}
+  if result.members > 0 then
+    parts[#parts + 1] = string.format(t("%d already a member"), result.members)
+  end
+  if result.non_members > 0 then
+    parts[#parts + 1] = string.format(t("%d to add"), result.non_members)
+  end
+  if result.unresolved > 0 then
+    parts[#parts + 1] = string.format(t("%d unresolved"), result.unresolved)
+  end
+  return table.concat(parts, ", ")
+end
+
 -- Resolve a comma-separated list of NEW-album titles into targets. Each title
 -- is checked against the cache via `exact_resolver(title)` (find_album_exact):
 -- if a set with that exact title/id already exists we reuse it (kind="existing",
@@ -6826,6 +6930,11 @@ panel_sets.match_widget = dt.new_widget("combobox") {
   tooltip = _("matching fetched Flickr albums; select one or type an exact name/ID above"),
   selected = 0,
 }
+-- Live "is the photo already in this target album?" indicator (issue #28). Driven
+-- by albums.target_membership_status against the photo's recorded memberships, so
+-- the user sees "already in 'Trips'" before pressing add. Lives on panel_sets
+-- (table field) to stay under Lua's per-function main-chunk local limit.
+panel_sets.membership_label = dt.new_widget("label") { label = "" }
 panel_sets.new_entry = dt.new_widget("entry") {
   text = "",
   placeholder = _("new album title"),
@@ -7008,11 +7117,17 @@ end
 
 function panel_sets.update_current_choices(image, account_nsid)
   panel_sets.clear_current_choices()
-  if not image or not account_nsid then return end
-  for _, set_id in ipairs(albums.ordered_set_ids(album_cache, state.get_sets(image, account_nsid))) do
-    panel_sets.current_ids[#panel_sets.current_ids + 1] = set_id
-    panel_sets.current_widget[#panel_sets.current_widget + 1] = panel_sets.title_for_id(set_id)
+  if image and account_nsid then
+    for _, set_id in ipairs(albums.ordered_set_ids(album_cache, state.get_sets(image, account_nsid))) do
+      panel_sets.current_ids[#panel_sets.current_ids + 1] = set_id
+      panel_sets.current_widget[#panel_sets.current_widget + 1] = panel_sets.title_for_id(set_id)
+    end
   end
+  -- Memberships (or the loaded photo) just changed — keep the "already in target
+  -- album?" indicator (issue #28) in sync. update_membership_indicator blanks
+  -- itself when no photo is loaded, so this also clears a stale indicator on
+  -- deselect.
+  if panel_sets.update_membership_indicator then panel_sets.update_membership_indicator() end
 end
 
 function panel_sets.selected_current_id()
@@ -7032,6 +7147,24 @@ function panel_sets.update_choices(query)
   local count, shown = update_album_match_widget(panel_sets.match_widget, query)
   panel_sets.filtering = false
   return count, shown
+end
+
+-- Refresh the "already in this target album?" indicator (issue #28) from the
+-- current add-to-album input and the loaded photo's recorded memberships. Blanks
+-- the line when nothing is typed, no photo is loaded, or no albums are cached
+-- (resolve() can't match without a cache, so an indicator would be misleading).
+function panel_sets.update_membership_indicator()
+  if not panel_sets.membership_label then return end
+  local image = panel_current.image
+  local acc = panel_current.account
+  local value = panel_sets.input_value()
+  if value == "" or not image or not acc or #album_cache == 0 then
+    panel_sets.membership_label.label = ""
+    return
+  end
+  local member_ids = state.get_sets(image, acc.nsid)
+  local result = albums.target_membership_status(value, panel_sets.resolve, member_ids)
+  panel_sets.membership_label.label = albums.format_membership_status(result, _)
 end
 
 function panel_sets.title_for_id(set_id)
@@ -7065,12 +7198,14 @@ function panel_sets.search()
   else
     panel_sets.status_label.label = string.format(_("%d matching album(s)"), count)
   end
+  panel_sets.update_membership_indicator()
 end
 
 panel_sets.match_widget.changed_callback = function(widget)
   if panel_sets.filtering then return end
   local selected = trim(widget.value or "")
   if selected ~= "" then panel_sets.entry.text = selected end
+  panel_sets.update_membership_indicator()
 end
 
 local function panel_reset_remote(message)
@@ -9143,6 +9278,7 @@ local panel_widget = dt.new_widget("box") {
     },
   },
   panel_sets.match_widget,
+  panel_sets.membership_label,
   panel_sets.current_widget,
   dt.new_widget("box") {
     orientation = "horizontal",
