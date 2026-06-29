@@ -5598,6 +5598,49 @@ function M.classify_error(err)
   return "other"
 end
 
+-- comment_count(body): the <comments>N</comments> count from a getInfo body, or
+-- nil when absent/non-numeric. Free data — getInfo is already fetched on panel load.
+function M.comment_count(body)
+  local n = tostring(body or ""):match("<comments>%s*(%d+)%s*</comments>")
+  return tonumber(n)
+end
+
+-- search_views(body, photo_id): the view count for `photo_id` from a
+-- flickr.photos.search body whose `extras` requested `views` (so each <photo>
+-- carries a views="N" attribute). Free data — the panel already issues this search
+-- for the content-type read; we just widen its extras. Matches the photo by id
+-- (handles both self-closing and open <photo> elements). Returns nil when the
+-- photo isn't in the page or carries no numeric views attribute.
+function M.search_views(body, photo_id)
+  local id = tostring(photo_id or "")
+  if id == "" then return nil end
+  for attrs in tostring(body or ""):gmatch("<photo%s+([^>]-)/?>") do
+    local this = attrs:match('id="(.-)"') or attrs:match("id='(.-)'")
+    if this == id then
+      local v = attrs:match('views="(.-)"') or attrs:match("views='(.-)'")
+      return tonumber(v)
+    end
+  end
+  return nil
+end
+
+-- format_stats(views, comments): a compact, panel-only stats line built from the
+-- counts that come free with calls the panel already makes (no extra request;
+-- faves have no free source so are never shown — issue #73). Returns nil when
+-- nothing is available, so the caller can clear/hide the line. Pluralises and
+-- joins with a middot, e.g. "42 views · 1 comment".
+local function plural(n, one, many)
+  return tostring(n) .. " " .. (n == 1 and one or many)
+end
+
+function M.format_stats(views, comments)
+  local parts = {}
+  if type(views) == "number" then parts[#parts + 1] = plural(views, "view", "views") end
+  if type(comments) == "number" then parts[#parts + 1] = plural(comments, "comment", "comments") end
+  if #parts == 0 then return nil end
+  return table.concat(parts, " \u{00B7} ")
+end
+
 local function norm(v)
   return tostring(v == nil and "" or v)
 end
@@ -6676,6 +6719,11 @@ panel_sets.delete_confirm = dt.new_widget("check_button") {
 }
 local panel_remote_label = dt.new_widget("label") { label = "" }
 local panel_tags_label = dt.new_widget("label") { label = "" }
+-- Panel-only Flickr stats line (issue #73): views + comment count for the selected
+-- published photo. Display-only, never persisted into darktable, and built solely
+-- from counts that come free with calls the panel already makes (getInfo comments,
+-- the content-type search widened to extras=views) — no extra request, no faves.
+local panel_stats_label = dt.new_widget("label") { label = "" }
 -- Tag reconciler (issue #3): side-by-side local-keyword vs Flickr-tag view plus
 -- explicit actions. All widgets/handlers/state live in this one table to keep the
 -- main chunk under Lua's per-function local limit (see CLAUDE.md).
@@ -6951,6 +6999,7 @@ end
 local function panel_reset_remote(message)
   panel_remote_label.label = message or ""
   panel_tags_label.label = ""
+  panel_stats_label.label = ""
   if panel_reconcile.reset then panel_reconcile.reset() end
   panel_loading = true
   panel_privacy_widget.selected = 0
@@ -7419,7 +7468,8 @@ end
 local function load_remote_content_type(api_key, api_secret, acc, photo_id, dateuploaded)
   local args = {
     user_id = acc and acc.nsid or nil,
-    extras = "content_type",
+    -- `views` is free here (same call) and feeds the panel-only stats line (#73).
+    extras = "content_type,views",
     per_page = 50,
     page = 1,
   }
@@ -7439,7 +7489,8 @@ local function load_remote_content_type(api_key, api_secret, acc, photo_id, date
     end, { coalesce_key = "panel-refresh-content:" .. tostring(photo_id) })
   end
   local search_value = parse_search_content_type(body, photo_id)
-  return panel_content_type_index_from_search_value(search_value), search_value, err
+  return panel_content_type_index_from_search_value(search_value), search_value, err,
+    remote_pull.search_views(body, photo_id)
 end
 
 local function load_remote_settings(api_key, api_secret, acc, photo_id)
@@ -7492,8 +7543,11 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
       state.set_uploaded_at(panel_current.image, acc.nsid, upload_stamp)
     end
   end
-  local content_type_index = load_remote_content_type(api_key, api_secret, acc, photo_id, remote_dateuploaded)
+  local content_type_index, _ctv, _cte, remote_views = load_remote_content_type(api_key, api_secret, acc, photo_id, remote_dateuploaded)
   panel_content_type_widget.selected = content_type_index or 0
+  -- Panel-only Flickr stats (#73): views (from the search above) + comment count
+  -- (from the getInfo body). Display-only; both are free with calls we already make.
+  panel_stats_label.label = remote_pull.format_stats(remote_views, remote_pull.comment_count(body)) or ""
   local perms_unavailable = false
   if acc then
     local perms_body, perms_err = __dtrmflickr_call("flickr.photos.getPerms", function()
@@ -8956,6 +9010,7 @@ local panel_widget = dt.new_widget("box") {
   },
   panel_remote_label,
   panel_tags_label,
+  panel_stats_label,
   panel_privacy_widget,
   panel_safety_widget,
   panel_sets.hidden_widget,
