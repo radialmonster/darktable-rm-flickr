@@ -5199,6 +5199,117 @@ end
 return M
 end
 
+package.preload["dtrmflickr.albums"] = function(...)
+-- albums.lua — pure album (photoset) input helpers.
+--
+-- The album field on the export panel (and the lighttable panel) lets a user
+-- name SEVERAL albums at once, separated by commas, so one upload can land in
+-- multiple photosets (issue #27). The actual resolution against the fetched
+-- album cache and the Flickr REST calls live in the main module / flickr_rest,
+-- but the parsing + target-building is pure string work — kept here so both the
+-- export path and the panel share one implementation and it can be unit-tested
+-- without darktable UI state.
+
+local M = {}
+
+local function trim(s)
+  return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- Split a user-typed album field into individual album references. Parts are
+-- comma-separated (mirrors the panel's multi-add), trimmed, with empties
+-- dropped. Order is preserved; exact-duplicate raw parts (case-insensitive,
+-- after trimming) are collapsed so "Trips, trips" only resolves once.
+function M.split_album_input(value)
+  local parts, seen = {}, {}
+  if type(value) ~= "string" then return parts end
+  for part in value:gmatch("[^,]+") do
+    local t = trim(part)
+    if t ~= "" then
+      local key = t:lower()
+      if not seen[key] then
+        seen[key] = true
+        parts[#parts + 1] = t
+      end
+    end
+  end
+  return parts
+end
+
+-- Resolve a comma-separated list of EXISTING-album references into photoset
+-- targets. `resolver(part)` is supplied by the caller (it closes over the
+-- album cache) and must behave like find_album_match: return (item, kind) where
+-- item has .id / .title, or (nil, kind) where kind is "ambiguous"/"none"/etc.
+--
+-- Returns:
+--   targets — list of { kind = "existing", photoset_id, title, match? },
+--             deduped by photoset id (so the same album listed twice, or matched
+--             by both name and id, is added once)
+--   errors  — list of { query, reason } for parts that matched nothing or were
+--             ambiguous
+function M.resolve_existing(value, resolver)
+  local targets, errors, seen_ids = {}, {}, {}
+  for _, part in ipairs(M.split_album_input(value)) do
+    local item, kind = resolver(part)
+    if item and item.id and item.id ~= "" then
+      local id = tostring(item.id)
+      if not seen_ids[id] then
+        seen_ids[id] = true
+        targets[#targets + 1] = { kind = "existing", photoset_id = id, title = item.title or id, match = kind }
+      end
+    elseif part:match("^%d+$") then
+      -- A bare numeric reference is treated as a manual photoset id even when it
+      -- is not in the fetched cache (same fallback the single-album path used).
+      if not seen_ids[part] then
+        seen_ids[part] = true
+        targets[#targets + 1] = { kind = "existing", photoset_id = part, title = part, match = "manual-id" }
+      end
+    else
+      errors[#errors + 1] = {
+        query = part,
+        reason = (kind == "ambiguous")
+          and "too many matches; type more or choose from matching albums"
+          or "no matching album; refresh albums or check the name",
+      }
+    end
+  end
+  return targets, errors
+end
+
+-- Resolve a comma-separated list of NEW-album titles into targets. Each title
+-- is checked against the cache via `exact_resolver(title)` (find_album_exact):
+-- if a set with that exact title/id already exists we reuse it (kind="existing",
+-- duplicate_create=true) rather than creating a duplicate; otherwise it becomes
+-- a kind="create" target. Deduped by title and by resolved id.
+--
+-- Always returns an empty errors list (every title is either reused or created);
+-- the signature matches resolve_existing for a uniform caller.
+function M.resolve_create(value, exact_resolver)
+  local targets, errors, seen_titles, seen_ids = {}, {}, {}, {}
+  for _, title in ipairs(M.split_album_input(value)) do
+    local key = title:lower()
+    if not seen_titles[key] then
+      seen_titles[key] = true
+      local match = exact_resolver and exact_resolver(title) or nil
+      if match and match.id and match.id ~= "" then
+        local id = tostring(match.id)
+        if not seen_ids[id] then
+          seen_ids[id] = true
+          targets[#targets + 1] = {
+            kind = "existing", photoset_id = id, title = match.title or title, duplicate_create = true,
+          }
+        end
+      else
+        targets[#targets + 1] = { kind = "create", title = title }
+      end
+    end
+  end
+  return targets, errors
+end
+
+return M
+end
+
 package.preload["dtrmflickr.widgets"] = function(...)
 -- widgets.lua — small darktable widget helpers kept out of the main module so
 -- they stay offline-testable against a faithful widget mock (tests/test_widgets.lua).
@@ -5286,6 +5397,7 @@ local rules = require "dtrmflickr.rules"
 local report = require "dtrmflickr.report"
 local tag_reconcile = require "dtrmflickr.tag_reconcile"
 local people = require "dtrmflickr.people"
+local albums = require "dtrmflickr.albums"
 local widgets = require "dtrmflickr.widgets"
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
@@ -6020,13 +6132,13 @@ end
 
 local album_entry = dt.new_widget("entry") {
   text = "",
-  placeholder = _("existing album name or ID"),
-  tooltip = _("type an existing Flickr album name or ID for this export"),
+  placeholder = _("existing album name(s) or ID(s), comma-separated"),
+  tooltip = _("type one or more existing Flickr albums (name or ID) for this export; separate multiple albums with commas"),
 }
 local album_new_entry = dt.new_widget("entry") {
   text = "",
-  placeholder = _("new album title"),
-  tooltip = _("create a new Flickr album for this export"),
+  placeholder = _("new album title(s), comma-separated"),
+  tooltip = _("create one or more new Flickr albums for this export; separate multiple titles with commas"),
 }
 local album_widget = dt.new_widget("combobox") {
   label = _("matching albums"),
@@ -8745,37 +8857,26 @@ local function current_hidden()
   return hidden_widget.value == true
 end
 
+-- Resolve the album field(s) into a list of photoset targets for finalize.
+-- Both the "existing album" and "create new album" fields accept a
+-- comma-separated list, so a single export can land in several albums at once
+-- (issue #27). Returns { mode, targets, errors } where targets are deduped and
+-- errors lists unresolved/ambiguous existing-album references.
 local function current_album()
   local mode = album_mode_widget.selected or 1
-  local existing_value = album_input_value()
-  local new_title = trim(album_new_entry.text or "")
-  if mode == 2 and existing_value ~= "" then
-    local match, match_kind = find_album_match(existing_value)
-    if match then
-      return {
-        mode = "existing",
-        photoset_id = match.id,
-        title = match.title,
-        match = match_kind,
-      }
-    end
-    if existing_value:match("^%d+$") then return { mode = "existing", photoset_id = existing_value, match = "manual-id" } end
-    return { mode = "none", error = "album not found or ambiguous", query = existing_value, match = match_kind }
+  if mode == 2 then
+    local existing_value = album_input_value()
+    if existing_value == "" then return { mode = "none", targets = {}, errors = {} } end
+    local targets, errors = albums.resolve_existing(existing_value, find_album_match)
+    return { mode = "multi", targets = targets, errors = errors }
   end
-  if mode == 3 and new_title ~= "" then
-    local match, match_kind = find_album_exact(new_title)
-    if match then
-      return {
-        mode = "existing",
-        photoset_id = match.id,
-        title = match.title,
-        duplicate_create = true,
-        match = match_kind,
-      }
-    end
-    return { mode = "create", title = new_title }
+  if mode == 3 then
+    local new_value = trim(album_new_entry.text or "")
+    if new_value == "" then return { mode = "none", targets = {}, errors = {} } end
+    local targets, errors = albums.resolve_create(new_value, find_album_exact)
+    return { mode = "multi", targets = targets, errors = errors }
   end
-  return { mode = "none" }
+  return { mode = "none", targets = {}, errors = {} }
 end
 
 local function supported(storage, format)
@@ -9266,59 +9367,69 @@ local function finalize(storage, image_table, extra_data)
   local post_errors = #(extra_data.post_errors or {})
   local keyword_conflicts = #(extra_data.keyword_conflicts or {})
   local tag_limit_warnings = #(extra_data.tag_limit_warnings or {})
-  local album = extra_data.album or { mode = "none" }
+  local album = extra_data.album or { mode = "none", targets = {}, errors = {} }
   local album_errors = 0
-  local photoset_id = album.photoset_id
 
-  if uploaded > 0 and album.error then
-    album_errors = album_errors + 1
-    dt.print(string.format(_("Flickr: album not applied for '%s': %s"), tostring(album.query or ""), tostring(album.error)))
-    dt.print_log(string.format("[dtrmflickr] finalize: album not applied query='%s': %s",
-      tostring(album.query or ""), tostring(album.error)))
-  end
-
-  if uploaded > 0 and album.mode == "create" then
-    local first = extra_data.uploaded[1]
-    -- max_attempts = 1: photosets.create is non-idempotent (see panel_sets.create);
-    -- a lost-ack retry would create a duplicate album. addPhoto below stays
-    -- retryable because replaying it converges (Flickr returns "already in set").
-    local created_id, err = __dtrmflickr_call("flickr.photosets.create", function()
-      return rest.photosets_create(extra_data.api_key, extra_data.api_secret, extra_data.account,
-        album.title, first.photo_id)
-    end, { max_attempts = 1 })
-    photoset_id = created_id
-    if photoset_id then
-      state.add_set(first.image, extra_data.account.nsid, photoset_id)
-      dt.print(string.format(_("Flickr: created album '%s'"), album.title))
-      dt.print_log(string.format("[dtrmflickr] finalize: created photoset=%s title='%s'", photoset_id, album.title))
-    else
+  -- Unresolved / ambiguous existing-album references: only surfaced once
+  -- something actually uploaded (otherwise there is nothing to file anyway).
+  if uploaded > 0 then
+    for _ei, e in ipairs(album.errors or {}) do
       album_errors = album_errors + 1
-      dt.print(string.format(_("Flickr: album create failed: %s"), tostring(err)))
-      dt.print_log(string.format("[dtrmflickr] finalize: photoset create failed: %s", tostring(err)))
+      dt.print(string.format(_("Flickr: album not applied for '%s': %s"), tostring(e.query or ""), tostring(e.reason or "")))
+      dt.print_log(string.format("[dtrmflickr] finalize: album not applied query='%s': %s",
+        tostring(e.query or ""), tostring(e.reason or "")))
     end
   end
 
-  if uploaded > 0 and album.duplicate_create and photoset_id and photoset_id ~= "" then
-    dt.print(string.format(_("Flickr: album '%s' already exists; adding photos to existing album"), tostring(album.title or photoset_id)))
-    dt.print_log(string.format("[dtrmflickr] finalize: create matched existing photoset=%s title='%s'",
-      tostring(photoset_id), tostring(album.title or "")))
-  end
+  -- Add the uploaded photos to every resolved album target (issue #27: one
+  -- export can land in multiple albums). Each target is independent: create
+  -- targets make a fresh photoset (first upload as primary), existing targets
+  -- add all uploads. A failure against one album does not abort the others.
+  if uploaded > 0 then
+    local first = extra_data.uploaded[1]
+    for _ti, target in ipairs(album.targets or {}) do
+      local photoset_id = target.photoset_id
+      if target.kind == "create" then
+        -- max_attempts = 1: photosets.create is non-idempotent (see panel_sets.create);
+        -- a lost-ack retry would create a duplicate album. addPhoto below stays
+        -- retryable because replaying it converges (Flickr returns "already in set").
+        local created_id, err = __dtrmflickr_call("flickr.photosets.create", function()
+          return rest.photosets_create(extra_data.api_key, extra_data.api_secret, extra_data.account,
+            target.title, first.photo_id)
+        end, { max_attempts = 1 })
+        photoset_id = created_id
+        if photoset_id then
+          state.add_set(first.image, extra_data.account.nsid, photoset_id)
+          dt.print(string.format(_("Flickr: created album '%s'"), target.title))
+          dt.print_log(string.format("[dtrmflickr] finalize: created photoset=%s title='%s'", photoset_id, target.title))
+        else
+          album_errors = album_errors + 1
+          dt.print(string.format(_("Flickr: album create failed: %s"), tostring(err)))
+          dt.print_log(string.format("[dtrmflickr] finalize: photoset create failed: %s", tostring(err)))
+        end
+      elseif target.duplicate_create and photoset_id and photoset_id ~= "" then
+        dt.print(string.format(_("Flickr: album '%s' already exists; adding photos to existing album"), tostring(target.title or photoset_id)))
+        dt.print_log(string.format("[dtrmflickr] finalize: create matched existing photoset=%s title='%s'",
+          tostring(photoset_id), tostring(target.title or "")))
+      end
 
-  if uploaded > 0 and photoset_id and photoset_id ~= "" then
-    local start = album.mode == "create" and 2 or 1
-    for i = start, uploaded do
-      local item = extra_data.uploaded[i]
-      local ok, err = __dtrmflickr_call("flickr.photosets.addPhoto", function()
-        return rest.photosets_add_photo(extra_data.api_key, extra_data.api_secret, extra_data.account,
-          photoset_id, item.photo_id)
-      end)
-      if ok or photoset_add_is_already_present(err) then
-        state.add_set(item.image, extra_data.account.nsid, photoset_id)
-      else
-        album_errors = album_errors + 1
-        dt.print(string.format(_("Flickr: could not add photo %s to album: %s"), tostring(item.photo_id), tostring(err)))
-        dt.print_log(string.format("[dtrmflickr] finalize: add photo_id=%s photoset=%s failed: %s",
-          tostring(item.photo_id), tostring(photoset_id), tostring(err)))
+      if photoset_id and photoset_id ~= "" then
+        local start = target.kind == "create" and 2 or 1
+        for i = start, uploaded do
+          local item = extra_data.uploaded[i]
+          local ok, err = __dtrmflickr_call("flickr.photosets.addPhoto", function()
+            return rest.photosets_add_photo(extra_data.api_key, extra_data.api_secret, extra_data.account,
+              photoset_id, item.photo_id)
+          end)
+          if ok or photoset_add_is_already_present(err) then
+            state.add_set(item.image, extra_data.account.nsid, photoset_id)
+          else
+            album_errors = album_errors + 1
+            dt.print(string.format(_("Flickr: could not add photo %s to album: %s"), tostring(item.photo_id), tostring(err)))
+            dt.print_log(string.format("[dtrmflickr] finalize: add photo_id=%s photoset=%s failed: %s",
+              tostring(item.photo_id), tostring(photoset_id), tostring(err)))
+          end
+        end
       end
     end
   end
