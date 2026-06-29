@@ -1391,6 +1391,90 @@ function M.photosets_get_memberships(api_key, api_secret, account, photo_id, use
   return memberships, body, sets
 end
 
+-- ---------------------------------------------------------------------------
+-- Groups / pools (issue #32) — shared community galleries, distinct from
+-- albums/photosets. flickr.groups.pools.getGroups lists the groups the
+-- authenticated user can post to; add/remove move a photo in/out of a pool.
+-- ---------------------------------------------------------------------------
+
+-- Parse a flickr.groups.pools.getGroups response into a list of group items:
+--   { nsid, name, photos, privacy, admin, iconserver }
+-- Groups are self-closing `<group nsid="…" name="…" … />` elements; accept a
+-- non-self-closing form too (defensive, matches the parse_photosets discipline).
+function M.parse_groups(body)
+  local groups = {}
+  body = tostring(body or "")
+  for attrs in body:gmatch("<group%s+([^>]*)>") do
+    -- Strip a trailing self-closing slash before attribute parsing.
+    attrs = attrs:gsub("%s*/%s*$", "")
+    local attr = parse_attrs(attrs)
+    local nsid = attr.nsid or attr.id
+    if nsid and nsid ~= "" then
+      groups[#groups + 1] = {
+        nsid = xml_unescape(nsid),
+        name = xml_unescape(attr.name or ""),
+        photos = attr.photos,
+        privacy = attr.privacy,
+        admin = attr.admin,
+        iconserver = attr.iconserver,
+      }
+    end
+  end
+  return groups
+end
+
+-- List the groups the authenticated user can add photos to. Requires a signed
+-- (read) call — getGroups has no public variant. Pages at up to 400 per page
+-- (Flickr's max) on the <groups> wrapper. Returns (groups, raw_body) or
+-- (nil, err).
+function M.groups_pools_get_groups(api_key, api_secret, account, opts)
+  opts = opts or {}
+  if not (account and account.token and account.secret) then
+    return nil, "missing account credentials"
+  end
+
+  local all_groups = {}
+  local bodies, err = M.paged_call(api_key, api_secret, account, "flickr.groups.pools.getGroups", {}, "groups", {
+    per_page = opts.per_page or 400,
+    cancelled = opts.cancelled,
+    on_page = function(body)
+      for _, item in ipairs(M.parse_groups(body)) do all_groups[#all_groups + 1] = item end
+    end,
+  })
+  if not bodies then return nil, err end
+  return all_groups, table.concat(bodies, "\n")
+end
+
+-- Add a photo to a group's pool (flickr.groups.pools.add). Returns true on
+-- success, or (nil, err) — the caller (groups.classify_add) maps the Flickr
+-- error code in `err` to an outcome (already-in-pool, pending moderation,
+-- per-group/per-user limit, rejected, …).
+function M.groups_pools_add(api_key, api_secret, account, group_id, photo_id)
+  if not group_id or group_id == "" then return nil, "missing group id" end
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+
+  local body, err = M.call(api_key, api_secret, account, "flickr.groups.pools.add", {
+    group_id = group_id,
+    photo_id = photo_id,
+  })
+  if not body then return nil, err end
+  return true
+end
+
+-- Remove a photo from a group's pool (flickr.groups.pools.remove). Returns true
+-- on success, or (nil, err).
+function M.groups_pools_remove(api_key, api_secret, account, group_id, photo_id)
+  if not group_id or group_id == "" then return nil, "missing group id" end
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+
+  local body, err = M.call(api_key, api_secret, account, "flickr.groups.pools.remove", {
+    group_id = group_id,
+    photo_id = photo_id,
+  })
+  if not body then return nil, err end
+  return true
+end
+
 function M.photos_licenses_set_license(api_key, api_secret, account, photo_id, license_id)
   if not photo_id or photo_id == "" then return nil, "missing photo id" end
   if license_id == nil or license_id == "" then return nil, "missing license id" end
@@ -5696,6 +5780,351 @@ end
 return M
 end
 
+package.preload["dtrmflickr.groups"] = function(...)
+-- groups.lua — pure group/pool input + submission-outcome helpers (issue #32).
+--
+-- Flickr "groups" expose shared community pools (flickr.groups.pools.*), distinct
+-- from a user's own albums/photosets. The panel lets a user name SEVERAL groups
+-- at once (comma-separated) so one action can submit a published photo to multiple
+-- pools. Like albums.lua, this module is the pure core: it resolves the typed
+-- group field against the fetched group cache and plans/classifies the submission,
+-- with no darktable UI or REST state — so both the (future) export path and the
+-- lighttable panel share one implementation and it is unit-testable.
+--
+-- Groups differ from albums in two ways this module accounts for:
+--   * group ids are NSIDs ("34427465446@N01"), not plain integers, so the
+--     "bare numeric is a manual id" album fallback is replaced with an NSID-shape
+--     fallback;
+--   * a pool add can partially succeed in ways an album add cannot — the pool may
+--     be moderated (photo lands in a pending queue), or the add may be rejected
+--     for a per-group / per-user limit, content rules, or a disabled pool. The
+--     issue specifically asks to "handle per-group upload limits and report
+--     submissions the group rejected", so classify_add_result + summarize_submission
+--     turn the raw Flickr error codes into actionable outcomes.
+
+local M = {}
+
+local function trim(s)
+  return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- A group id is a Flickr NSID: digits, then "@N", then digits ("12345@N00").
+local function looks_like_nsid(s)
+  return tostring(s or ""):match("^%d+@N%d+$") ~= nil
+end
+M.looks_like_nsid = looks_like_nsid
+
+-- Human-readable combobox/status label for one group: "Name (#nsid) - N photo(s)".
+function M.label(item)
+  local name = trim(item and item.name or "")
+  local nsid = tostring(item and item.nsid or "")
+  local count = item and item.photos and tostring(item.photos) or nil
+  if name == "" then name = nsid end
+  local label = string.format("%s (#%s)", name, nsid)
+  if count and count ~= "" then
+    return string.format("%s - %s photo(s)", label, count)
+  end
+  return label
+end
+
+-- True if `query` (case-insensitive substring) appears in the group's nsid,
+-- name, or rendered label. An empty query matches everything.
+function M.matches_query(item, query)
+  query = trim(query):lower()
+  if query == "" then return true end
+  local haystack = table.concat({
+    tostring(item.nsid or ""),
+    tostring(item.name or ""),
+    M.label(item),
+  }, " "):lower()
+  return haystack:find(query, 1, true) ~= nil
+end
+
+-- Relevance score for `item` against an already-lowercased `query` (lower bins
+-- sort first). Mirrors albums.match_score:
+--   0  exact match on nsid / name / rendered label
+--   1  name starts with the query (prefix)
+--   2  a word inside the name starts with the query
+--   3  some other substring hit (nsid, mid-word in name, or label)
+-- Returns nil when the item does not match at all.
+local function match_score(item, query)
+  if query == "" then return 3 end
+  local nsid = tostring(item.nsid or ""):lower()
+  local name = tostring(item.name or ""):lower()
+  local label = M.label(item):lower()
+  if query == nsid or query == name or query == label then return 0 end
+  if name:sub(1, #query) == query then return 1 end
+  if (" " .. name):find("[%s%p]" .. query:gsub("(%W)", "%%%1"), 1, false) then return 2 end
+  if nsid:find(query, 1, true) or name:find(query, 1, true) or label:find(query, 1, true) then
+    return 3
+  end
+  return nil
+end
+M.match_score = match_score
+
+-- Filter `cache` to the items matching `query`, ranked by relevance, with the
+-- cache's existing order as a stable tiebreak. Returns (matches, total) where
+-- total is the full match count and matches is capped to `limit` (no cap when
+-- limit is nil/<=0). Mirrors albums.filter_matches so large group lists stay
+-- usable.
+function M.filter_matches(cache, query, limit)
+  query = trim(query):lower()
+  cache = cache or {}
+  if query == "" then
+    local all = {}
+    for _, item in ipairs(cache) do all[#all + 1] = item end
+    local total = #all
+    if limit and limit > 0 and total > limit then
+      local capped = {}
+      for i = 1, limit do capped[i] = all[i] end
+      return capped, total
+    end
+    return all, total
+  end
+
+  local scored = {}
+  for index, item in ipairs(cache) do
+    local score = match_score(item, query)
+    if score then
+      scored[#scored + 1] = { item = item, score = score, index = index }
+    end
+  end
+  table.sort(scored, function(a, b)
+    if a.score ~= b.score then return a.score < b.score end
+    return a.index < b.index
+  end)
+
+  local matches, total = {}, #scored
+  local n = (limit and limit > 0) and math.min(limit, total) or total
+  for i = 1, n do matches[i] = scored[i].item end
+  return matches, total
+end
+
+-- Resolve a free-text group reference against `cache`. Returns (item, kind):
+--   "exact"   nsid/name/label matched exactly
+--   "unique"  a single fuzzy match
+-- or (nil, kind) where kind is "ambiguous" / "none" / "empty".
+function M.find_match(cache, value)
+  value = trim(value)
+  if value == "" then return nil, "empty" end
+  local lower = value:lower()
+  local matches = {}
+  for _, item in ipairs(cache or {}) do
+    local nsid = tostring(item.nsid or "")
+    local name = tostring(item.name or "")
+    local label = M.label(item)
+    if value == nsid or lower == name:lower() or lower == label:lower() then
+      return item, "exact"
+    end
+    if M.matches_query(item, value) then matches[#matches + 1] = item end
+  end
+  if #matches == 1 then return matches[1], "unique" end
+  if #matches > 1 then return nil, "ambiguous" end
+  return nil, "none"
+end
+
+-- Split a user-typed group field into individual references. Comma-separated,
+-- trimmed, empties dropped, order preserved, exact-duplicate raw parts
+-- (case-insensitive) collapsed. Mirrors albums.split_album_input.
+function M.split_input(value)
+  local parts, seen = {}, {}
+  if type(value) ~= "string" then return parts end
+  for part in value:gmatch("[^,]+") do
+    local t = trim(part)
+    if t ~= "" then
+      local key = t:lower()
+      if not seen[key] then
+        seen[key] = true
+        parts[#parts + 1] = t
+      end
+    end
+  end
+  return parts
+end
+
+-- Resolve a comma-separated list of group references into pool targets.
+-- `resolver(part)` is supplied by the caller (it closes over the group cache)
+-- and behaves like find_match: returns (item, kind) where item has .nsid/.name,
+-- or (nil, kind) where kind is "ambiguous"/"none"/etc.
+--
+-- Returns:
+--   targets — list of { kind = "existing", group_id, name, match? }, deduped by
+--             group id (the same group by name and by NSID is added once)
+--   errors  — list of { query, reason } for parts that matched nothing or were
+--             ambiguous
+function M.resolve_existing(value, resolver)
+  local targets, errors, seen_ids = {}, {}, {}
+  for _, part in ipairs(M.split_input(value)) do
+    local item, kind = resolver(part)
+    if item and item.nsid and item.nsid ~= "" then
+      local id = tostring(item.nsid)
+      if not seen_ids[id] then
+        seen_ids[id] = true
+        targets[#targets + 1] = { kind = "existing", group_id = id, name = item.name or id, match = kind }
+      end
+    elseif looks_like_nsid(part) then
+      -- A bare NSID is treated as a manual group id even when it is not in the
+      -- fetched cache (mirrors the album numeric-id fallback). The add will fail
+      -- with Flickr error 2 if the user is not a member of that group.
+      if not seen_ids[part] then
+        seen_ids[part] = true
+        targets[#targets + 1] = { kind = "existing", group_id = part, name = part, match = "manual-id" }
+      end
+    else
+      errors[#errors + 1] = {
+        query = part,
+        reason = (kind == "ambiguous")
+          and "too many matches; type more or choose from matching groups"
+          or "no matching group; refresh groups or check the name",
+      }
+    end
+  end
+  return targets, errors
+end
+
+-- Extract the leading "(NN)" Flickr error code from an error string, as a number.
+-- Errors surface as "Flickr REST failed (NN): msg" (see flickr_rest.parse_error).
+local function error_code(err)
+  return tonumber(tostring(err or ""):match("%((%d+)%)"))
+end
+M.error_code = error_code
+
+-- Outcome categories for a single pool add. `success` means the photo is now in
+-- the pool (or accepted into a moderation queue); `terminal` means retrying the
+-- same add would not help (a limit/rule rejection or an auth/group error) — used
+-- so the queue does not pointlessly re-attempt. `category` is a coarse bucket for
+-- summaries.
+--   added             ok                         success, no-op-safe
+--   already_in_pool   code 3                     success (already a member)
+--   pending           code 6 (moderated queue)   success-ish, awaiting approval
+--   pending_already   code 7                      success-ish, already pending
+--   rejected_max_pools code 4 (photo in max pools)        rejected, terminal
+--   rejected_user_limit code 5 (user pool-photo limit)    rejected, terminal
+--   rejected_pool_full code 10 (pool at upper limit)      rejected, terminal
+--   rejected_content  code 8 (content not allowed)        rejected, terminal
+--   rejected_disabled code 11 (posting disabled)          rejected, terminal
+--   error_group       code 1/2 (photo/group not found)    error, terminal
+--   error             anything else (transport, transient) not terminal
+local ADD_OUTCOMES = {
+  [3]  = { category = "already_in_pool",   success = true,  terminal = true },
+  [6]  = { category = "pending",           success = true,  terminal = true },
+  [7]  = { category = "pending_already",   success = true,  terminal = true },
+  [4]  = { category = "rejected_max_pools", success = false, terminal = true },
+  [5]  = { category = "rejected_user_limit", success = false, terminal = true },
+  [10] = { category = "rejected_pool_full", success = false, terminal = true },
+  [8]  = { category = "rejected_content",  success = false, terminal = true },
+  [11] = { category = "rejected_disabled", success = false, terminal = true },
+  [1]  = { category = "error_group",       success = false, terminal = true },
+  [2]  = { category = "error_group",       success = false, terminal = true },
+}
+
+-- Classify the result of a single flickr.groups.pools.add call. `ok` is the
+-- truthy first return of the REST call (or the wrapped __dtrmflickr_call); `err`
+-- is its error string on failure. Returns an outcome table:
+--   { category, success, terminal, code }
+function M.classify_add_result(ok, err)
+  if ok then
+    return { category = "added", success = true, terminal = true, code = nil }
+  end
+  local code = error_code(err)
+  local mapped = code and ADD_OUTCOMES[code]
+  if mapped then
+    return { category = mapped.category, success = mapped.success, terminal = mapped.terminal, code = code }
+  end
+  -- Unmapped failure: a transport error or a transient Flickr code (105/106).
+  -- Not terminal — the shared queue may retry.
+  return { category = "error", success = false, terminal = false, code = code }
+end
+
+-- True when an add error means the photo is already in the pool (code 3) — used
+-- by callers that treat that as an idempotent success, like the album path's
+-- photoset_add_is_already_present.
+function M.add_is_already_present(err)
+  return error_code(err) == 3
+end
+
+-- Friendly one-line message for an outcome category (optionally with the group
+-- name). `translate` is an optional gettext-style fn. Used by the panel/report.
+function M.outcome_label(category, name, translate)
+  local t = translate or function(s) return s end
+  name = name and name ~= "" and name or t("the group")
+  local msgs = {
+    added             = "added to '%s'",
+    already_in_pool   = "already in '%s'",
+    pending           = "queued for '%s' (awaiting moderation)",
+    pending_already   = "already awaiting moderation in '%s'",
+    rejected_max_pools = "'%s' rejected: photo is in the maximum number of pools",
+    rejected_user_limit = "'%s' rejected: your pool-photo limit reached",
+    rejected_pool_full = "'%s' rejected: the pool is full",
+    rejected_content  = "'%s' rejected: content not allowed by group rules",
+    rejected_disabled = "'%s' is not accepting photos",
+    error_group       = "'%s' failed: not found or you are not a member",
+    error             = "'%s' failed (try again)",
+  }
+  local fmt = msgs[category] or "'%s': unknown result"
+  return string.format(t(fmt), name)
+end
+
+-- Aggregate a list of per-group submission results into a summary. Each result
+-- is { name, outcome } where outcome is a classify_add_result table. Returns:
+--   { added, already, pending, rejected, errors, total,
+--     succeeded,            -- added + already + pending* (photo is in/queued)
+--     details = { {name, category, code}, ... } }   -- in input order
+-- so the caller can render a precise per-group report and a one-line tally.
+function M.summarize_submission(results)
+  local s = {
+    added = 0, already = 0, pending = 0, rejected = 0, errors = 0,
+    total = 0, succeeded = 0, details = {},
+  }
+  for _, r in ipairs(results or {}) do
+    local o = r.outcome or {}
+    local cat = o.category or "error"
+    s.total = s.total + 1
+    s.details[#s.details + 1] = { name = r.name, category = cat, code = o.code }
+    if cat == "added" then
+      s.added = s.added + 1
+    elseif cat == "already_in_pool" then
+      s.already = s.already + 1
+    elseif cat == "pending" or cat == "pending_already" then
+      s.pending = s.pending + 1
+    elseif cat == "error" or cat == "error_group" then
+      s.errors = s.errors + 1
+    else
+      -- every rejected_* category
+      s.rejected = s.rejected + 1
+    end
+    if o.success then s.succeeded = s.succeeded + 1 end
+  end
+  return s
+end
+
+-- Compact human tally for a summary (from summarize_submission). `translate` is
+-- an optional gettext-style fn. Returns "" for an empty summary.
+function M.format_summary(summary, translate)
+  local t = translate or function(s) return s end
+  if not summary or (summary.total or 0) == 0 then return "" end
+  local parts = {}
+  if summary.added > 0 then
+    parts[#parts + 1] = string.format(t("%d added"), summary.added)
+  end
+  if summary.already > 0 then
+    parts[#parts + 1] = string.format(t("%d already in pool"), summary.already)
+  end
+  if summary.pending > 0 then
+    parts[#parts + 1] = string.format(t("%d pending moderation"), summary.pending)
+  end
+  if summary.rejected > 0 then
+    parts[#parts + 1] = string.format(t("%d rejected"), summary.rejected)
+  end
+  if summary.errors > 0 then
+    parts[#parts + 1] = string.format(t("%d failed"), summary.errors)
+  end
+  return table.concat(parts, ", ")
+end
+
+return M
+end
+
 package.preload["dtrmflickr.widgets"] = function(...)
 -- widgets.lua — small darktable widget helpers kept out of the main module so
 -- they stay offline-testable against a faithful widget mock (tests/test_widgets.lua).
@@ -6055,6 +6484,7 @@ local report = require "dtrmflickr.report"
 local tag_reconcile = require "dtrmflickr.tag_reconcile"
 local people = require "dtrmflickr.people"
 local albums = require "dtrmflickr.albums"
+local groups = require "dtrmflickr.groups"  -- group/pool submission helpers (#32)
 local widgets = require "dtrmflickr.widgets"
 local remote_pull = require "dtrmflickr.remote_pull"  -- pull remote edits back (#20)
 
@@ -9553,6 +9983,192 @@ panel_sets.set_link_button = dt.new_widget("button") {
 }
 panel_sets.refresh_queue_status()
 
+-- ---------------------------------------------------------------------------
+-- Groups / pools panel (issue #32) — submit the focused published photo to one
+-- or more Flickr group pools. Distinct from albums: there is no per-photo pool
+-- membership read API (getGroups lists the groups you can post to, not which
+-- pools a photo is in), so this panel offers refresh + a multi-group add only.
+--
+-- All state and widgets hang off the single `panel_pools` table (not main-chunk
+-- locals) to stay under Lua's per-function local limit, matching panel_sets.
+-- ---------------------------------------------------------------------------
+local panel_pools = { cache = {}, cache_nsid = nil, filtering = false }
+panel_pools.status_label = dt.new_widget("label") { label = "" }
+panel_pools.entry = dt.new_widget("entry") {
+  text = "",
+  placeholder = _("group name(s) or NSID(s), comma-separated"),
+  tooltip = _("type one or more Flickr groups to submit this photo to; separate multiple groups with commas"),
+}
+panel_pools.match_widget = dt.new_widget("combobox") {
+  label = _("matching groups"),
+  tooltip = _("matching fetched Flickr groups; select one or type an exact name/NSID above"),
+  changed_callback = function() end,
+  "",
+}
+
+function panel_pools.cache_matches(account)
+  local nsid = (type(account) == "table" and account.nsid or account) or ""
+  return nsid == "" or panel_pools.cache_nsid == nil or panel_pools.cache_nsid == nsid
+end
+
+function panel_pools.input_value()
+  local typed = trim(panel_pools.entry.text or "")
+  if typed ~= "" then return typed end
+  return trim(panel_pools.match_widget.value or "")
+end
+
+function panel_pools.update_choices(query)
+  panel_pools.filtering = true
+  clear_widget_items(panel_pools.match_widget)
+  query = trim(query)
+  if query == "" then
+    panel_pools.match_widget.selected = 0
+    panel_pools.match_widget.value = nil
+    panel_pools.filtering = false
+    return #panel_pools.cache, 0
+  end
+  -- Same relevance ranking + ALBUM_MATCH_LIMIT cap as the album picker (issue #29)
+  -- so a large group list stays usable.
+  local matches, count = groups.filter_matches(panel_pools.cache, query, ALBUM_MATCH_LIMIT)
+  local shown = 0
+  for _, item in ipairs(matches) do
+    shown = shown + 1
+    panel_pools.match_widget[shown] = groups.label(item)
+  end
+  panel_pools.match_widget.selected = 0
+  panel_pools.match_widget.value = nil
+  panel_pools.filtering = false
+  return count, shown
+end
+
+function panel_pools.clear_choices()
+  panel_pools.filtering = true
+  clear_widget_items(panel_pools.match_widget)
+  panel_pools.match_widget.selected = 0
+  panel_pools.match_widget.value = nil
+  panel_pools.filtering = false
+end
+
+function panel_pools.resolve(value)
+  return groups.find_match(panel_pools.cache, value)
+end
+
+panel_pools.match_widget.changed_callback = function(widget)
+  if panel_pools.filtering then return end
+  local selected = trim(widget.value or "")
+  if selected ~= "" then panel_pools.entry.text = selected end
+end
+
+function panel_pools.search()
+  local query = panel_pools.input_value()
+  if #panel_pools.cache == 0 then
+    if query ~= "" then panel_pools.status_label.label = _("refresh groups to search") end
+    return
+  end
+  local count, shown = panel_pools.update_choices(query)
+  if query == "" then
+    panel_pools.status_label.label = string.format(_("%d group(s) loaded; type to search"), #panel_pools.cache)
+  elseif count == 1 then
+    panel_pools.status_label.label = _("1 matching group")
+  elseif count > shown then
+    panel_pools.status_label.label = string.format(_("%d matching group(s); showing first %d"), count, shown)
+  else
+    panel_pools.status_label.label = string.format(_("%d matching group(s)"), count)
+  end
+end
+
+function panel_pools.refresh_list()
+  local acc = load_token()
+  local api_key, api_secret = get_credentials()
+  if not acc then
+    panel_pools.status_label.label = _("log in to refresh groups")
+    dt.print(_("Flickr: log in before refreshing groups."))
+    return nil, "not logged in to Flickr"
+  end
+  if not api_key or not api_secret then
+    panel_pools.status_label.label = _("missing API credentials")
+    dt.print(_("Flickr: missing API key/secret."))
+    return nil, "missing Flickr API key/secret"
+  end
+  local list, err = __dtrmflickr_call("flickr.groups.pools.getGroups", function()
+    return rest.groups_pools_get_groups(api_key, api_secret, acc)
+  end)
+  if not list then
+    panel_pools.status_label.label = _("group refresh failed")
+    dt.print(string.format(_("Flickr: group refresh failed: %s"), tostring(err)))
+    return nil, err
+  end
+  panel_pools.cache = list
+  panel_pools.cache_nsid = acc.nsid
+  panel_pools.update_choices(panel_pools.input_value())
+  panel_pools.status_label.label = string.format(_("%d group(s) loaded"), #list)
+  dt.print(string.format(_("Flickr: loaded %d group(s)"), #list))
+  return list
+end
+
+-- Submit the focused published photo to every typed/selected group pool, then
+-- report a per-group tally: added, already-in-pool, queued-for-moderation, and
+-- the groups that rejected it (per-group/per-user limit, content rules, disabled)
+-- distinctly from transient failures (issue #32).
+function panel_pools.submit()
+  local image, acc, photo_id, api_key, api_secret = panel_sets.api_context(_("submitting to a group"))
+  if not image then return end
+  if not panel_pools.cache_matches(acc) then
+    panel_pools.cache = {}
+    panel_pools.cache_nsid = nil
+  end
+  if #panel_pools.cache == 0 then panel_pools.refresh_list() end
+  panel_pools.search()
+  local value = panel_pools.input_value()
+  if value == "" then
+    dt.print(_("Flickr: type a group name or NSID first."))
+    return
+  end
+
+  local targets, errors = groups.resolve_existing(value, panel_pools.resolve)
+  local results = {}
+  for _, target in ipairs(targets) do
+    local ok, err = __dtrmflickr_call("flickr.groups.pools.add", function()
+      return rest.groups_pools_add(api_key, api_secret, acc, target.group_id, photo_id)
+    end)
+    results[#results + 1] = { name = target.name, outcome = groups.classify_add_result(ok, err) }
+  end
+
+  local summary = groups.summarize_submission(results)
+
+  if #errors > 0 and summary.total == 0 then
+    -- Nothing resolved: only unresolved/ambiguous input.
+    local parts = {}
+    for _, e in ipairs(errors) do parts[#parts + 1] = string.format("%s: %s", e.query, e.reason) end
+    panel_pools.status_label.label = _("choose a matching group")
+    dt.print(_("Flickr: choose a matching group: ") .. table.concat(parts, "; "))
+    return
+  end
+
+  -- Detailed lines for anything that was not a clean add, so the user sees why a
+  -- pool rejected the photo or left it pending.
+  local notes = {}
+  for _, d in ipairs(summary.details) do
+    if d.category ~= "added" and d.category ~= "already_in_pool" then
+      notes[#notes + 1] = groups.outcome_label(d.category, d.name, _)
+    end
+  end
+  for _, e in ipairs(errors) do
+    notes[#notes + 1] = string.format("%s: %s", e.query, e.reason)
+  end
+
+  local tally = groups.format_summary(summary, _)
+  if tally == "" then tally = _("no groups submitted") end
+  panel_pools.status_label.label = tally
+  if #notes > 0 then
+    dt.print(string.format(_("Flickr: groups: %s — %s"), tally, table.concat(notes, "; ")))
+  else
+    panel_pools.entry.text = ""
+    panel_pools.clear_choices()
+    dt.print(string.format(_("Flickr: groups: %s"), tally))
+  end
+end
+
 local panel_widget = dt.new_widget("box") {
   orientation = "vertical",
   panel_status_label,
@@ -9624,6 +10240,27 @@ local panel_widget = dt.new_widget("box") {
     },
   },
   panel_sets.status_label,
+  dt.new_widget("label") { label = _("groups / pools") },
+  panel_pools.entry,
+  dt.new_widget("box") {
+    orientation = "horizontal",
+    dt.new_widget("button") {
+      label = _("refresh groups"),
+      tooltip = _("fetch the Flickr groups you can submit photos to"),
+      clicked_callback = function() panel_pools.refresh_list() end,
+    },
+    dt.new_widget("button") {
+      label = _("search groups"),
+      clicked_callback = function() panel_pools.search() end,
+    },
+    dt.new_widget("button") {
+      label = _("submit to group(s)"),
+      tooltip = _("submit the selected published photo to the typed/selected group pool(s)"),
+      clicked_callback = function() panel_pools.submit() end,
+    },
+  },
+  panel_pools.match_widget,
+  panel_pools.status_label,
   dt.new_widget("label") { label = _("photo link") },
   panel_photo_id_entry,
   dt.new_widget("box") {
