@@ -6956,6 +6956,29 @@ function __dtrmflickr_note_auth_failure(err)
   end
 end
 
+-- "Request delete permission" toggle lives HERE, in the login area, rather than
+-- as a standalone bool preference — on purpose. darktable only commits a bool
+-- *preference* to config when the preferences dialog is closed: its value is
+-- written by the dialog "response" handler, not on toggle (see darktable
+-- src/lua/preferences.c response_callback_bool, wired in update_widget_bool). The
+-- login button is embedded in that same dialog, so a freshly-ticked preference
+-- checkbox is invisible to a login click in the same session, and the plugin
+-- would silently fall back to write-only scope (issue: delete login asked for
+-- write perms). A live check_button's `.value` is readable immediately, so
+-- reading it at click time is correct without closing/reopening preferences. The
+-- choice is mirrored into a hidden pref so it persists across restarts (written
+-- immediately on toggle, unlike the dialog checkbox; read back to seed `value`).
+local delete_perm_check = dt.new_widget("check_button") {
+  label = _("request delete permission on next login"),
+  tooltip = _("when on, the next Flickr login asks Flickr for permission to delete photos (required for 'delete from Flickr'). Leave off for normal use; tick this, then click 'log in to Flickr' — no need to close preferences first"),
+  value = dt.preferences.read(PLUGIN, "request_delete_perm", "bool") == true,
+}
+-- check_button fires clicked_callback (not changed_callback); see hidden_widget.
+delete_perm_check.clicked_callback = function(widget)
+  dt.preferences.write(PLUGIN, "request_delete_perm", "bool", widget.value == true)
+  dt.print_log(string.format("[dtrmflickr] request_delete_perm toggled -> %s", tostring(widget.value == true)))
+end
+
 login_button = dt.new_widget("button") {
   label = _("log in to Flickr…"),
   clicked_callback = function()
@@ -6974,8 +6997,10 @@ login_button = dt.new_widget("button") {
     end
     pending = { token = tok, secret = sec_or_err }
     -- Default to write scope; only request delete scope when the user explicitly
-    -- opted in via the preference (issue #19). Delete is never requested silently.
-    local want_delete = dt.preferences.read(PLUGIN, "request_delete_perm", "bool")
+    -- opted in (issue #19). Delete is never requested silently. Read the LIVE
+    -- check_button value, not the preference: a preference toggled in the same
+    -- still-open dialog has not been committed yet (see delete_perm_check above).
+    local want_delete = delete_perm_check.value == true
     local url = auth.authorize_url(tok, auth.login_perms(want_delete))
     open_url(url)
     refresh_status()
@@ -7037,6 +7062,7 @@ logout_button = dt.new_widget("button") {
 local account_widget = dt.new_widget("box") {
   orientation = "vertical",
   status_label,
+  delete_perm_check,
   login_button,
   verifier_label,
   verifier_entry,
@@ -7048,14 +7074,14 @@ dt.preferences.register(PLUGIN, "api_secret", "string",
   _("Flickr: API secret"), _("Flickr app API secret used for OAuth request signing"), "")
 dt.preferences.register(PLUGIN, "api_key", "string",
   _("Flickr: API key"), _("Flickr app API key used for OAuth and upload requests"), "")
--- Opt-in (default off) to request perms=delete on the *next* login. Delete scope
--- lets the panel's "delete from Flickr" action call flickr.photos.delete; it is
--- never requested silently. Changing this only takes effect after logging in
--- again. See issue #19.
-dt.preferences.register(PLUGIN, "request_delete_perm", "bool",
-  _("Flickr: request delete permission on next login"),
-  _("when on, the next Flickr login asks for permission to delete photos (required for 'delete from Flickr'). Leave off for normal use; you must log in again after changing this"),
-  false)
+-- NOTE: the "request delete permission on next login" opt-in (issue #19) is NOT a
+-- registered bool preference. It is a live check_button in the account login
+-- widget (delete_perm_check) backed by the hidden `request_delete_perm` conf key.
+-- A registered bool preference only commits when the preferences dialog closes,
+-- so it could never agree with a login click made inside that same open dialog —
+-- the login would silently fall back to write scope. The live widget is read at
+-- click time and persists immediately on toggle. Delete is never requested
+-- silently. See docs/design-notes.md.
 dt.preferences.register(PLUGIN, "account_login", "lua",
   _("Flickr: account login"),
   _("authorize the default Flickr account used for uploads and lighttable sync"),
