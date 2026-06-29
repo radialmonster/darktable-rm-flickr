@@ -2394,6 +2394,28 @@ function M.geo_date_resend_plan(sync, date_taken, lat, lon)
   return { send_date = send_date or false, send_gps = send_gps or false }
 end
 
+-- metadata_resend_plan(sync, reasons): decide which metadata-only operations a
+-- batch/multi-select resend should push for one photo (issue #18). It sends only
+-- fields that BOTH changed (a needs-sync reason is present) AND are enabled by the
+-- master sync toggles, so a batch over many photos touches only what drifted and
+-- never re-uploads pixels. `reasons` is the per-image reason list from
+-- state.evaluate_publish_state (e.g. {"keywords","gps"}); only the four reasons
+-- that have a metadata-only Flickr push (title_description, keywords, gps,
+-- date_taken) are considered here. Pure/offline-testable.
+function M.metadata_resend_plan(sync, reasons)
+  sync = sync or {}
+  local flagged = {}
+  for _, reason in ipairs(reasons or {}) do flagged[reason] = true end
+  local plan = {
+    send_meta = ((sync.title == true) or (sync.description == true)) and flagged.title_description == true,
+    send_tags = (sync.tags == true) and flagged.keywords == true,
+    send_date = (sync.date_taken == true) and flagged.date_taken == true,
+    send_gps  = (sync.gps == true) and flagged.gps == true,
+  }
+  plan.any = plan.send_meta or plan.send_tags or plan.send_date or plan.send_gps
+  return plan
+end
+
 function M.fingerprints_from_values(values)
   values = values or {}
   local privacy = values.privacy or {}
@@ -7407,6 +7429,118 @@ function panel_sets.scan_selected_publish_state()
   end
 end
 
+-- Batch / multi-select metadata-only push (issue #18, scope folded in from #11).
+-- For each selected published photo this resends only the metadata fields that
+-- BOTH drifted (a needs-sync reason is present) AND are enabled by the master
+-- sync toggles — title/description (setMeta), keywords (setTags), GPS
+-- (geo.setLocation), date taken (setDates) — with no pixel re-upload. It mirrors
+-- the single-image sync buttons but loops the selection and reports per-photo
+-- outcomes plus a per-field tally. Photos with no linked Flickr id, or with
+-- nothing enabled-and-changed, are skipped (never re-uploaded).
+function panel_sets.push_selected_metadata()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection == 0 then
+    dt.print(_("Flickr: select one or more images before pushing metadata."))
+    return
+  end
+  local acc = load_token()
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before pushing metadata."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+  local sync = master_sync_fields()
+
+  local pushed, unchanged, unlinked, failed_photos = 0, 0, 0, 0
+  local field_tally = {}      -- friendly field name -> photos pushed
+  local fail_notes = {}
+
+  for _, image in ipairs(selection) do
+    local photo_id = state.get_photo_id(image, acc.nsid)
+    if not photo_id then
+      unlinked = unlinked + 1
+    else
+      local fingerprints = effective_metadata_fingerprints(image, sync)
+      local _status, _pub, _pid, reasons = state.evaluate_publish_state(image, acc.nsid, {
+        metadata_fingerprints = fingerprints,
+      })
+      local plan = metadata.metadata_resend_plan(sync, reasons)
+      if not plan.any then
+        unchanged = unchanged + 1
+      else
+        local photo_ok, photo_failed = false, false
+
+        local function push(field, reason, friendly, method, fn)
+          local ok, err = __dtrmflickr_call(method, fn)
+          if ok then
+            state.clear_reason(image, acc.nsid, reason)
+            store_metadata_fingerprints(image, acc.nsid, fingerprints, { reason })
+            field_tally[reason] = (field_tally[reason] or 0) + 1
+            photo_ok = true
+          else
+            state.mark_reason(image, acc.nsid, reason)
+            photo_failed = true
+            fail_notes[#fail_notes + 1] = string.format("%s/%s: %s",
+              tostring(photo_id), friendly, tostring(err))
+          end
+        end
+
+        if plan.send_meta then
+          local title = sync.title and (image.title or "") or nil
+          local description = sync.description and (image.description or "") or nil
+          push("title_description", "title_description", _("title/description"),
+            "flickr.photos.setMeta", function()
+              return rest.photos_set_meta(api_key, api_secret, acc, photo_id, title, description)
+            end)
+        end
+        if plan.send_tags then
+          local tags = rules.image_keyword_tags(image) or ""
+          push("keywords", "keywords", _("keywords"),
+            "flickr.photos.setTags", function()
+              return rest.photos_set_tags(api_key, api_secret, acc, photo_id, tags)
+            end)
+        end
+        if plan.send_date then
+          local date_taken = metadata.image_date_taken(image)
+          push("date_taken", "date_taken", _("date taken"),
+            "flickr.photos.setDates", function()
+              return rest.photos_set_dates(api_key, api_secret, acc, photo_id, date_taken, 0)
+            end)
+        end
+        if plan.send_gps then
+          local lat, lon = metadata.image_location(image)
+          push("gps", "gps", _("GPS location"),
+            "flickr.photos.geo.setLocation", function()
+              return rest.photos_geo_set_location(api_key, api_secret, acc, photo_id, lat, lon, 16)
+            end)
+        end
+
+        if photo_ok then
+          state.set_metadata_published_at(image, acc.nsid)
+          pushed = pushed + 1
+        end
+        if photo_failed then failed_photos = failed_photos + 1 end
+      end
+    end
+  end
+
+  refresh_panel(true, false)
+  dt.print(string.format(
+    _("Flickr: metadata push — %d updated, %d unchanged, %d not linked, %d with errors (of %d selected)"),
+    pushed, unchanged, unlinked, failed_photos, #selection))
+  local breakdown = state.describe_reason_tally and state.describe_reason_tally(field_tally) or ""
+  if breakdown ~= "" then
+    dt.print(string.format(_("Flickr: fields pushed: %s"), breakdown))
+  end
+  if #fail_notes > 0 then
+    dt.print(_("Flickr: metadata push errors: ") .. table.concat(fail_notes, "; "))
+  end
+end
+
 -- Clear the ambiguous-candidate picker (issue #16).
 function panel_sets.clear_candidates()
   panel_sets.candidate_ids = {}
@@ -7836,6 +7970,11 @@ local panel_widget = dt.new_widget("box") {
   dt.new_widget("button") {
     label = _("scan selected"),
     clicked_callback = function() panel_sets.scan_selected_publish_state() end,
+  },
+  dt.new_widget("button") {
+    label = _("push metadata to selected"),
+    tooltip = _("resend only the changed, sync-enabled metadata (title/description, keywords, GPS, date taken) for every selected published photo, without re-uploading pixels"),
+    clicked_callback = function() panel_sets.push_selected_metadata() end,
   },
   dt.new_widget("button") {
     label = _("refresh"),
