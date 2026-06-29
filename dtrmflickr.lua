@@ -2292,6 +2292,32 @@ local function fingerprint_parts(parts)
   return fingerprint_hash(table.concat(parts or {}, "\31"))
 end
 
+-- Decide what a single-image "sync GPS/date taken" panel resend should push,
+-- given the master sync flags and the values currently available on the image.
+-- Pure (no darktable calls) so the panel action's gating can be tested offline.
+-- Returns one of:
+--   { disabled = true }  -- neither GPS nor date-taken sync is enabled
+--   { nothing = true }   -- enabled, but no value to send (no GPS and/or no date)
+--   { send_date = bool, send_gps = bool }  -- at least one field to push
+local function nonempty(v)
+  return v ~= nil and tostring(v) ~= ""
+end
+
+function M.geo_date_resend_plan(sync, date_taken, lat, lon)
+  sync = sync or {}
+  local enabled_date = sync.date_taken == true
+  local enabled_gps = sync.gps == true
+  if not enabled_date and not enabled_gps then
+    return { disabled = true }
+  end
+  local send_date = enabled_date and nonempty(date_taken)
+  local send_gps = enabled_gps and nonempty(lat) and nonempty(lon)
+  if not send_date and not send_gps then
+    return { nothing = true }
+  end
+  return { send_date = send_date or false, send_gps = send_gps or false }
+end
+
 function M.fingerprints_from_values(values)
   values = values or {}
   local privacy = values.privacy or {}
@@ -6809,6 +6835,97 @@ local function sync_panel_tags()
   end
 end
 
+-- Single-image GPS / date-taken resend (issue #18). Mirrors sync_panel_meta /
+-- sync_panel_tags: pushes only the darktable GPS location and/or date-taken to
+-- an already-published photo via setDates + geo.setLocation, with no pixel
+-- re-upload. Each field is independently gated by its master sync toggle and by
+-- whether the image actually carries that value; per-field success clears the
+-- matching needs-sync reason and refreshes its stored fingerprint.
+function panel_sets.sync_geo_date()
+  local acc, photo_id, image = panel_current.account, panel_current.photo_id, panel_current.image
+  if (panel_current.selection_count or 0) ~= 1 then
+    dt.print(_("Flickr: select exactly one image before syncing GPS/date."))
+    return
+  end
+  if not image or not photo_id then
+    dt.print(_("Flickr: select a published image first."))
+    return
+  end
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before syncing GPS/date."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+
+  local sync = master_sync_fields()
+  local date_taken = sync.date_taken and metadata.image_date_taken(image) or nil
+  local lat, lon = nil, nil
+  if sync.gps then lat, lon = metadata.image_location(image) end
+
+  local plan = metadata.geo_date_resend_plan(sync, date_taken, lat, lon)
+  if plan.disabled then
+    dt.print(_("Flickr: GPS/date sync disabled in Lua Options."))
+    return
+  end
+  if plan.nothing then
+    dt.print(_("Flickr: selected image has no GPS/date taken to sync."))
+    return
+  end
+
+  local fingerprints = effective_metadata_fingerprints(image, sync)
+  local done, failed = {}, {}
+
+  if plan.send_date then
+    local ok, err = __dtrmflickr_call("flickr.photos.setDates", function()
+      return rest.photos_set_dates(api_key, api_secret, acc, photo_id, date_taken, 0)
+    end)
+    if ok then
+      state.clear_reason(image, acc.nsid, "date_taken")
+      store_metadata_fingerprints(image, acc.nsid, fingerprints, { "date_taken" })
+      done[#done + 1] = _("date taken")
+    else
+      state.mark_reason(image, acc.nsid, "date_taken")
+      failed[#failed + 1] = _("date taken") .. ": " .. tostring(err)
+    end
+  end
+
+  if plan.send_gps then
+    local ok, err = __dtrmflickr_call("flickr.photos.geo.setLocation", function()
+      return rest.photos_geo_set_location(api_key, api_secret, acc, photo_id, lat, lon, 16)
+    end)
+    if ok then
+      state.clear_reason(image, acc.nsid, "gps")
+      store_metadata_fingerprints(image, acc.nsid, fingerprints, { "gps" })
+      done[#done + 1] = _("GPS location")
+    else
+      state.mark_reason(image, acc.nsid, "gps")
+      failed[#failed + 1] = _("GPS location") .. ": " .. tostring(err)
+    end
+  end
+
+  if #done > 0 then state.set_metadata_published_at(image, acc.nsid) end
+  panel_sets.refresh_publish_state_label(image, acc, photo_id)
+
+  if #failed == 0 then
+    local msg = string.format(_("Flickr: synced %s."), table.concat(done, ", "))
+    panel_remote_label.label = msg
+    dt.print(msg)
+    load_remote_settings(api_key, api_secret, acc, photo_id)
+  elseif #done == 0 then
+    panel_remote_label.label = _("Flickr: GPS/date sync failed")
+    dt.print(_("Flickr: GPS/date sync failed: ") .. table.concat(failed, "; "))
+  else
+    panel_remote_label.label = _("Flickr: GPS/date partially synced")
+    dt.print(string.format(_("Flickr: synced %s; failed %s"),
+      table.concat(done, ", "), table.concat(failed, "; ")))
+    load_remote_settings(api_key, api_secret, acc, photo_id)
+  end
+end
+
 ----------------------------------------------------------------------
 -- Tag reconciler (issue #3): side-by-side local-keyword vs Flickr-tag view
 -- with explicit, confirmation-gated actions. The pure diff/plan logic lives in
@@ -7458,6 +7575,11 @@ local panel_widget = dt.new_widget("box") {
   dt.new_widget("button") {
     label = _("sync keywords"),
     clicked_callback = function() sync_panel_tags() end,
+  },
+  dt.new_widget("button") {
+    label = _("sync GPS/date taken"),
+    tooltip = _("push darktable GPS location and date taken to the linked Flickr photo without re-uploading"),
+    clicked_callback = function() panel_sets.sync_geo_date() end,
   },
   dt.new_widget("label") { label = _("tag reconciler") },
   panel_reconcile.diff_label,
