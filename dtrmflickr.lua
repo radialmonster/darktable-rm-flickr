@@ -4521,6 +4521,199 @@ end
 return M
 end
 
+package.preload["dtrmflickr.queue_panel"] = function(...)
+-- queue_panel.lua — pure formatting for the live job-lifecycle panel (issue #56).
+--
+-- The lighttable Flickr panel can now render "what is each queued job doing right
+-- now" by polling the `queue_jobs` lifecycle tracker (which collapses the queue's
+-- async `on_event` stream into one explicit per-job state). This module is the
+-- pure, offline-testable presentation layer between that tracker snapshot and the
+-- darktable label widgets the main module owns:
+--
+--   * `job_line(rec)`         — one record -> one human row
+--                               (state · name · attempt · error).
+--   * `build(snapshot, opts)` — a tracker snapshot -> a bounded, stably-ordered
+--                               list of rows plus a one-line counts summary. Live
+--                               (non-terminal) jobs are always kept; terminal jobs
+--                               backfill the remaining budget, most-recent first;
+--                               rows are emitted in the tracker's insertion order
+--                               so a job never jumps around between polls.
+--   * `uncertain_summary` / `uncertain_lines` — surface the resume planner's
+--                               `uncertain` records (a non-idempotent job that may
+--                               already have reached Flickr — see
+--                               queue_jobs.plan_resume_safe) so the panel can flag
+--                               them for an explicit user decision instead of
+--                               silently re-running and risking a duplicate.
+--
+-- It touches no darktable or network API (a `translate` hook localizes the few
+-- fixed strings; record data is user content / ids and is never translated), so
+-- the whole layer is unit-tested in tests/test_queue_panel.lua. Living outside the
+-- main module keeps it off the Lua main-chunk local-variable budget (CLAUDE.md);
+-- it is wired into tools/build-single-file.ps1.
+
+local M = {}
+
+-- Human word per lifecycle state. Kept short for a narrow panel column. The set
+-- mirrors queue_jobs.STATES; `succeeded` reads as the friendlier "done".
+M.STATE_WORD = {
+  queued = "queued", running = "running", waiting = "waiting",
+  retrying = "retrying", succeeded = "done", failed = "failed",
+  stale = "stale", cancelled = "cancelled",
+}
+
+local TERMINAL = {
+  succeeded = true, failed = true, stale = true, cancelled = true,
+}
+
+-- Order states appear in the summary line: live states first (most interesting),
+-- then terminal outcomes.
+local SUMMARY_ORDER = {
+  "running", "retrying", "waiting", "queued",
+  "succeeded", "failed", "stale", "cancelled",
+}
+
+local function identity(s) return s end
+
+-- A job's display name: its explicit label, else the Flickr method, else a
+-- generic word. Never translated (label/method are user content / ids).
+function M.name_of(rec)
+  if type(rec) ~= "table" then return "?" end
+  local label = rec.label
+  if label ~= nil and tostring(label) ~= "" then return tostring(label) end
+  local method = rec.method
+  if method ~= nil and tostring(method) ~= "" then return tostring(method) end
+  return "request"
+end
+
+-- One record -> one row: "<state> · <name>" with an optional " (attempt N)" when
+-- a job has been tried more than once and an optional ": <error>" when an error
+-- is recorded. Pure; `translate` localizes only the fixed "attempt" word.
+function M.job_line(rec, translate)
+  translate = translate or identity
+  local state = rec and tostring(rec.state or "") or ""
+  local word = M.STATE_WORD[state] or state
+  if word == "" then word = "?" end
+  local line = word .. " \194\183 " .. M.name_of(rec)  -- \194\183 = U+00B7 middle dot
+  local attempts = rec and tonumber(rec.attempts) or nil
+  if attempts and attempts > 1 then
+    line = line .. string.format(translate(" (attempt %d)"), attempts)
+  end
+  local err = rec and rec.error
+  if err ~= nil and tostring(err) ~= "" then
+    line = line .. ": " .. tostring(err)
+  end
+  return line
+end
+
+-- One-line counts summary, e.g. "jobs: 2 running, 1 retrying, 3 done, 1 failed".
+-- Only non-zero states are listed, in SUMMARY_ORDER. When the grid is showing
+-- fewer rows than the tracker holds, append " (showing S/T)" so a user knows the
+-- view is capped. Returns "" for an empty queue. Pure.
+function M.summary_line(counts, total, shown, translate)
+  translate = translate or identity
+  counts = counts or {}
+  total = tonumber(total) or 0
+  if total <= 0 then return "" end
+  local parts = {}
+  for _, state in ipairs(SUMMARY_ORDER) do
+    local n = tonumber(counts[state]) or 0
+    if n > 0 then
+      parts[#parts + 1] = string.format("%d %s", n, M.STATE_WORD[state] or state)
+    end
+  end
+  local line = translate("jobs: ") .. table.concat(parts, ", ")
+  shown = tonumber(shown) or total
+  if shown < total then
+    line = line .. string.format(translate(" (showing %d/%d)"), shown, total)
+  end
+  return line
+end
+
+-- A tracker snapshot (insertion-ordered list of record copies) -> a bounded view.
+-- opts.limit (default 12) caps how many rows render. Selection priority: keep the
+-- live (non-terminal) jobs first — most-recent first when even those overflow the
+-- cap — then backfill the remaining budget with the most-recent terminal jobs.
+-- Whatever is chosen is emitted in the original insertion order, so the rows are
+-- stable across polls (a job keeps its slot; it does not jump when its state
+-- changes). Returns { lines, shown, total, counts, summary }. Pure.
+function M.build(snapshot, opts)
+  opts = opts or {}
+  local translate = opts.translate or identity
+  local limit = math.max(1, math.floor(tonumber(opts.limit) or 12))
+  snapshot = snapshot or {}
+
+  local counts = {}
+  local live_idx, term_idx = {}, {}
+  for i, rec in ipairs(snapshot) do
+    local state = tostring((rec and rec.state) or "")
+    counts[state] = (counts[state] or 0) + 1
+    if TERMINAL[state] then
+      term_idx[#term_idx + 1] = i
+    else
+      live_idx[#live_idx + 1] = i
+    end
+  end
+
+  -- Pick indices to show: live first (most-recent first if capped), then the
+  -- most-recent terminal jobs to fill the rest.
+  local chosen = {}
+  local shown = 0
+  for j = #live_idx, 1, -1 do
+    if shown >= limit then break end
+    chosen[live_idx[j]] = true
+    shown = shown + 1
+  end
+  for j = #term_idx, 1, -1 do
+    if shown >= limit then break end
+    chosen[term_idx[j]] = true
+    shown = shown + 1
+  end
+
+  -- Emit in insertion order so slots are stable across refreshes.
+  local lines = {}
+  for i, rec in ipairs(snapshot) do
+    if chosen[i] then lines[#lines + 1] = M.job_line(rec, translate) end
+  end
+
+  return {
+    lines = lines,
+    shown = #lines,
+    total = #snapshot,
+    counts = counts,
+    summary = M.summary_line(counts, #snapshot, #lines, translate),
+  }
+end
+
+-- One-line headline for the resume planner's `uncertain` set: non-idempotent jobs
+-- that were interrupted after they may have reached Flickr, so re-running risks a
+-- duplicate. Empty list -> "". Pure.
+function M.uncertain_summary(records, translate)
+  translate = translate or identity
+  records = records or {}
+  local n = #records
+  if n <= 0 then return "" end
+  return string.format(
+    translate("interrupted uploads needing your decision: %d (may already be on Flickr)"),
+    n)
+end
+
+-- One row per uncertain record: "<name> (<state>)". Never translated (record data
+-- is user content / ids). Returns a (possibly empty) list. Pure.
+function M.uncertain_lines(records)
+  local out = {}
+  for _, rec in ipairs(records or {}) do
+    if type(rec) == "table" then
+      local state = tostring(rec.state or "")
+      local suffix = state ~= "" and (" (" .. state .. ")") or ""
+      out[#out + 1] = M.name_of(rec) .. suffix
+    end
+  end
+  return out
+end
+
+return M
+end
+
 package.preload["dtrmflickr.settings"] = function(...)
 -- settings.lua — stable Flickr option tables and preference lookup helpers.
 
@@ -7302,6 +7495,7 @@ local widgets = require "dtrmflickr.widgets"
 local remote_pull = require "dtrmflickr.remote_pull"  -- pull remote edits back (#20)
 local panel_helpers = require "dtrmflickr.panel_helpers"  -- pure panel parse/index/label helpers (#46)
 local account_ui = require "dtrmflickr.account_ui"  -- account-login widget + session state (#47)
+local queue_panel = require "dtrmflickr.queue_panel"  -- pure live job-lifecycle grid formatter (#56)
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -7361,6 +7555,11 @@ __dtrmflickr_queue = require("dtrmflickr.queue").new {
     -- touches the preference. A global like __dtrmflickr_jobs so it costs no
     -- main-chunk local.
     if __dtrmflickr_resume then __dtrmflickr_resume.on_event() end
+    -- Repaint the live job-lifecycle grid on every async tick (issue #56) so the
+    -- panel shows each job moving through queued/running/waiting/retrying/done as
+    -- the async queue drains. Cheap (a bounded snapshot render) and guarded for
+    -- module-load ordering — the panel's refresher is assigned later in the chunk.
+    if panel_sets and panel_sets.refresh_queue_jobs then panel_sets.refresh_queue_jobs() end
   end,
   sleep_ms = function(ms)
     -- dt.control.sleep takes an int delay in MILLISECONDS (see
@@ -8233,6 +8432,23 @@ panel_sets.status_label = dt.new_widget("label") { label = "" }
 panel_sets.publish_label = dt.new_widget("label") { label = "" }
 panel_sets.queue_label = dt.new_widget("label") { label = "" }
 panel_sets.queue_detail_label = dt.new_widget("label") { label = "" }
+-- Live job-lifecycle grid (issue #56). A FIXED pool of label widgets the panel
+-- repaints from the queue_jobs tracker snapshot on every async lifecycle tick —
+-- darktable widgets cannot be added/removed dynamically, so the pool is sized
+-- once and unused rows are blanked. `queue_jobs_limit` bounds both how many rows
+-- the pool holds and the tracker view fed to it (queue_panel.build's `limit`), so
+-- a long session can never grow the grid unbounded. The header carries the
+-- counts summary; the uncertain label surfaces resume records that need a user
+-- decision (#36's plan_resume_safe — a non-idempotent job that may already have
+-- reached Flickr). These live under panel_sets (table fields), costing no
+-- main-chunk local against CLAUDE.md's per-function limit.
+panel_sets.queue_jobs_limit = 12
+panel_sets.queue_jobs_header = dt.new_widget("label") { label = "" }
+panel_sets.queue_jobs_rows = {}
+for i = 1, panel_sets.queue_jobs_limit do
+  panel_sets.queue_jobs_rows[i] = dt.new_widget("label") { label = "" }
+end
+panel_sets.queue_uncertain_label = dt.new_widget("label") { label = "" }
 -- Per-action confirm gate for the destructive "delete from Flickr" button
 -- (issue #19): the button refuses unless this is checked, and it is reset after
 -- every attempt so each deletion requires a deliberate re-check.
@@ -8453,6 +8669,30 @@ function panel_sets.refresh_queue_status()
   local label, detail = format_queue_status(summary, recent)
   panel_sets.queue_label.label = label
   if panel_sets.queue_detail_label then panel_sets.queue_detail_label.label = detail end
+  panel_sets.refresh_queue_jobs()
+end
+
+-- Repaint the live job-lifecycle grid (issue #56) from the queue_jobs tracker
+-- snapshot. Called both after a synchronous queue call and on every async
+-- lifecycle event (see the queue's on_event), so a job's state, attempt count and
+-- error update live as the async queue ticks. Bounded + stably ordered by
+-- queue_panel.build; unused pool rows are blanked. Also surfaces the resume
+-- planner's `uncertain` records (a non-idempotent job interrupted after it may
+-- have reached Flickr) so the user can decide on them (#36/#57 own the action).
+function panel_sets.refresh_queue_jobs()
+  local rows = panel_sets.queue_jobs_rows
+  if not rows then return end
+  local snapshot = __dtrmflickr_jobs and __dtrmflickr_jobs:snapshot() or {}
+  local view = queue_panel.build(snapshot,
+    { limit = panel_sets.queue_jobs_limit, translate = _ })
+  panel_sets.queue_jobs_header.label = view.summary or ""
+  for i = 1, #rows do
+    rows[i].label = view.lines[i] or ""
+  end
+  -- Uncertain resume records the start-up classifier parked for a user decision.
+  local plan = __dtrmflickr_resume and __dtrmflickr_resume.plan or nil
+  local uncertain = plan and plan.uncertain or nil
+  panel_sets.queue_uncertain_label.label = queue_panel.uncertain_summary(uncertain, _)
 end
 
 function panel_sets.clear_choices()
@@ -10897,6 +11137,19 @@ function panel_pools.submit()
   end
 end
 
+-- Live job-lifecycle grid container (issue #56): the counts header, the fixed
+-- pool of per-job row labels, then the uncertain-resume surface. Assembled
+-- programmatically (the row pool is a table) and stored on panel_sets so it costs
+-- no main-chunk local. refresh_queue_jobs repaints the labels in place.
+do
+  local children = { orientation = "vertical", panel_sets.queue_jobs_header }
+  for i = 1, #panel_sets.queue_jobs_rows do
+    children[#children + 1] = panel_sets.queue_jobs_rows[i]
+  end
+  children[#children + 1] = panel_sets.queue_uncertain_label
+  panel_sets.queue_jobs_box = dt.new_widget("box")(children)
+end
+
 local panel_widget = dt.new_widget("box") {
   orientation = "vertical",
   panel_status_label,
@@ -10912,6 +11165,7 @@ local panel_widget = dt.new_widget("box") {
   panel_sets.publish_label,
   panel_sets.queue_label,
   panel_sets.queue_detail_label,
+  panel_sets.queue_jobs_box,
   panel_sets_label,
   dt.new_widget("label") { label = _("albums") },
   dt.new_widget("box") {
@@ -11929,6 +12183,7 @@ script_data.__test = {
   flickr_resume = __dtrmflickr_resume,
   queue_jobs = require("dtrmflickr.queue_jobs"),
   queue_resume = require("dtrmflickr.queue_resume"),
+  queue_panel = queue_panel,
   flickr_call = __dtrmflickr_call,
   format_queue_status = format_queue_status,
   privacy_values = settings.privacy_values,
@@ -11964,6 +12219,10 @@ refresh_panel(false, http.quiet_rest_available())
 -- store is not mutated at start, so an other-account batch stays recoverable.
 if __dtrmflickr_resume then
   __dtrmflickr_resume.load_plan(dt.preferences.read(PLUGIN, "active_nsid", "string"))
+  -- Surface any uncertain resume records in the panel grid right away (issue #56)
+  -- so they are visible for a user decision at startup, not only after the next
+  -- queue activity repaints the grid.
+  if panel_sets and panel_sets.refresh_queue_jobs then panel_sets.refresh_queue_jobs() end
 end
 
 dt.print_log("[dtrmflickr] registered Flickr export storage (step 3); " .. TRANSPORT_MSG)
