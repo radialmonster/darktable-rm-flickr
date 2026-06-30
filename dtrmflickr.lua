@@ -924,6 +924,9 @@ M.resolve_ticket = resolve_ticket
 -- account: { token = "...", secret = "..." }
 -- opts: title, description, tags, is_public, is_friend, is_family,
 --       safety_level, content_type, hidden, perm_comment, perm_addmeta
+-- NOTE: the upload API's `hidden` is 1 = include in public search, 2 = hide.
+-- This is the OPPOSITE of flickr.photos.setSafetyLevel's `hidden` (1 = hide,
+-- 0 = visible). Pass 2 here to hide a freshly-uploaded photo from search.
 function M.upload_photo(api_key, api_secret, account, filename, opts)
   if not account or not account.token or not account.secret then
     return nil, "not logged in to Flickr"
@@ -13212,7 +13215,11 @@ local function store(storage, image, format, filename, number, total, high_quali
         perm_addmeta = sync.permissions and permissions.perm_addmeta or nil,
         -- Upload-only option (no resend equivalent): omit unless the user opted in,
         -- so Flickr keeps the account's default search visibility otherwise.
-        hidden = hide_from_search and 1 or nil,
+        -- NOTE: the upload API encodes `hidden` OPPOSITE to flickr.photos.setSafetyLevel.
+        -- upload: 1 = keep in public search, 2 = hide from public search.
+        -- setSafetyLevel (replace/panel paths below): 1 = hide, 0 = visible.
+        -- So hiding on upload must send 2, not 1.
+        hidden = hide_from_search and 2 or nil,
         sleep_fn = pixel_sleep,
       })
     end, { max_attempts = 1 })
@@ -13308,9 +13315,10 @@ local function store(storage, image, format, filename, number, total, high_quali
         end)
       end
       -- setSafetyLevel carries the safety level AND the hide-from-public-search
-      -- flag (issue #61). A fresh upload sends hidden=1 only when the user checked
-      -- the hide-from-search box; a replace carries no metadata, so re-assert that
-      -- intent here through the same call. hidden is sent ONLY when the box is
+      -- flag (issue #61). A fresh upload sends the upload API's hide value (2) only
+      -- when the user checked the hide-from-search box; a replace carries no
+      -- metadata, so re-assert that intent here through setSafetyLevel, whose hide
+      -- value is 1 (the two APIs encode it oppositely). hidden is sent ONLY when the box is
       -- checked (hide_from_search) — matching fresh-upload semantics so a resend
       -- never silently un-hides a photo whose box happens to be unchecked. The
       -- call runs whenever safety is being synced OR a hide is requested, so the
