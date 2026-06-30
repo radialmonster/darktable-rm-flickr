@@ -170,8 +170,13 @@ package.preload["dtrmflickr.http"] = function(...)
 -- toolchain). On Windows, REST GET/POST prefer an optional in-process WinHTTP
 -- module. If that DLL is not installed or cannot be loaded, manual Windows
 -- REST calls fall back to a hidden WScript/MSXML helper.
--- Uploads still fall back to curl because building multipart bodies in pure Lua
--- is much more fragile than curl's battle-tested form encoder.
+--
+-- Photo uploads (multipart/form-data) also prefer the in-process WinHTTP DLL on
+-- Windows: build_multipart() assembles the body in pure Lua and sends it via
+-- native_http.request(). This removes the per-photo console flash that the curl
+-- shell-out caused on GUI darktable (cmd.exe gets a fresh console; see #77). When
+-- the DLL is unavailable, uploads fall back to curl's battle-tested form encoder
+-- (and the flash returns only in that degraded path).
 --
 -- NOTE: io.popen blocks until the command finishes. OAuth token calls are tiny
 -- and fast, so that is fine here. The (potentially long) photo upload in step 3
@@ -276,6 +281,17 @@ local function read_file(path)
   local body = f:read("*a")
   f:close()
   body = body and body:gsub("^\239\187\191", "") or body
+  return body
+end
+
+-- Read a file as raw bytes WITHOUT the BOM-stripping read_file() does. Used for
+-- the binary photo part of a multipart upload, where stripping leading bytes that
+-- happen to match a UTF-8 BOM would corrupt the image.
+local function read_file_binary(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local body = f:read("*a")
+  f:close()
   return body
 end
 
@@ -509,10 +525,91 @@ function M.post(url, body)
   })
 end
 
+-- Build a multipart/form-data request body in pure Lua.
+--   fields: table of string form fields (all signed OAuth + upload params).
+--   file_field/file_path: the binary file part, e.g. photo + C:\path\out.jpg.
+-- Returns: body (binary-safe string), content_type ("multipart/form-data;
+-- boundary=..."), nil  — or  nil, nil, err  when the file cannot be read.
+--
+-- The boundary is chosen so it never appears inside any field value or the file
+-- bytes (multipart requires the delimiter be absent from every part), regenerating
+-- with more entropy on the astronomically unlikely collision. Field/file part
+-- *values* live in the body (not in headers), so quotes, newlines, and arbitrary
+-- UTF-8 in title/description/tags are sent verbatim — exactly what Flickr signs
+-- and reads. Only the form-field names (OAuth + upload param keys) and the
+-- derived filename go into Content-Disposition headers; those keys are ASCII, and
+-- the filename has CR/LF/quotes stripped to prevent header injection.
+local function build_multipart(fields, file_field, file_path)
+  local file_data = read_file_binary(file_path)
+  if not file_data then return nil, nil, "could not read upload file: " .. tostring(file_path) end
+
+  local filename = (tostring(file_path):match("[^/\\]+$") or "photo"):gsub('[\r\n"]', "")
+  if filename == "" then filename = "photo" end
+
+  local keys = {}
+  for k in pairs(fields or {}) do keys[#keys + 1] = k end
+  table.sort(keys)
+
+  local function collides(boundary)
+    if file_data:find(boundary, 1, true) then return true end
+    for _, k in ipairs(keys) do
+      if tostring(fields[k]):find(boundary, 1, true) then return true end
+    end
+    return false
+  end
+
+  local boundary
+  for attempt = 0, 8 do
+    temp_counter = temp_counter + 1
+    boundary = "----dtrmflickrFormBoundary" .. temp_token
+      .. tostring(os.time()) .. tostring(temp_counter) .. tostring(attempt)
+    if not collides(boundary) then break end
+  end
+
+  local CRLF = "\r\n"
+  local t = {}
+  for _, k in ipairs(keys) do
+    t[#t + 1] = "--" .. boundary .. CRLF
+    t[#t + 1] = 'Content-Disposition: form-data; name="' .. tostring(k) .. '"' .. CRLF .. CRLF
+    t[#t + 1] = tostring(fields[k]) .. CRLF
+  end
+  t[#t + 1] = "--" .. boundary .. CRLF
+  t[#t + 1] = 'Content-Disposition: form-data; name="' .. tostring(file_field)
+    .. '"; filename="' .. filename .. '"' .. CRLF
+  t[#t + 1] = "Content-Type: application/octet-stream" .. CRLF .. CRLF
+  t[#t + 1] = file_data
+  t[#t + 1] = CRLF
+  t[#t + 1] = "--" .. boundary .. "--" .. CRLF
+
+  return table.concat(t), "multipart/form-data; boundary=" .. boundary
+end
+
+-- Test hook: lets offline tests force the in-process native path with a stubbed
+-- request() on any OS (the real selection is gated on is_windows() + a loaded DLL).
+local native_http_override = nil
+
+local function multipart_native()
+  if native_http_override then return native_http_override end
+  if is_windows() and native_http_ok and native_http and native_http.request then
+    return native_http
+  end
+  return nil
+end
+
 -- POST multipart/form-data.
 --   fields: table of string form fields.
 --   file_field/file_path: uploaded file field, e.g. photo=@C:\path\out.jpg.
+-- On Windows with the WinHTTP DLL loaded, the body is built in-process and sent
+-- via native_http.request — no curl shell-out, so no per-photo console flash
+-- (#77). Otherwise curl handles the form encoding.
 function M.post_multipart(url, fields, file_field, file_path)
+  local nh = multipart_native()
+  if nh then
+    local body, content_type, err = build_multipart(fields, file_field, file_path)
+    if not body then return nil, err end
+    return nh.request("POST", url, body, content_type)
+  end
+
   local keys = {}
   for k in pairs(fields or {}) do keys[#keys + 1] = k end
   table.sort(keys)
@@ -532,9 +629,15 @@ function M.post_multipart(url, fields, file_field, file_path)
   return run_curl_config(lines)
 end
 
--- Test hook: exposes the curl config runner so offline tests can stub M.run and
--- verify the HTTP-status-sentinel parsing without spawning curl.
-M.__test = { run_curl_config = run_curl_config }
+-- Test hooks: the curl config runner (HTTP-status-sentinel parsing without
+-- spawning curl), the pure-Lua multipart builder, and a setter to force the
+-- native send path with a stubbed request() so the Windows-only branch is
+-- exercisable on any OS.
+M.__test = {
+  run_curl_config = run_curl_config,
+  build_multipart = build_multipart,
+  set_native_http = function(mod) native_http_override = mod end,
+}
 
 return M
 end
