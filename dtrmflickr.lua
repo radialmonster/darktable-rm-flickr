@@ -7952,6 +7952,291 @@ M.publish_dashboard = publish_dashboard
 return M
 end
 
+package.preload["dtrmflickr.account_info"] = function(...)
+-- account_info.lua — account-identity helpers for the login widget (issue #12).
+--
+-- "Account identity polish": show the logged-in user's username/realname, whether
+-- the account is Pro, the profile + buddyicon (avatar) URLs, and the monthly
+-- upload bandwidth / quota Flickr exposes. Two Flickr methods back this:
+--   * flickr.people.getInfo        — username, realname, ispro, iconserver/iconfarm
+--                                     (avatar), profile + photos URLs, photo count.
+--   * flickr.people.getUploadStatus — the calling user's monthly bandwidth limit
+--                                     and per-photo max filesize (requires read).
+--
+-- Everything here is pure and side-effect free EXCEPT the two thin fetch_* wrappers
+-- at the bottom, which take the REST module injected so the parsers/formatters are
+-- fully offline-testable (tests/test_account_info.lua) and the wrappers can be
+-- driven against the real authed account headlessly (tests/live/verify_account_info_cli.lua).
+--
+-- darktable cannot render a remote image in a Lua widget, so the avatar is surfaced
+-- as its buddyicon *URL* (open/copy), not painted inline — hence "if available".
+
+local M = {}
+
+-- ---------------------------------------------------------------------------
+-- Small XML helpers (kept local so this module has no flickr_rest dependency
+-- for the pure path). They mirror flickr_rest's discipline: tolerant attribute
+-- scraping + entity unescape, never a real XML parse.
+-- ---------------------------------------------------------------------------
+
+local function xml_unescape(s)
+  return tostring(s or "")
+    :gsub("&#x(%x+);", function(h)
+      local n = tonumber(h, 16); if not n then return "" end
+      local okc, c = pcall(utf8.char, n); return okc and c or ""
+    end)
+    :gsub("&#(%d+);", function(d)
+      local n = tonumber(d, 10); if not n then return "" end
+      local okc, c = pcall(utf8.char, n); return okc and c or ""
+    end)
+    :gsub("&quot;", '"'):gsub("&apos;", "'")
+    :gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&")
+end
+M.xml_unescape = xml_unescape
+
+-- Pull one attribute value (double- or single-quoted) out of an element's opening
+-- tag text. `tag` is the element name, `attr` the attribute name.
+local function attr_of(body, tag, attr)
+  body = tostring(body or "")
+  local open = body:match("<" .. tag .. "%s+([^>]*)>")
+  if not open then return nil end
+  local v = open:match(attr .. '%s*=%s*"(.-)"') or open:match(attr .. "%s*=%s*'(.-)'")
+  return v
+end
+
+-- Text content of a simple <tag>...</tag> child element, unescaped, or nil.
+local function child_text(body, tag)
+  local v = tostring(body or ""):match("<" .. tag .. "%s*>(.-)</" .. tag .. ">")
+    or tostring(body or ""):match("<" .. tag .. ">(.-)</" .. tag .. ">")
+  return v and xml_unescape(v) or nil
+end
+
+-- A "0"/"1"/"true"/"false" flag attribute -> boolean.
+local function flag(v)
+  if v == nil then return false end
+  v = tostring(v):lower()
+  return v == "1" or v == "true" or v == "yes"
+end
+M.flag = flag
+
+-- ---------------------------------------------------------------------------
+-- Avatar (buddyicon) URL
+-- ---------------------------------------------------------------------------
+
+-- buddyicon_url(nsid, iconserver, iconfarm) -> url
+-- Flickr's buddyicon rule: when iconserver > 0 the avatar lives at
+--   https://farm{iconfarm}.staticflickr.com/{iconserver}/buddyicons/{nsid}.jpg
+-- (the farm-less host live.staticflickr.com also serves it and needs no farm, so
+-- it is used as the fallback when iconfarm is absent). When iconserver is 0/absent
+-- the user has no custom avatar and Flickr serves the default placeholder gif.
+function M.buddyicon_url(nsid, iconserver, iconfarm)
+  nsid = tostring(nsid or "")
+  local server = tonumber(iconserver)
+  if not server or server <= 0 or nsid == "" then
+    return "https://www.flickr.com/images/buddyicon.gif"
+  end
+  local farm = tonumber(iconfarm)
+  if farm and farm > 0 then
+    return string.format("https://farm%d.staticflickr.com/%d/buddyicons/%s.jpg", farm, server, nsid)
+  end
+  return string.format("https://live.staticflickr.com/%d/buddyicons/%s.jpg", server, nsid)
+end
+
+-- ---------------------------------------------------------------------------
+-- Parsers
+-- ---------------------------------------------------------------------------
+
+-- parse_people_info(body) -> info | nil
+-- Parse a flickr.people.getInfo response. Returns a structured table:
+--   { nsid, ispro (bool), iconserver, iconfarm, username, realname, location,
+--     photosurl, profileurl, photos_count (number|nil), avatar_url }
+-- Returns nil when no <person> element is present (e.g. an <err> body).
+function M.parse_people_info(body)
+  body = tostring(body or "")
+  local nsid = attr_of(body, "person", "nsid")
+  if not nsid then return nil end
+  nsid = xml_unescape(nsid)
+  local iconserver = attr_of(body, "person", "iconserver")
+  local iconfarm = attr_of(body, "person", "iconfarm")
+  -- <photos><count>N</count></photos>
+  local photos_block = body:match("<photos%s*>(.-)</photos>") or body:match("<photos>(.-)</photos>")
+  local count = photos_block and tonumber((photos_block:match("<count%s*>(.-)</count>")
+    or photos_block:match("<count>(.-)</count>")))
+  local info = {
+    nsid = nsid,
+    ispro = flag(attr_of(body, "person", "ispro")),
+    iconserver = iconserver,
+    iconfarm = iconfarm,
+    username = child_text(body, "username"),
+    realname = child_text(body, "realname"),
+    location = child_text(body, "location"),
+    photosurl = child_text(body, "photosurl"),
+    profileurl = child_text(body, "profileurl"),
+    photos_count = count,
+  }
+  info.avatar_url = M.buddyicon_url(nsid, iconserver, iconfarm)
+  return info
+end
+
+-- parse_upload_status(body) -> status | nil
+-- Parse a flickr.people.getUploadStatus response. Bandwidth/filesize are reported
+-- in both bytes and kb (use kb to stay inside 32-bit Lua, but Lua 5.4 has 64-bit
+-- integers so bytes are safe here). Modern Pro accounts report unlimited monthly
+-- bandwidth — Flickr signals that by omitting the <bandwidth> element or its
+-- max*; treat a missing/zero max as unlimited. Returns nil on a non-<user> body.
+function M.parse_upload_status(body)
+  body = tostring(body or "")
+  local id = attr_of(body, "user", "id")
+  if not id then return nil end
+  local function num(tag, a)
+    local open = body:match("<" .. tag .. "%s+([^>]*)>")
+    if not open then return nil end
+    local v = open:match(a .. '%s*=%s*"(.-)"') or open:match(a .. "%s*=%s*'(.-)'")
+    return v and tonumber(v) or nil
+  end
+  local bw_present = body:find("<bandwidth", 1, true) ~= nil
+  local bw_max = num("bandwidth", "maxbytes")
+  local status = {
+    nsid = xml_unescape(id),
+    ispro = flag(attr_of(body, "user", "ispro")),
+    username = child_text(body, "username"),
+    bandwidth = {
+      present = bw_present,
+      maxbytes = bw_max,
+      usedbytes = num("bandwidth", "usedbytes"),
+      remainingbytes = num("bandwidth", "remainingbytes"),
+      maxkb = num("bandwidth", "maxkb"),
+      usedkb = num("bandwidth", "usedkb"),
+      remainingkb = num("bandwidth", "remainingkb"),
+      -- Pro / no-cap accounts: bandwidth element absent, or max 0/missing.
+      unlimited = (not bw_present) or (bw_max == nil) or (bw_max <= 0),
+    },
+    filesize = {
+      maxbytes = num("filesize", "maxbytes"),
+      maxkb = num("filesize", "maxkb"),
+    },
+    sets_created = num("sets", "created"),
+  }
+  return status
+end
+
+-- ---------------------------------------------------------------------------
+-- Formatters (friendly one-liners for the panel/login widget)
+-- ---------------------------------------------------------------------------
+
+-- human_bytes(n) -> "1.2 GB" etc. nil/negative -> nil.
+function M.human_bytes(n)
+  n = tonumber(n)
+  if not n or n < 0 then return nil end
+  local units = { "B", "KB", "MB", "GB", "TB" }
+  local i = 1
+  while n >= 1024 and i < #units do n = n / 1024; i = i + 1 end
+  if i == 1 then return string.format("%d %s", n, units[i]) end
+  -- Trim a trailing ".0" so whole values read cleanly (e.g. "2 GB" not "2.0 GB").
+  local s = string.format("%.1f", n):gsub("%.0$", "")
+  return s .. " " .. units[i]
+end
+
+-- format_identity(info) -> "Realname (username)" | "username" | nsid
+-- A compact who-am-I line. Prefers a realname + username pair, falls back to
+-- whichever is present, then the bare nsid.
+function M.format_identity(info)
+  if not info then return "" end
+  local user = info.username and info.username ~= "" and info.username or nil
+  local real = info.realname and info.realname ~= "" and info.realname or nil
+  if real and user then return string.format("%s (%s)", real, user) end
+  return real or user or info.nsid or ""
+end
+
+-- format_quota(status) -> friendly monthly-upload string
+-- Examples:
+--   "Pro account · unlimited monthly uploads"
+--   "monthly uploads: 374 KB of 2 GB used (2 GB left)"
+--   "monthly uploads: unlimited"
+function M.format_quota(status)
+  if not status then return "" end
+  local bw = status.bandwidth or {}
+  local prefix = status.ispro and "Pro account" or "Free account"
+  if bw.unlimited then
+    return prefix .. " \u{00B7} unlimited monthly uploads"
+  end
+  -- Prefer byte values (Lua 5.4 is 64-bit); fall back to kb*1024.
+  local maxb = bw.maxbytes or (bw.maxkb and bw.maxkb * 1024) or nil
+  local usedb = bw.usedbytes or (bw.usedkb and bw.usedkb * 1024) or nil
+  local remb = bw.remainingbytes or (bw.remainingkb and bw.remainingkb * 1024)
+    or (maxb and usedb and (maxb - usedb)) or nil
+  local maxh = M.human_bytes(maxb)
+  local usedh = M.human_bytes(usedb)
+  local remh = M.human_bytes(remb)
+  if maxh and usedh then
+    if remh then
+      return string.format("%s \u{00B7} monthly uploads: %s of %s used (%s left)", prefix, usedh, maxh, remh)
+    end
+    return string.format("%s \u{00B7} monthly uploads: %s of %s used", prefix, usedh, maxh)
+  end
+  if maxh then
+    return string.format("%s \u{00B7} monthly upload limit: %s", prefix, maxh)
+  end
+  return prefix
+end
+
+-- summary_lines(info, status) -> { line, ... }
+-- The label block the widget renders. Always returns at least the identity line.
+-- info/status may each be nil (a fetch that failed/was skipped) — the function
+-- degrades gracefully, emitting only what is known.
+function M.summary_lines(info, status)
+  local lines = {}
+  if info then
+    lines[#lines + 1] = "account: " .. M.format_identity(info)
+    if info.photos_count then
+      lines[#lines + 1] = string.format("photos on Flickr: %d", info.photos_count)
+    end
+    if info.profileurl and info.profileurl ~= "" then
+      lines[#lines + 1] = "profile: " .. info.profileurl
+    end
+    if info.avatar_url and info.avatar_url ~= "" then
+      lines[#lines + 1] = "avatar: " .. info.avatar_url
+    end
+  end
+  if status then
+    lines[#lines + 1] = M.format_quota(status)
+  end
+  return lines
+end
+
+-- ---------------------------------------------------------------------------
+-- Thin REST fetch wrappers (rest module injected for offline testing)
+-- ---------------------------------------------------------------------------
+
+-- fetch_identity(rest, api_key, api_secret, account) -> info, raw | nil, err
+-- getInfo does not require auth, but we sign it (so the caller's own contact
+-- context is available and one code path covers it) and pass the account's nsid.
+function M.fetch_identity(rest, api_key, api_secret, account)
+  if not (account and account.nsid) then return nil, "not logged in to Flickr" end
+  local body, err = rest.call(api_key, api_secret, account, "flickr.people.getInfo",
+    { user_id = account.nsid })
+  if not body then return nil, err end
+  local info = M.parse_people_info(body)
+  if not info then return nil, "could not parse flickr.people.getInfo response" end
+  return info, body
+end
+
+-- fetch_upload_status(rest, api_key, api_secret, account) -> status, raw | nil, err
+-- Requires a signed (read) call.
+function M.fetch_upload_status(rest, api_key, api_secret, account)
+  if not (account and account.token and account.secret) then
+    return nil, "not logged in to Flickr"
+  end
+  local body, err = rest.call(api_key, api_secret, account, "flickr.people.getUploadStatus", {})
+  if not body then return nil, err end
+  local status = M.parse_upload_status(body)
+  if not status then return nil, "could not parse flickr.people.getUploadStatus response" end
+  return status, body
+end
+
+return M
+end
+
 package.preload["dtrmflickr.account_ui"] = function(...)
 -- account_ui.lua — the "Flickr: account login" Lua-options widget and its live
 -- session state, lifted out of the main module so it stops consuming the main
@@ -7987,6 +8272,7 @@ package.preload["dtrmflickr.account_ui"] = function(...)
 
 local auth = require "dtrmflickr.flickr_auth"
 local rest = require "dtrmflickr.flickr_rest"
+local account_info = require "dtrmflickr.account_info"
 
 local M = {}
 
@@ -8005,6 +8291,11 @@ function M.build(deps)
   local clear_token = deps.clear_token
   local get_credentials = deps.get_credentials
   local open_url = deps.open_url
+  -- Issue #12: account-identity (username/avatar/quota). account_info + the REST
+  -- module are injectable so the refresh-button path is offline-testable with a
+  -- fake rest (tests/test_account_ui.lua); the live wiring uses the real modules.
+  local info_mod = deps.account_info or account_info
+  local rest_mod = deps.rest or rest
 
   local status_label = dt.new_widget("label") { label = "" }
   local verifier_label = dt.new_widget("label") { label = _("verifier code") }
@@ -8020,6 +8311,11 @@ function M.build(deps)
   local complete_button
   local login_button
   local logout_button
+  local info_button
+  -- Multi-line account-identity block (issue #12): username/realname, photo
+  -- count, profile + buddyicon (avatar) URLs, and the monthly-upload quota. Empty
+  -- until the user clicks "refresh account info"; cleared on logout.
+  local info_label = dt.new_widget("label") { label = "" }
 
   local function short_error(err)
     local s = tostring(err or ""):gsub("%s+", " ")
@@ -8057,6 +8353,10 @@ function M.build(deps)
     -- token at all, or a saved-but-revoked one the user must replace.
     if login_button then login_button.visible = (not logged_in) or revoked end
     if logout_button then logout_button.visible = logged_in end
+    -- Account-identity refresh is only meaningful with a usable session.
+    if info_button then info_button.visible = logged_in and not revoked end
+    if info_label then info_label.visible = logged_in end
+    if not logged_in then info_label.label = "" end
   end
 
   -- Called from the signed-call wrapper when a Flickr call fails. If the failure
@@ -8172,6 +8472,38 @@ function M.build(deps)
     end,
   }
 
+  -- Issue #12: fetch and render the logged-in account's identity + quota on
+  -- demand. Kept behind a button (not auto-fetched at startup) so opening the
+  -- preferences pane never makes two network calls unprompted; the panel shows
+  -- the cheap saved username immediately and this enriches it when asked.
+  info_button = dt.new_widget("button") {
+    label = _("refresh account info"),
+    tooltip = _("fetch your Flickr username, profile/avatar URL and monthly upload quota"),
+    clicked_callback = function()
+      local acc = load_token()
+      if not acc then dt.print(_("Log in to Flickr first.")); return end
+      local key, secret = get_credentials()
+      if not key then dt.print(_("Enter your Flickr API key and secret first.")); return end
+      local info, ierr = info_mod.fetch_identity(rest_mod, key, secret, acc)
+      if not info then
+        if __dtrmflickr_note_auth_failure then __dtrmflickr_note_auth_failure(ierr) end
+        info_label.label = _("could not load account info: ") .. short_error(ierr)
+        dt.print_log("[dtrmflickr] account info (getInfo) failed: " .. tostring(ierr))
+        return
+      end
+      -- getUploadStatus is best-effort: a write-only / read-lacking token can fail
+      -- it (code 99) without the identity being unavailable, so render identity
+      -- regardless and only append the quota line when it resolves.
+      local status, serr = info_mod.fetch_upload_status(rest_mod, key, secret, acc)
+      if not status then
+        if __dtrmflickr_note_auth_failure then __dtrmflickr_note_auth_failure(serr) end
+        dt.print_log("[dtrmflickr] account upload status failed: " .. tostring(serr))
+      end
+      info_label.label = table.concat(info_mod.summary_lines(info, status), "\n")
+      info_label.visible = true
+    end,
+  }
+
   logout_button = dt.new_widget("button") {
     label = _("log out"),
     clicked_callback = function()
@@ -8192,6 +8524,8 @@ function M.build(deps)
     verifier_entry,
     complete_button,
     logout_button,
+    info_button,
+    info_label,
   }
 
   return {
