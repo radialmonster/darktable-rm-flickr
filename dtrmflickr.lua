@@ -7835,10 +7835,90 @@ local function publish_state_label(status, published_at, reasons, translate)
     return tr("publish state: linked, sync date unknown")
   elseif status == "unpublished" then
     return tr("publish state: unpublished")
+  elseif status == "missing" then
+    return tr("publish state: missing on Flickr")
   end
   return tr("publish state: unknown")
 end
 M.publish_state_label = publish_state_label
+
+-- Aggregate a selection's per-image publish verdicts into the published-state
+-- dashboard text shown in the panel (issue #7). `entries` is a list of
+-- per-image tables:
+--   { status       = <evaluate_publish_state verdict, or "missing">,
+--     reasons      = { <diff reason keys> },           -- optional
+--     published_at = <last local sync stamp string>,   -- optional
+--     uploaded_at  = <Flickr upload date stamp string> } -- optional
+-- A single entry renders full detail (the state line — which already carries
+-- the last-local-sync stamp and which fields differ — plus the Flickr upload
+-- date); a multi-image selection renders a roll-up of category counts plus a
+-- per-field breakdown of what needs syncing. `opts.translate` is an optional
+-- gettext-style wrapper (defaults to identity) so the formatting stays pure and
+-- testable while the caller localizes. Returns
+--   { count, counts = {current, ["needs-republish"], unknown, unpublished,
+--     missing, other}, fields = <breakdown string>, lines = {...},
+--     text = <lines joined by "\n"> }.
+local function publish_dashboard(entries, opts)
+  opts = opts or {}
+  local tr = opts.translate
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  entries = entries or {}
+
+  local counts = {
+    current = 0, ["needs-republish"] = 0, unknown = 0,
+    unpublished = 0, missing = 0, other = 0,
+  }
+  local tally = {}
+  for _, e in ipairs(entries) do
+    local status = tostring((e and e.status) or "unknown")
+    if counts[status] == nil then status = "other" end
+    counts[status] = counts[status] + 1
+    -- Tally each distinct diff reason once per image so the per-field
+    -- breakdown counts photos, not duplicate reason tags on one photo.
+    local seen = {}
+    for _, reason in ipairs((e and e.reasons) or {}) do
+      reason = tostring(reason or "")
+      if reason ~= "" and not seen[reason] then
+        seen[reason] = true
+        tally[reason] = (tally[reason] or 0) + 1
+      end
+    end
+  end
+
+  local fields = state.describe_reason_tally and state.describe_reason_tally(tally) or ""
+  local count = #entries
+  local lines = {}
+
+  if count == 0 then
+    lines[#lines + 1] = tr("Flickr dashboard: no images selected")
+  elseif count == 1 then
+    local e = entries[1]
+    lines[#lines + 1] = publish_state_label(e.status, e.published_at, e.reasons, tr)
+    if e.uploaded_at and e.uploaded_at ~= "" then
+      lines[#lines + 1] = string.format(tr("Flickr upload date: %s"), e.uploaded_at)
+    end
+  else
+    local summary = string.format(
+      tr("%d selected: %d current, %d need sync, %d unknown, %d unpublished"),
+      count, counts.current, counts["needs-republish"], counts.unknown, counts.unpublished)
+    if counts.missing > 0 then
+      summary = summary .. string.format(tr(", %d missing on Flickr"), counts.missing)
+    end
+    lines[#lines + 1] = summary
+    if fields ~= "" then
+      lines[#lines + 1] = string.format(tr("fields needing sync: %s"), fields)
+    end
+  end
+
+  return {
+    count = count,
+    counts = counts,
+    fields = fields,
+    lines = lines,
+    text = table.concat(lines, "\n"),
+  }
+end
+M.publish_dashboard = publish_dashboard
 
 return M
 end
@@ -9080,6 +9160,11 @@ local panel_sets_label = dt.new_widget("label") { label = "" }
 panel_sets = { filtering = false, current_ids = {} }
 panel_sets.status_label = dt.new_widget("label") { label = "" }
 panel_sets.publish_label = dt.new_widget("label") { label = "" }
+-- Published-state dashboard (issue #7): single-image detail or a selection
+-- roll-up of publish-state counts + which fields need syncing. Populated by
+-- refresh_publish_state_label (single image) and scan_selected_publish_state
+-- (whole selection) via panel_helpers.publish_dashboard.
+panel_sets.dashboard_label = dt.new_widget("label") { label = "" }
 panel_sets.queue_label = dt.new_widget("label") { label = "" }
 panel_sets.queue_detail_label = dt.new_widget("label") { label = "" }
 -- Live job-lifecycle grid (issue #56). A FIXED pool of label widgets the panel
@@ -11300,16 +11385,31 @@ end
 function panel_sets.refresh_publish_state_label(image, acc, photo_id)
   if not image or not photo_id then
     panel_sets.publish_label.label = panel_helpers.publish_state_label("unpublished", nil, nil, _)
+    if panel_sets.dashboard_label then
+      panel_sets.dashboard_label.label = panel_helpers.publish_dashboard(
+        { { status = "unpublished" } }, { translate = _ }).text
+    end
     return "unpublished"
   end
   if not acc then
     panel_sets.publish_label.label = _("publish state: log in to evaluate")
+    if panel_sets.dashboard_label then
+      panel_sets.dashboard_label.label = _("Flickr dashboard: log in to evaluate")
+    end
     return "unknown"
   end
   local status, published_at, _photo_id, reasons = state.evaluate_publish_state(image, acc.nsid, {
     metadata_fingerprints = effective_metadata_fingerprints and effective_metadata_fingerprints(image, master_sync_fields()) or nil,
   })
   panel_sets.publish_label.label = panel_helpers.publish_state_label(status, published_at, reasons, _)
+  -- Reuse the just-computed verdict (no extra evaluate) for the single-image
+  -- dashboard; the whole-selection roll-up is driven by scan_selected_publish_state.
+  if panel_sets.dashboard_label then
+    panel_sets.dashboard_label.label = panel_helpers.publish_dashboard({
+      { status = status, reasons = reasons, published_at = published_at,
+        uploaded_at = state.get_uploaded_at(image, acc.nsid) },
+    }, { translate = _ }).text
+  end
   return status, published_at, reasons
 end
 
@@ -11398,12 +11498,17 @@ function panel_sets.scan_selected_publish_state()
   end
   local counts = { ["needs-republish"] = 0, current = 0, unknown = 0, unpublished = 0 }
   local field_tally = {}
+  local entries = {}
   local sync = master_sync_fields()
   for _, image in ipairs(selection) do
-    local status, _published_at, _photo_id, reasons = state.evaluate_publish_state(image, acc.nsid, {
+    local status, published_at, _photo_id, reasons = state.evaluate_publish_state(image, acc.nsid, {
       metadata_fingerprints = effective_metadata_fingerprints and effective_metadata_fingerprints(image, sync) or nil,
     })
     counts[status] = (counts[status] or 0) + 1
+    entries[#entries + 1] = {
+      status = status, reasons = reasons, published_at = published_at,
+      uploaded_at = state.get_uploaded_at(image, acc.nsid),
+    }
     -- Tally each distinct diff reason once per image so the per-field breakdown
     -- counts photos, not duplicate reason tags on a single photo.
     local seen = {}
@@ -11413,6 +11518,11 @@ function panel_sets.scan_selected_publish_state()
         field_tally[reason] = (field_tally[reason] or 0) + 1
       end
     end
+  end
+  -- Persist the roll-up into the panel's dashboard label (issue #7) so the
+  -- scan result stays visible instead of only flashing as a toast.
+  if panel_sets.dashboard_label then
+    panel_sets.dashboard_label.label = panel_helpers.publish_dashboard(entries, { translate = _ }).text
   end
   refresh_panel(true, false)
   dt.print(string.format(_("Flickr: scanned %d selected photo(s): %d need sync, %d current, %d unknown, %d unpublished"),
@@ -12097,6 +12207,7 @@ local panel_widget = dt.new_widget("box") {
     panel_sets.copy_url_button,
   },
   panel_sets.publish_label,
+  panel_sets.dashboard_label,
   panel_sets.queue_label,
   panel_sets.queue_detail_label,
   panel_sets.queue_jobs_box,
