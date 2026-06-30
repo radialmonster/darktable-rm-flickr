@@ -4459,17 +4459,38 @@ function M.new(opts)
   -- set with this parked set. Empty until `resume` populates it.
   local parked = {}
 
+  -- The "pending" set: durable resume records produced by the SYNCHRONOUS export
+  -- path (issue #78), keyed by their image+account so a per-image add/remove is
+  -- O(1). Unlike the tracker's async records these are not driven by queue events
+  -- (the synchronous `Queue:call` drain never sits observably mid-flight), so the
+  -- export producer manages them explicitly: `add_pending` after a photo's pixels
+  -- reach Flickr, `remove_pending` once its metadata remainder is confirmed clean.
+  -- They are merged into the persisted blob exactly like `parked`, so a quit
+  -- mid-batch leaves a non-empty, reconstructable blob; a clean batch removes them
+  -- all and the blob loads back as "nothing to resume".
+  local pending = {}            -- key -> record
+  local function pending_key(image_key, nsid)
+    return tostring(image_key or "") .. "\0" .. tostring(nsid or "")
+  end
+  local function pending_records()
+    local out = {}
+    for _, rec in pairs(pending) do out[#out + 1] = rec end
+    return out
+  end
+
   -- The current live (non-terminal) record set the tracker is holding, unioned
-  -- with the sticky parked set. This is exactly the set a restart would need to
-  -- resume; `save_records` filters it again through `to_resumable`, so a record
-  -- that went terminal between the snapshot and the write is still never
-  -- persisted. The parked records are non-terminal by construction.
+  -- with the sticky parked set and the synchronous-export pending set. This is
+  -- exactly the set a restart would need to resume; `save_records` filters it again
+  -- through `to_resumable`, so a record that went terminal between the snapshot and
+  -- the write is still never persisted. The parked/pending records are non-terminal
+  -- by construction.
   local function live_records()
     local out = {}
     if type(tracker.active) == "function" then
       for _, rec in ipairs(tracker:active()) do out[#out + 1] = rec end
     end
     for _, rec in ipairs(parked) do out[#out + 1] = rec end
+    for _, rec in ipairs(pending_records()) do out[#out + 1] = rec end
     return out
   end
 
@@ -4480,10 +4501,41 @@ function M.new(opts)
     for _, rec in ipairs(records or {}) do parked[#parked + 1] = rec end
   end
 
-  -- Persist the current resumable set (tracker-live ∪ parked). Returns the blob
-  -- written (for tests/logs).
+  -- Persist the current resumable set (tracker-live ∪ parked ∪ pending). Returns
+  -- the blob written (for tests/logs).
   function self.persist()
     return qj.save_records(backend, live_records())
+  end
+
+  -- Register a synchronous-export resume record (issue #78). Idempotent on the
+  -- record's image+nsid key, so re-adding the same image's record (e.g. a replace
+  -- after a fresh upload in the same batch) just overwrites it. Persists
+  -- immediately — the synchronous export path is NOT gated by `is_pumping`, so the
+  -- durable blob reflects the in-progress batch the moment a photo's pixels land.
+  -- A nil/keyless record is ignored. Returns the blob written, or nil if ignored.
+  function self.add_pending(rec)
+    if type(rec) ~= "table" or rec.image == nil then return nil end
+    pending[pending_key(rec.image, rec.nsid)] = rec
+    return self.persist()
+  end
+
+  -- Drop a synchronous-export resume record once its image's post-upload remainder
+  -- is confirmed clean. No-op (no rewrite) when the record was not present, so a
+  -- clean image that never needed a record costs no extra write. Returns the blob
+  -- written, or nil when nothing changed.
+  function self.remove_pending(image_key, nsid)
+    local key = pending_key(image_key, nsid)
+    if pending[key] == nil then return nil end
+    pending[key] = nil
+    return self.persist()
+  end
+
+  -- Drop every synchronous-export pending record (clean end-of-batch). Rewrites the
+  -- blob to whatever live/parked records remain (empty in the common clean case, so
+  -- the blob loads back as "nothing to resume"). Returns the blob written.
+  function self.clear_pending()
+    pending = {}
+    return self.persist()
   end
 
   -- Drop the persisted blob (clean drain / logout / post-resume). Also drops the
@@ -4491,6 +4543,7 @@ function M.new(opts)
   -- explicit logout must not leave another account's orphaned work persisted.
   function self.clear()
     parked = {}
+    pending = {}
     qj.clear_records(backend)
   end
 
@@ -4646,6 +4699,223 @@ function M.new(opts)
   end
 
   return self
+end
+
+return M
+end
+
+package.preload["dtrmflickr.upload_resume"] = function(...)
+-- upload_resume.lua — produce reconstructable post-upload resume records for the
+-- synchronous export path (issue #78).
+--
+-- WHY this exists / scope (read before changing):
+--   The export `store`/`finalize` callbacks must drain SYNCHRONOUSLY. darktable
+--   calls `store` once per image with a freshly-exported temp file and deletes
+--   that file once `store` returns, so the pixel UPLOAD itself can never be
+--   deferred across darktable ticks — the file would be gone. And a never-started
+--   upload cannot be safely re-run anyway: `flickr.upload` is non-idempotent, has
+--   no dedupe key, and the temp file is gone, so re-running it risks a DUPLICATE
+--   photo (the exact hazard the queue's `max_attempts = 1` rule exists to prevent).
+--
+--   What CAN be safely resumed after an interruption is the IDEMPOTENT post-upload
+--   remainder for a photo whose pixels ALREADY reached Flickr: the metadata setters
+--   (title/description, keywords, GPS, date taken, license, perms, safety). Their
+--   pending state is durably stored as darktable TAGS by `state.lua` — it survives
+--   a quit/restart because darktable persists tags in its library/XMP. So a resume
+--   record needs only a durable image key + the owning account nsid; at restart the
+--   reconstruction handler re-derives the still-pending reasons from the image's
+--   tags and re-runs ONLY those setters. Re-running an idempotent setter converges
+--   to the same Flickr state, so there is no duplicate and no harm if the photo was
+--   already fully synced (the handler then finds nothing pending and no-ops).
+--
+--   The record uses method "dtrmflickr.resend", which `queue_jobs.is_idempotent`
+--   classifies idempotent and (state "queued") `is_safely_resumable`, so
+--   `plan_resume_safe` routes it to `runnable` and the resume executor (#57) re-runs
+--   it with NO duplicate photo/album. The non-idempotent upload stays out of the
+--   resume blob entirely: an image that never finished uploading simply isn't
+--   recorded here, and the user re-exports it (current behaviour, no duplicate).
+--
+-- This module is pure / offline-importable: every darktable dependency (image
+-- resolution, the Flickr call wrapper, rest/metadata/state helpers) is INJECTED by
+-- the main module, never `require`d here, so it stays unit-testable without a
+-- darktable runtime and costs no main-chunk locals.
+----------------------------------------------------------------------
+
+local M = {}
+
+-- The synthetic method name for a post-upload metadata-remainder resume record.
+-- Kept idempotent + safely-resumable by queue_jobs (unknown/own methods default
+-- idempotent; state "queued" never started). Must NOT be one of the queue's
+-- non-idempotent methods.
+M.METHOD = "dtrmflickr.resend"
+
+-- A durable, restart-stable key for a darktable image. Within one library the
+-- image's numeric `id` is stable across restarts, so it round-trips through the
+-- serialized resume blob and can be resolved back to the image at startup. Returns
+-- nil for a nil image or one with no id (which therefore produces no record).
+function M.image_key(image)
+  if image == nil then return nil end
+  local id = image.id
+  if id == nil then return nil end
+  id = tostring(id)
+  if id == "" then return nil end
+  return id
+end
+
+-- Build a resume record describing the post-upload metadata remainder for one
+-- uploaded image. Pure. Returns nil when there is no usable image key (so a
+-- caller can `if rec then add_pending(rec) end` unconditionally).
+--
+--   image_key : durable id string (from M.image_key)
+--   nsid      : owning account nsid (account-binding contract)
+--   label     : optional human label (filename) for the panel/log
+function M.build_record(image_key, nsid, label)
+  if image_key == nil or image_key == "" then return nil end
+  return {
+    method = M.METHOD,
+    nsid = (nsid ~= nil and nsid ~= "") and tostring(nsid) or nil,
+    image = tostring(image_key),
+    -- "queued" = never started executing on the async pump. Combined with the
+    -- idempotent method this is what makes `is_safely_resumable` return true and
+    -- routes the record to `runnable` (not `uncertain`) at restart.
+    state = "queued",
+    label = label,
+  }
+end
+
+-- Re-run the still-pending, sync-enabled metadata setters for a single already-
+-- uploaded image. This is the idempotent remainder a resume replays; it mirrors
+-- the panel's `push_selected_metadata` single-image body but is dependency-injected
+-- so it is offline-testable and lives off the main-chunk local budget.
+--
+-- deps (all injected by the main module's reconstruction handler):
+--   call(method, fn)                 -> ok, err   (the shared __dtrmflickr_call)
+--   rest                             -> flickr_rest module
+--   metadata                         -> metadata module
+--   state                            -> state module
+--   sync                             -> resolved master_sync_fields() table
+--   fingerprints(image, sync)        -> effective_metadata_fingerprints
+--   store_fingerprints(image, nsid, fingerprints, fields) -> persist helper
+--   keyword_tags(image)              -> rules.image_keyword_tags
+--   tr(s)                            -> optional translate hook (defaults identity)
+--
+-- Returns (status, detail):
+--   "synced"   detail = number of fields pushed   (>=1 setter succeeded)
+--   "clean"    detail = nil                        (nothing was pending — no-op)
+--   "unlinked" detail = nil                        (no Flickr photo id for account)
+--   "error"    detail = error string              (a setter failed)
+-- A truthy first return (any non-"error" status string) lets the queue treat the
+-- resumed job as success; "error" returns (nil, detail) to trigger normal retry of
+-- the idempotent setters.
+function M.resend_image(image, acc, deps)
+  deps = deps or {}
+  local call = deps.call
+  local rest = deps.rest
+  local meta = deps.metadata
+  local state = deps.state
+  local sync = deps.sync or {}
+  local tr = deps.tr or function(s) return s end
+  if image == nil or acc == nil or acc.nsid == nil then
+    return nil, "resume resend: missing image/account"
+  end
+  local photo_id = state.get_photo_id(image, acc.nsid)
+  if photo_id == nil or photo_id == "" then
+    -- No linked photo for this account: nothing to resend (and never re-upload).
+    return "unlinked"
+  end
+  local fingerprints = deps.fingerprints and deps.fingerprints(image, sync) or nil
+  local _status, _pub, _pid, reasons = state.evaluate_publish_state(image, acc.nsid, {
+    metadata_fingerprints = fingerprints,
+  })
+  local plan = meta.metadata_resend_plan(sync, reasons)
+  if not plan.any then
+    return "clean"
+  end
+
+  local pushed = 0
+  local function push(reason, method, fn)
+    local ok, err = call(method, fn)
+    if ok then
+      state.clear_reason(image, acc.nsid, reason)
+      if deps.store_fingerprints and fingerprints then
+        deps.store_fingerprints(image, acc.nsid, fingerprints, { reason })
+      end
+      pushed = pushed + 1
+      return true
+    end
+    state.mark_reason(image, acc.nsid, reason)
+    return false, err
+  end
+
+  if plan.send_meta then
+    local title = sync.title and (image.title or "") or nil
+    local description = sync.description and (image.description or "") or nil
+    local ok, err = push("title_description", "flickr.photos.setMeta", function()
+      return rest.photos_set_meta(deps.api_key, deps.api_secret, acc, photo_id, title, description)
+    end)
+    if not ok then return nil, err end
+  end
+  if plan.send_tags then
+    local tags = (deps.keyword_tags and deps.keyword_tags(image)) or ""
+    local ok, err = push("keywords", "flickr.photos.setTags", function()
+      return rest.photos_set_tags(deps.api_key, deps.api_secret, acc, photo_id, tags)
+    end)
+    if not ok then return nil, err end
+  end
+  if plan.send_date then
+    local date_taken = meta.image_date_taken(image)
+    local ok, err = push("date_taken", "flickr.photos.setDates", function()
+      return rest.photos_set_dates(deps.api_key, deps.api_secret, acc, photo_id, date_taken, 0)
+    end)
+    if not ok then return nil, err end
+  end
+  if plan.send_gps then
+    local lat, lon = meta.image_location(image)
+    local ok, err = push("gps", "flickr.photos.geo.setLocation", function()
+      return rest.photos_geo_set_location(deps.api_key, deps.api_secret, acc, photo_id, lat, lon, 16)
+    end)
+    if not ok then return nil, err end
+  end
+
+  if pushed > 0 then
+    state.set_metadata_published_at(image, acc.nsid)
+    return "synced", pushed
+  end
+  return "clean"
+end
+
+-- Reconstruct a job descriptor from a persisted resume record (the
+-- `__dtrmflickr_resume_handlers[METHOD]` body). Pure with respect to darktable:
+-- the live wiring is injected.
+--
+-- deps:
+--   resolve_image(image_key) -> image | nil   (find the darktable image by id)
+--   account()                -> acc   | nil   (the active account)
+--   resend(image, acc)       -> status, detail (M.resend_image bound to live deps)
+--
+-- Returns a `{ method, fn, opts }` descriptor for Queue:submit_async, or nil when
+-- the image can no longer be resolved / there is no active account (the executor
+-- then keeps the record persisted for a later session rather than dropping it).
+function M.rebuild(rec, deps)
+  if type(rec) ~= "table" or rec.image == nil then return nil end
+  deps = deps or {}
+  if type(deps.resolve_image) ~= "function" or type(deps.resend) ~= "function" then
+    return nil
+  end
+  local image = deps.resolve_image(rec.image)
+  if image == nil then return nil end
+  local acc = deps.account and deps.account() or nil
+  if acc == nil or acc.nsid == nil then return nil end
+  -- Account-binding contract: only resume a record whose owning nsid matches the
+  -- active account. plan_resume_safe already enforced this (orphans never reach a
+  -- runnable rebuild), but re-check defensively so a mis-wired caller can never
+  -- resend one account's image under another account's token.
+  if rec.nsid ~= nil and tostring(rec.nsid) ~= tostring(acc.nsid) then return nil end
+  return {
+    method = M.METHOD,
+    fn = function() return deps.resend(image, acc) end,
+    opts = {},
+  }
 end
 
 return M
@@ -11919,6 +12189,21 @@ local function store(storage, image, format, filename, number, total, high_quali
     if not is_replace then
       state.set_uploaded_at(image, extra_data.account.nsid, extra_data.publish_stamp)
     end
+    -- (#78) Register a durable resume record now that the photo's pixels are on
+    -- Flickr (photo_id known + persisted in state.lua tags). A quit/crash before
+    -- the idempotent metadata setters below finish then leaves a reconstructable
+    -- remainder the next startup replays — without ever re-uploading the
+    -- non-idempotent pixels (the temp file is gone and re-upload risks a
+    -- duplicate). Removed once this image's metadata is confirmed clean below.
+    -- Guarded: a resume-store hiccup must never break a working export.
+    if __dtrmflickr_resume and __dtrmflickr_resume.add_pending then
+      pcall(function()
+        local ur = require("dtrmflickr.upload_resume")
+        local rec = ur.build_record(ur.image_key(image), extra_data.account.nsid,
+          image and image.filename or filename)
+        if rec then __dtrmflickr_resume.add_pending(rec) end
+      end)
+    end
     local post_failed = false
     local failed_metadata_fields = {}
     -- A replace carries no metadata (the endpoint only accepts the photo id and
@@ -12078,6 +12363,16 @@ local function store(storage, image, format, filename, number, total, high_quali
     else
       state.set_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
       store_metadata_fingerprints(image, extra_data.account.nsid, upload_fingerprints)
+    end
+    -- (#78) Metadata remainder confirmed for this image: a clean image drops its
+    -- resume record (so a clean batch leaves an empty resume blob), while a
+    -- post_failed image KEEPS its record so the failed idempotent setters replay at
+    -- the next startup. Guarded so it can never break the export.
+    if not post_failed and __dtrmflickr_resume and __dtrmflickr_resume.remove_pending then
+      pcall(function()
+        local ur = require("dtrmflickr.upload_resume")
+        __dtrmflickr_resume.remove_pending(ur.image_key(image), extra_data.account.nsid)
+      end)
     end
     extra_data.uploaded[#extra_data.uploaded + 1] = { image = image, filename = filename, photo_id = photo_id, attempts = image_attempts, replaced = is_replace }
     if is_replace then
@@ -12352,6 +12647,48 @@ refresh_panel(false, http.quiet_rest_available())
 -- reconstructable record yet — the executor therefore keeps any unhandled runnable
 -- record persisted rather than dropping it.
 __dtrmflickr_resume_handlers = __dtrmflickr_resume_handlers or {}
+
+-- (#78) Reconstruction handler for the synchronous-export post-upload remainder.
+-- The export path now produces `dtrmflickr.resend` resume records (upload_resume.lua)
+-- once a photo's pixels reach Flickr. This handler rebuilds an IDEMPOTENT metadata-
+-- resend job for that already-uploaded image from its durable darktable id +
+-- state.lua tags (photo_id + still-pending reasons) — it never re-uploads pixels,
+-- so it cannot create a duplicate photo. It lives off the main-chunk local budget
+-- (a function value on a global table) and pulls every live dependency from the
+-- surrounding chunk; upload_resume.lua itself stays pure / injected.
+__dtrmflickr_resume_handlers[require("dtrmflickr.upload_resume").METHOD] = function(rec)
+  local ur = require("dtrmflickr.upload_resume")
+  return ur.rebuild(rec, {
+    resolve_image = function(image_key)
+      if image_key == nil then return nil end
+      local want = tostring(image_key)
+      for _, img in ipairs(dt.database) do
+        if tostring(img.id) == want then return img end
+      end
+      return nil
+    end,
+    account = function() return load_token() end,
+    resend = function(image, acc)
+      local api_key, api_secret = get_credentials()
+      if not api_key or not api_secret then
+        return nil, "resume resend: missing API key/secret"
+      end
+      return ur.resend_image(image, acc, {
+        call = __dtrmflickr_call,
+        rest = rest,
+        metadata = metadata,
+        state = state,
+        sync = master_sync_fields(),
+        fingerprints = function(im, sy) return effective_metadata_fingerprints(im, sy) end,
+        store_fingerprints = store_metadata_fingerprints,
+        keyword_tags = function(im) return rules.image_keyword_tags(im) end,
+        api_key = api_key,
+        api_secret = api_secret,
+        tr = _,
+      })
+    end,
+  })
+end
 
 -- darktable-start resume classification + execution (issues #55 / #57). Load any
 -- persisted resume blob from a previous session and classify it against the
