@@ -4393,6 +4393,134 @@ end
 return M
 end
 
+package.preload["dtrmflickr.queue_resume"] = function(...)
+-- queue_resume.lua — LIVE wiring of the durable resume store (issue #55).
+--
+-- The pure plumbing already exists in `queue_jobs.lua`:
+--   * `save_records`/`load_records`/`clear_records` — the serialize/deserialize
+--     round-trip against an injected {read,write} backend,
+--   * `make_pref_backend` — adapts `dt.preferences` to that backend,
+--   * `to_resumable`/`plan_resume_safe` — the resume-safety + idempotency guards.
+--
+-- What was missing is calling that plumbing on REAL lifecycle transitions, which
+-- only become meaningful now that the async/coroutine queue (issue #54) exists:
+-- the synchronous `Queue:call` path drains every job to a terminal state within
+-- one call, so there is never a mid-flight job to persist there. Only work routed
+-- through `submit_async`/`pump` can sit observably in queued/running/waiting/
+-- retrying across darktable ticks — the window a restart or crash must survive.
+--
+-- This module is deliberately kept out of the main module's chunk: it costs zero
+-- main-chunk locals (CLAUDE.md's per-function local limit) and stays pure /
+-- offline-importable because every darktable dependency (the prefs-backed backend,
+-- the tracker, the queue) is INJECTED, never `require`d here.
+--
+-- Responsibilities:
+--   * persist the resumable subset whenever it changes during async pumping,
+--   * `clear` the blob on a clean drain (queue emptied of live work),
+--   * persist the remaining pending set on shutdown / script teardown,
+--   * at darktable start, load the blob and classify it against the active
+--     account via `plan_resume_safe`, honoring the account-binding contract
+--     (orphaned / logged-out records are surfaced as orphaned, never run here).
+--
+-- Execution of the `runnable` plan (and the user decision over `uncertain`
+-- records) is issue #57; this module only persists, loads, and classifies.
+----------------------------------------------------------------------
+
+local M = {}
+
+-- Build a live resume store around the injected pieces.
+--
+-- opts:
+--   queue_jobs : the queue_jobs module (provides save/load/clear/plan_resume_safe)
+--   tracker    : the lifecycle tracker (provides :active() -> live record copies)
+--   backend    : a {read, write} key/value backend (make_pref_backend in prod)
+--   is_pumping : optional () -> boolean — true while the async pump is draining.
+--                Persistence is gated on this so the synchronous export path
+--                (which drains within one call and has nothing to recover) never
+--                churns the durable store. Defaults to "always persist" when nil.
+--   log        : optional (msg) -> nil progress logger.
+function M.new(opts)
+  opts = opts or {}
+  local qj = assert(opts.queue_jobs, "queue_resume.new requires queue_jobs")
+  local tracker = assert(opts.tracker, "queue_resume.new requires a tracker")
+  local backend = assert(opts.backend, "queue_resume.new requires a backend")
+  local is_pumping = opts.is_pumping
+  local log = opts.log or function() end
+
+  local self = { queue_jobs = qj, tracker = tracker, backend = backend }
+
+  -- The current live (non-terminal) record set the tracker is holding. This is
+  -- exactly the set a restart would need to resume; `save_records` filters it
+  -- again through `to_resumable`, so a record that went terminal between the
+  -- snapshot and the write is still never persisted.
+  local function live_records()
+    if type(tracker.active) == "function" then return tracker:active() end
+    return {}
+  end
+
+  -- Persist the current resumable set. Returns the blob written (for tests/logs).
+  function self.persist()
+    return qj.save_records(backend, live_records())
+  end
+
+  -- Drop the persisted blob (clean drain / logout / post-resume).
+  function self.clear()
+    qj.clear_records(backend)
+  end
+
+  -- Lifecycle hook fed from the queue's event stream. Persist only while the
+  -- async pump is active: the synchronous `Queue:call` drain has no recoverable
+  -- mid-flight state, and persisting on every synchronous event would hammer the
+  -- preference for nothing. When the live set empties during a pump (the final
+  -- job went terminal — a clean drain), clear the blob instead of writing an
+  -- empty one, so a restart sees "nothing to resume". Returns "saved" / "cleared"
+  -- / "skipped" so callers (and tests) can assert what happened.
+  function self.on_event()
+    if is_pumping and not is_pumping() then return "skipped" end
+    local records = live_records()
+    if #records == 0 then
+      self.clear()
+      return "cleared"
+    end
+    self.persist()
+    return "saved"
+  end
+
+  -- darktable-start classification. Load the persisted blob and split it against
+  -- the active account with the idempotency-aware planner. Pure with respect to
+  -- the store (does NOT mutate or clear the blob): other-account records stay
+  -- recoverable for when that account logs back in, and #57 owns execution +
+  -- post-resume clearing. `active_nsid` nil/"" (logged out) sends every resumable
+  -- record to `orphaned`. Returns the plan table:
+  --   { runnable, uncertain, orphaned, finished, records }
+  -- and logs a one-line summary. Honors the account-binding contract by
+  -- classification: nothing is run here, and orphans are surfaced as orphaned.
+  function self.load_plan(active_nsid)
+    local records = qj.load_records(backend)
+    local runnable, uncertain, orphaned, finished =
+      qj.plan_resume_safe(records, active_nsid)
+    local plan = {
+      runnable = runnable,
+      uncertain = uncertain,
+      orphaned = orphaned,
+      finished = finished,
+      records = records,
+    }
+    self.plan = plan
+    if #records > 0 then
+      log(string.format(
+        "[dtrmflickr] resume store: %d persisted record(s) -> %d runnable, %d uncertain, %d orphaned, %d finished",
+        #records, #runnable, #uncertain, #orphaned, #finished))
+    end
+    return plan
+  end
+
+  return self
+end
+
+return M
+end
+
 package.preload["dtrmflickr.settings"] = function(...)
 -- settings.lua — stable Flickr option tables and preference lookup helpers.
 
@@ -7224,7 +7352,16 @@ local panel_sets
 __dtrmflickr_jobs = require("dtrmflickr.queue_jobs").new_tracker()
 
 __dtrmflickr_queue = require("dtrmflickr.queue").new {
-  on_event = function(payload) __dtrmflickr_jobs:observe(payload) end,
+  on_event = function(payload)
+    __dtrmflickr_jobs:observe(payload)
+    -- LIVE durable-resume wiring (issue #55). Persist the resumable set on async
+    -- pump lifecycle transitions; clear it on a clean drain. Gated on
+    -- `is_pumping` inside the store so the synchronous Queue:call path (which
+    -- drains to terminal within one call and has nothing to recover) never
+    -- touches the preference. A global like __dtrmflickr_jobs so it costs no
+    -- main-chunk local.
+    if __dtrmflickr_resume then __dtrmflickr_resume.on_event() end
+  end,
   sleep_ms = function(ms)
     -- dt.control.sleep takes an int delay in MILLISECONDS (see
     -- docs/lua-api-manual/darktable/darktable.control.md). The queue already
@@ -7269,6 +7406,22 @@ __dtrmflickr_queue = require("dtrmflickr.queue").new {
     ["flickr.photos.search"] = 250,
     ["flickr.photosets.getList"] = 250,
   },
+}
+
+-- LIVE durable resume store (issue #55). Wraps dt.preferences as the {read,write}
+-- backend and persists the tracker's resumable set across the async pump's
+-- lifecycle. The blob lives in an UNREGISTERED internal preference (key
+-- "queue_resume", "string"), exactly like active_nsid/active_username above:
+-- registering it would surface a raw serialized blob as a user-editable string in
+-- the Lua Options dialog, which is wrong for internal state. A global so it costs
+-- no main-chunk local. Persistence is gated on the queue actually pumping so the
+-- synchronous export path never churns the preference.
+__dtrmflickr_resume = require("dtrmflickr.queue_resume").new {
+  queue_jobs = require("dtrmflickr.queue_jobs"),
+  tracker = __dtrmflickr_jobs,
+  backend = require("dtrmflickr.queue_jobs").make_pref_backend(dt.preferences, PLUGIN, "queue_resume"),
+  is_pumping = function() return __dtrmflickr_queue:pumping() end,
+  log = function(msg) dt.print_log(msg) end,
 }
 
 function __dtrmflickr_call(method, fn, opts)
@@ -11709,6 +11862,11 @@ script_data.metadata = {
 }
 script_data.destroy_method = "hide"
 function script_data.destroy()
+  -- Capture any still-pending async work into the durable store before teardown
+  -- (issue #55). On a clean drain the on_event hook has already cleared the blob;
+  -- this only writes when live records remain, so a script reload / darktable
+  -- quit mid-pump leaves a resumable blob for the next start to classify.
+  if __dtrmflickr_resume then __dtrmflickr_resume.persist() end
   dt.destroy_storage(STORAGE)
   if dt.destroy_event then dt.destroy_event(PLUGIN .. "_selection_changed", "selection-changed") end
   if dt.gui.libs and dt.gui.libs[PANEL] then dt.gui.libs[PANEL].visible = false end
@@ -11768,7 +11926,9 @@ script_data.__test = {
   panel_content_type_index_from_search_value = panel_helpers.panel_content_type_index_from_search_value,
   flickr_queue = __dtrmflickr_queue,
   flickr_jobs = __dtrmflickr_jobs,
+  flickr_resume = __dtrmflickr_resume,
   queue_jobs = require("dtrmflickr.queue_jobs"),
+  queue_resume = require("dtrmflickr.queue_resume"),
   flickr_call = __dtrmflickr_call,
   format_queue_status = format_queue_status,
   privacy_values = settings.privacy_values,
@@ -11794,6 +11954,18 @@ end)
 
 account.refresh_status()
 refresh_panel(false, http.quiet_rest_available())
+
+-- darktable-start resume classification (issue #55). Load any persisted resume
+-- blob from a previous session and classify it against the currently active
+-- account with the idempotency-aware planner. This honors the account-binding
+-- contract by classification only: nothing is executed here (issue #57 owns
+-- running the `runnable` plan and prompting over `uncertain` records), and
+-- other-account / logged-out records are surfaced as `orphaned`, never run. The
+-- store is not mutated at start, so an other-account batch stays recoverable.
+if __dtrmflickr_resume then
+  __dtrmflickr_resume.load_plan(dt.preferences.read(PLUGIN, "active_nsid", "string"))
+end
+
 dt.print_log("[dtrmflickr] registered Flickr export storage (step 3); " .. TRANSPORT_MSG)
 
 return script_data
