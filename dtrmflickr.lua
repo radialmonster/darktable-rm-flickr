@@ -923,10 +923,7 @@ M.resolve_ticket = resolve_ticket
 --
 -- account: { token = "...", secret = "..." }
 -- opts: title, description, tags, is_public, is_friend, is_family,
---       safety_level, content_type, hidden, perm_comment, perm_addmeta
--- NOTE: the upload API's `hidden` is 1 = include in public search, 2 = hide.
--- This is the OPPOSITE of flickr.photos.setSafetyLevel's `hidden` (1 = hide,
--- 0 = visible). Pass 2 here to hide a freshly-uploaded photo from search.
+--       safety_level, content_type, perm_comment, perm_addmeta
 function M.upload_photo(api_key, api_secret, account, filename, opts)
   if not account or not account.token or not account.secret then
     return nil, "not logged in to Flickr"
@@ -945,7 +942,6 @@ function M.upload_photo(api_key, api_secret, account, filename, opts)
   add_if_present(params, "is_family", opts.is_family)
   add_if_present(params, "safety_level", opts.safety_level)
   add_if_present(params, "content_type", opts.content_type)
-  add_if_present(params, "hidden", opts.hidden)
   add_if_present(params, "perm_comment", opts.perm_comment)
   add_if_present(params, "perm_addmeta", opts.perm_addmeta)
 
@@ -1684,22 +1680,14 @@ function M.photos_set_perms(api_key, api_secret, account, photo_id, is_public, i
   return true
 end
 
--- Set a photo's safety level and/or its hide-from-public-search flag.
--- flickr.photos.setSafetyLevel accepts BOTH params; each is optional but at least
--- one must be present (Flickr error 2 otherwise). `hidden` uses this method's own
--- mapping: 1 = hide from public searches, 0 = include. We only ever send 1 (hide)
--- on a resend — see the replace path — so an unset/nil `hidden` leaves the photo's
--- current visibility untouched (the REST layer omits nil params).
-function M.photos_set_safety_level(api_key, api_secret, account, photo_id, safety_level, hidden)
+-- Set a photo's safety level via flickr.photos.setSafetyLevel.
+function M.photos_set_safety_level(api_key, api_secret, account, photo_id, safety_level)
   if not photo_id or photo_id == "" then return nil, "missing photo id" end
-  if (safety_level == nil or safety_level == "") and (hidden == nil or hidden == "") then
-    return nil, "missing safety level or hidden flag"
-  end
+  if safety_level == nil or safety_level == "" then return nil, "missing safety level" end
 
   local body, err = M.call(api_key, api_secret, account, "flickr.photos.setSafetyLevel", {
     photo_id = photo_id,
     safety_level = safety_level,
-    hidden = hidden,
   })
   if not body then return nil, err end
   return true
@@ -5263,7 +5251,7 @@ package.preload["dtrmflickr.batch_apply"] = function(...)
 --
 -- The panel's single-image "Save to Flickr" applies the settings comboboxes
 -- (privacy / safety level / content type / license / comment+add-meta
--- permissions / hide-from-search) to one focused published photo. When more
+-- permissions) to one focused published photo. When more
 -- than one published photo is selected, the same user-chosen values are applied
 -- to ALL of them. This module owns the pure, decidable parts of that batch flow
 -- so they stay offline-testable instead of bloating the main module's tight
@@ -5279,12 +5267,9 @@ local M = {}
 -- Stable display order, friendly names and reason keys for the batch-applyable
 -- settings fields. `dirty_key` is the panel_dirty flag the user's combobox edit
 -- sets; `sync_key` names the master_sync_fields() gate that can suppress the
--- push (nil = not gated: hide-from-search follows the upload model, not a sync.*
--- toggle — see design-notes "Hide-from-public-search"); `reason` is the
--- publish-state reason / settings fingerprint key the main module clears on a
--- successful push (matches state.lua's metadata_reasons + metadata.lua's
--- fingerprints_from_values keys). hidden has no publish-state reason (upload-only
--- model), so its reason is nil.
+-- push (nil = not gated); `reason` is the publish-state reason / settings
+-- fingerprint key the main module clears on a successful push (matches state.lua's
+-- metadata_reasons + metadata.lua's fingerprints_from_values keys).
 local FIELD_ORDER = {
   { dirty_key = "privacy",      friendly = "privacy",           sync_key = "privacy",      reason = "visibility" },
   { dirty_key = "safety",       friendly = "safety level",      sync_key = "safety",       reason = "safety" },
@@ -5292,7 +5277,6 @@ local FIELD_ORDER = {
   { dirty_key = "license",      friendly = "license",           sync_key = "license",      reason = "license" },
   { dirty_key = "comment_perm", friendly = "who can comment",   sync_key = "permissions",  reason = "permissions" },
   { dirty_key = "addmeta_perm", friendly = "who can add notes", sync_key = "permissions",  reason = "permissions" },
-  { dirty_key = "hidden",       friendly = "hide from search",  sync_key = nil,            reason = nil },
 }
 M.FIELD_ORDER = FIELD_ORDER
 
@@ -8400,7 +8384,8 @@ function M.build(deps)
     tooltip = _("when on, the next Flickr login asks Flickr for permission to delete photos (required for 'delete from Flickr'). Leave off for normal use; tick this, then click 'log in to Flickr' — no need to close preferences first"),
     value = dt.preferences.read(PLUGIN, "request_delete_perm", "bool") == true,
   }
-  -- check_button fires clicked_callback (not changed_callback); see hidden_widget.
+  -- check_button fires clicked_callback (changed_callback is invalid for the type
+  -- and aborts script load).
   delete_perm_check.clicked_callback = function(widget)
     dt.preferences.write(PLUGIN, "request_delete_perm", "bool", widget.value == true)
     dt.print_log(string.format("[dtrmflickr] request_delete_perm toggled -> %s", tostring(widget.value == true)))
@@ -9074,24 +9059,6 @@ local addmeta_perm_widget = dt.new_widget("combobox") {
   _("only you"), _("friends & family"), _("people you follow"), _("any Flickr member"),
 }
 
--- Hide-from-public-search is a boolean upload option (Flickr's `hidden`). Like
--- the comboboxes above, the export widget both controls it per export and saves
--- the choice as the sticky default. Off (the sane default) omits the param so
--- Flickr applies the account's own search-visibility setting; on sends hidden=1.
-local hidden_widget = dt.new_widget("check_button") {
-  label = _("hide from public site searches"),
-  tooltip = _("keep uploaded photos out of public Flickr searches (they stay reachable via direct link and your photostream)"),
-  value = dt.preferences.read(PLUGIN, "default_hide_from_search", "bool") == true,
-}
--- check_button fires clicked_callback (not changed_callback, which only exists
--- for slider/combobox/entry types); assigning changed_callback to a check_button
--- raises "field can't be written for type lua_check_button" and aborts the whole
--- script load. The signature/value access is identical.
-hidden_widget.clicked_callback = function(widget)
-  dt.preferences.write(PLUGIN, "default_hide_from_search", "bool", widget.value == true)
-  dt.print_log(string.format("[dtrmflickr] hide-from-search changed -> default_hide_from_search=%s",
-    tostring(widget.value == true)))
-end
 
 local function sync_check_button(name, label, tooltip)
   local widget = dt.new_widget("check_button") {
@@ -9485,7 +9452,6 @@ local storage_widget = dt.new_widget("box") {
   license_widget,
   comment_perm_widget,
   addmeta_perm_widget,
-  hidden_widget,
   dt.new_widget("label") { label = _("album") },
   album_mode_widget,
   dt.new_widget("label") { label = _("existing album") },
@@ -9643,25 +9609,6 @@ local panel_addmeta_perm_widget = dt.new_widget("combobox") {
   tooltip = _("who can add tags, notes, and people tags to the selected published photo"),
   _("only you"), _("friends & family"), _("people you follow"), _("any Flickr member"),
 }
--- Hide-from-public-search panel control (issue #71). Flickr exposes NO read API for
--- a photo's search-hidden state — verified live against the real account: flipping
--- it with setSafetyLevel hidden=1/0 leaves getInfo and getPerms byte-identical
--- (getInfo's <visibility> is ispublic/isfriend/isfamily only; getPerms is
--- comment/meta perms only). So the control CANNOT reflect the photo's current
--- state. It used to be a check_button that always loaded unchecked, which was a
--- trap: a single click on the (always-unchecked) box read as "hide" and an
--- intended un-hide silently hid the photo instead. It is now a TRI-STATE combobox
--- whose neutral default ("leave unchanged") does nothing, so only an explicit
--- hide/include choice ever touches the photo. Pushed via setSafetyLevel's `hidden`
--- param (1 = hide, 0 = include). Lives on panel_sets (table field, not a main-chunk
--- local) to stay under Lua's per-function local limit (see CLAUDE.md). Comboboxes
--- fire changed_callback (a check_button would need clicked_callback).
-panel_sets.hidden_widget = dt.new_widget("combobox") {
-  label = _("hide from search"),
-  tooltip = _("change a published photo's public-search visibility, then save.\nFlickr provides NO way to read the current state, so this starts at \"leave unchanged\" and only acts when you pick hide or include:\n  leave unchanged — do nothing\n  hide from public searches — exclude from Flickr search / search engines\n  include in public searches — make it findable again"),
-  selected = 1,
-  _("leave unchanged"), _("hide from public searches"), _("include in public searches"),
-}
 local panel_photo_id_entry = dt.new_widget("entry") {
   text = "",
   placeholder = _("Flickr photo ID or URL"),
@@ -9696,7 +9643,7 @@ panel_sets.url_label = dt.new_widget("label") { label = "" }
 local refresh_panel
 local panel_current = { image = nil, account = nil, photo_id = nil, selection_count = 0, remote_loaded = false }
 local panel_loading = false
-local panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false, hidden = false }
+local panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
 panel_privacy_widget.changed_callback = function()
   if not panel_loading then panel_dirty.privacy = true end
 end
@@ -9714,13 +9661,6 @@ panel_comment_perm_widget.changed_callback = function()
 end
 panel_addmeta_perm_widget.changed_callback = function()
   if not panel_loading then panel_dirty.addmeta_perm = true end
-end
--- Tri-state combobox (issue #71): index 1 = "leave unchanged" (neutral, no push),
--- 2 = hide, 3 = include. dirty is true only for an explicit hide/include choice, so
--- returning to "leave unchanged" clears it and an untouched panel never acts. Guard
--- with panel_loading so the programmatic resets don't mark dirty.
-panel_sets.hidden_widget.changed_callback = function()
-  if not panel_loading then panel_dirty.hidden = (panel_sets.hidden_widget.selected or 1) > 1 end
 end
 
 local function panel_is_visible()
@@ -9925,16 +9865,14 @@ local function panel_reset_remote(message)
   panel_license_widget.selected = 0
   panel_comment_perm_widget.selected = 0
   panel_addmeta_perm_widget.selected = 0
-  panel_sets.hidden_widget.selected = 1
   panel_loading = false
-  panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false, hidden = false }
+  panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
   panel_privacy_widget.sensitive = false
   panel_safety_widget.sensitive = false
   panel_content_type_widget.sensitive = false
   panel_license_widget.sensitive = false
   panel_comment_perm_widget.sensitive = false
   panel_addmeta_perm_widget.sensitive = false
-  panel_sets.hidden_widget.sensitive = false
   panel_current.remote_loaded = false
   -- The remote widgets no longer reflect any loaded photo, so drop the
   -- "already loaded" marker; the next selection must re-fetch.
@@ -10060,16 +9998,6 @@ end
 local function panel_safety_value()
   local selected = settings.safety_values[panel_safety_widget.selected or 1] or settings.safety_values[1]
   return selected.flickr_value
-end
-
--- Tri-state hide-from-search (issue #71): combobox 1 = leave unchanged, 2 = hide,
--- 3 = include. Returns the setSafetyLevel `hidden` arg ("1" hide / "0" include) or
--- nil to leave the photo's current search visibility untouched. Flickr exposes no
--- read API for this state (verified live), so the control is action-only — it never
--- starts on a real value and only acts on an explicit hide/include choice.
-local function panel_hidden_arg()
-  local sel = panel_sets.hidden_widget.selected or 1
-  if sel == 2 then return "1" elseif sel == 3 then return "0" else return nil end
 end
 
 local function panel_content_type_value()
@@ -10676,9 +10604,6 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
     visibility and panel_helpers.remote_attr(visibility, "isfriend"),
     visibility and panel_helpers.remote_attr(visibility, "isfamily")) or 0
   panel_safety_widget.selected = panel_helpers.panel_safety_index_from_remote(panel_helpers.remote_attr(body, "safety_level")) or 0
-  -- Flickr exposes no read for the search-hidden state, so the panel toggle always
-  -- starts unchecked on a fresh load (see its definition / issue #71).
-  panel_sets.hidden_widget.selected = 1
   panel_license_widget.selected = panel_helpers.panel_license_index_from_id(panel_helpers.remote_attr(body, "license")) or 0
   local remote_dateuploaded = panel_helpers.remote_attr(body, "dateuploaded")
   -- Persist Flickr's authoritative upload date/time (issue #21). This is the
@@ -10740,10 +10665,9 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
     or _("Flickr tags: none")
   if panel_reconcile.refresh then panel_reconcile.refresh(panel_current.image, remote_tags) end
   panel_loading = false
-  panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false, hidden = false }
+  panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
   panel_privacy_widget.sensitive = acc ~= nil
   panel_safety_widget.sensitive = acc ~= nil
-  panel_sets.hidden_widget.sensitive = acc ~= nil
   panel_content_type_widget.sensitive = acc ~= nil
   panel_license_widget.sensitive = acc ~= nil
   panel_comment_perm_widget.sensitive = acc ~= nil and not perms_unavailable
@@ -10818,30 +10742,18 @@ local function save_panel_settings()
     skipped[#skipped + 1] = "permissions"
   end
   local safety = panel_safety_value()
-  -- setSafetyLevel carries the safety level AND the hide-from-public-search flag
-  -- (issue #71). Fold both into one call, mirroring the resend path: safety is gated
-  -- by its sync master toggle, but hide-from-search is NOT a sync.* field (it follows
-  -- the upload model — see design-notes "Hide-from-public-search"), so it pushes
-  -- whenever the user picked an explicit hide/include in the tri-state combobox.
-  -- panel_hidden_arg() returns "1"/"0" for hide/include or nil for "leave unchanged",
-  -- so a neutral selection never alters the photo's current visibility.
+  -- setSafetyLevel pushes the safety level, gated by its sync master toggle.
   local push_safety = panel_dirty.safety and sync.safety
-  local hidden_arg = panel_hidden_arg()
-  local push_hidden = hidden_arg ~= nil
-  if push_safety or push_hidden then
-    local safety_arg = push_safety and safety or nil
+  if push_safety then
     local ok, err = __dtrmflickr_call("flickr.photos.setSafetyLevel", function()
-      return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety_arg, hidden_arg)
+      return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety)
     end)
     if not ok then
-      if push_safety then state.mark_reason(panel_current.image, acc.nsid, "safety") end
-      errors[#errors + 1] = "safety/visibility: " .. tostring(err)
+      state.mark_reason(panel_current.image, acc.nsid, "safety")
+      errors[#errors + 1] = "safety: " .. tostring(err)
     else
-      if push_safety then
-        state.clear_reason(panel_current.image, acc.nsid, "safety")
-        saved_fields[#saved_fields + 1] = "safety"
-      end
-      if push_hidden then saved_fields[#saved_fields + 1] = "hide_from_search" end
+      state.clear_reason(panel_current.image, acc.nsid, "safety")
+      saved_fields[#saved_fields + 1] = "safety"
     end
   elseif panel_dirty.safety then
     skipped[#skipped + 1] = "safety"
@@ -10905,7 +10817,7 @@ local function save_panel_settings()
 end
 
 -- Batch apply the panel's settings comboboxes (privacy / safety / content-type /
--- license / comment+add-meta permissions / hide-from-search) to every selected
+-- license / comment+add-meta permissions) to every selected
 -- published photo (issue #49). save_panel_settings handles selection_count == 1;
 -- this handles > 1 and is what the "save" button dispatches to in that case, so
 -- the verified single-image path stays byte-for-byte untouched.
@@ -10914,7 +10826,7 @@ end
 -- those still enabled by the Lua sync toggles (batch_apply.partition_fields);
 -- the chosen widget values are the same for every photo. Per-photo apply mirrors
 -- save_panel_settings exactly: setPerms folds privacy+permissions, setSafetyLevel
--- folds safety+hide-from-search, the same publish-state reasons are cleared on
+-- pushes the safety level, the same publish-state reasons are cleared on
 -- success / marked on failure, and the same settings fingerprints are stored so
 -- the photos read as current afterwards. Photos with no linked Flickr id are
 -- skipped (never touched). Reports a per-photo tally like push_selected_metadata.
@@ -10977,7 +10889,6 @@ function panel_sets.apply_settings_to_selection()
   local safety_val = panel_safety_value()
   local content_val = panel_content_type_value()
   local license_val = panel_license_value()
-  local hidden_val = panel_hidden_arg()
   local want_perm = want.comment_perm or want.addmeta_perm
 
   local applied, with_errors, unlinked = 0, 0, 0
@@ -11010,12 +10921,10 @@ function panel_sets.apply_settings_to_selection()
         end
       end
 
-      -- safety + hide-from-search fold into one setSafetyLevel call.
-      if want.safety or want.hidden then
+      -- safety level via setSafetyLevel.
+      if want.safety then
         local ok, err = __dtrmflickr_call("flickr.photos.setSafetyLevel", function()
-          return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id,
-            want.safety and safety_val or nil,
-            want.hidden and hidden_val or nil)
+          return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety_val)
         end)
         if ok then
           photo_ok = true
@@ -12732,7 +12641,6 @@ local panel_widget = dt.new_widget("box") {
   panel_sets.batch_indicator_label,
   panel_privacy_widget,
   panel_safety_widget,
-  panel_sets.hidden_widget,
   panel_content_type_widget,
   panel_license_widget,
   panel_comment_perm_widget,
@@ -12918,11 +12826,6 @@ local function current_permissions()
   }
 end
 
--- true when the export should hide uploads from public Flickr searches.
-local function current_hidden()
-  return hidden_widget.value == true
-end
-
 -- Resolve the album field(s) into a list of photoset targets for finalize.
 -- Both the "existing album" and "create new album" fields accept a
 -- comma-separated list, so a single export can land in several albums at once
@@ -12974,7 +12877,6 @@ local function initialize(storage, format, images, high_quality, extra_data)
   extra_data.content_type = current_content_type()
   extra_data.license = current_license()
   extra_data.permissions = current_permissions()
-  extra_data.hide_from_search = current_hidden()
   extra_data.sync = current_sync_fields()
   extra_data.post_errors = {}
   extra_data.keyword_conflicts = {}
@@ -13112,10 +13014,6 @@ local function store(storage, image, format, filename, number, total, high_quali
   local content_type = extra_data.content_type or current_content_type()
   local license = extra_data.license or current_license()
   local permissions = extra_data.permissions or current_permissions()
-  -- Boolean upload option, so `or` would mistake a captured `false` for "unset";
-  -- fall back to the live widget only when the key was never recorded.
-  local hide_from_search = extra_data.hide_from_search
-  if hide_from_search == nil then hide_from_search = current_hidden() end
   local sync = extra_data.sync or current_sync_fields()
   local tag_names = metadata.image_tag_names(image)
   local skip_filter, skip_tag = should_skip_upload_by_keyword(tag_names)
@@ -13230,13 +13128,6 @@ local function store(storage, image, format, filename, number, total, high_quali
         content_type = (sync.content_type or forced.content_type) and content_type.flickr_value or nil,
         perm_comment = sync.permissions and permissions.perm_comment or nil,
         perm_addmeta = sync.permissions and permissions.perm_addmeta or nil,
-        -- Upload-only option (no resend equivalent): omit unless the user opted in,
-        -- so Flickr keeps the account's default search visibility otherwise.
-        -- NOTE: the upload API encodes `hidden` OPPOSITE to flickr.photos.setSafetyLevel.
-        -- upload: 1 = keep in public search, 2 = hide from public search.
-        -- setSafetyLevel (replace/panel paths below): 1 = hide, 0 = visible.
-        -- So hiding on upload must send 2, not 1.
-        hidden = hide_from_search and 2 or nil,
         sleep_fn = pixel_sleep,
       })
     end, { max_attempts = 1 })
@@ -13331,22 +13222,13 @@ local function store(storage, image, format, filename, number, total, high_quali
             sync.permissions and permissions.perm_addmeta or nil)
         end)
       end
-      -- setSafetyLevel carries the safety level AND the hide-from-public-search
-      -- flag (issue #61). A fresh upload sends the upload API's hide value (2) only
-      -- when the user checked the hide-from-search box; a replace carries no
-      -- metadata, so re-assert that intent here through setSafetyLevel, whose hide
-      -- value is 1 (the two APIs encode it oppositely). hidden is sent ONLY when the box is
-      -- checked (hide_from_search) — matching fresh-upload semantics so a resend
-      -- never silently un-hides a photo whose box happens to be unchecked. The
-      -- call runs whenever safety is being synced OR a hide is requested, so the
-      -- hide can land even when the safety level itself is not being pushed.
+      -- A replace carries no metadata, so re-assert the safety level via
+      -- setSafetyLevel, gated by the same sync/forced flag a fresh upload uses.
       local want_safety = sync.safety or forced.safety
-      local hidden_param = hide_from_search and 1 or nil
-      if want_safety or hidden_param then
+      if want_safety then
         push_meta("flickr.photos.setSafetyLevel", { "safety" }, "safety", function()
           return rest.photos_set_safety_level(extra_data.api_key, extra_data.api_secret,
-            extra_data.account, photo_id,
-            want_safety and safety.flickr_value or nil, hidden_param)
+            extra_data.account, photo_id, safety.flickr_value)
         end)
       end
       if sync.content_type or forced.content_type then
@@ -13715,8 +13597,6 @@ script_data.__test = {
   current_safety = current_safety,
   current_content_type = current_content_type,
   current_license = current_license,
-  current_hidden = current_hidden,
-  panel_hidden_arg = panel_hidden_arg,
   image_tag_names = metadata.image_tag_names,
   apply_keyword_overrides = rules.apply_keyword_overrides,
   format_keyword_conflict = rules.format_keyword_conflict,
