@@ -5254,6 +5254,115 @@ end
 return M
 end
 
+package.preload["dtrmflickr.batch_apply"] = function(...)
+-- batch_apply.lua — pure planning/formatting helpers for the lighttable Flickr
+-- panel's multi-selection settings apply (issue #49).
+--
+-- The panel's single-image "Save to Flickr" applies the settings comboboxes
+-- (privacy / safety level / content type / license / comment+add-meta
+-- permissions / hide-from-search) to one focused published photo. When more
+-- than one published photo is selected, the same user-chosen values are applied
+-- to ALL of them. This module owns the pure, decidable parts of that batch flow
+-- so they stay offline-testable instead of bloating the main module's tight
+-- main-chunk local budget (Lua caps locals per function; see
+-- tests/test_lua_limits.lua): which user-changed fields will actually push vs be
+-- gated out by the Lua sync toggles, the two-click confirmation prompt text, the
+-- result summary, and the batch-mode indicator. The per-photo REST calls,
+-- reason/fingerprint bookkeeping and widget reads stay in the main module, which
+-- mirrors the single-image path exactly.
+
+local M = {}
+
+-- Stable display order, friendly names and reason keys for the batch-applyable
+-- settings fields. `dirty_key` is the panel_dirty flag the user's combobox edit
+-- sets; `sync_key` names the master_sync_fields() gate that can suppress the
+-- push (nil = not gated: hide-from-search follows the upload model, not a sync.*
+-- toggle — see design-notes "Hide-from-public-search"); `reason` is the
+-- publish-state reason / settings fingerprint key the main module clears on a
+-- successful push (matches state.lua's metadata_reasons + metadata.lua's
+-- fingerprints_from_values keys). hidden has no publish-state reason (upload-only
+-- model), so its reason is nil.
+local FIELD_ORDER = {
+  { dirty_key = "privacy",      friendly = "privacy",           sync_key = "privacy",      reason = "visibility" },
+  { dirty_key = "safety",       friendly = "safety level",      sync_key = "safety",       reason = "safety" },
+  { dirty_key = "content_type", friendly = "content type",      sync_key = "content_type", reason = "content_type" },
+  { dirty_key = "license",      friendly = "license",           sync_key = "license",      reason = "license" },
+  { dirty_key = "comment_perm", friendly = "who can comment",   sync_key = "permissions",  reason = "permissions" },
+  { dirty_key = "addmeta_perm", friendly = "who can add notes", sync_key = "permissions",  reason = "permissions" },
+  { dirty_key = "hidden",       friendly = "hide from search",  sync_key = nil,            reason = nil },
+}
+M.FIELD_ORDER = FIELD_ORDER
+
+-- Partition the user-changed fields into those that WILL push (`apply`) and
+-- those gated out by a disabled Lua sync toggle (`skipped`). Each entry is the
+-- FIELD_ORDER row. A field the user did not touch (dirty false/nil) appears in
+-- neither list. Pure: `dirty` and `sync` are plain boolean tables.
+function M.partition_fields(dirty, sync)
+  dirty = dirty or {}
+  sync = sync or {}
+  local apply, skipped = {}, {}
+  for _, f in ipairs(FIELD_ORDER) do
+    if dirty[f.dirty_key] then
+      local gated = f.sync_key ~= nil and not sync[f.sync_key]
+      if gated then skipped[#skipped + 1] = f else apply[#apply + 1] = f end
+    end
+  end
+  return apply, skipped
+end
+
+-- Join the friendly names of a list of FIELD_ORDER entries for a message, e.g.
+-- "privacy, license". De-duplicates (comment_perm + addmeta_perm both read
+-- "who can comment"/"who can add notes" but are distinct, so no collapse needed;
+-- de-dupe only guards an accidental repeat).
+local function friendly_list(entries)
+  local names, seen = {}, {}
+  for _, e in ipairs(entries or {}) do
+    local n = e.friendly
+    if n and not seen[n] then
+      seen[n] = true
+      names[#names + 1] = n
+    end
+  end
+  return table.concat(names, ", ")
+end
+M.friendly_list = friendly_list
+
+-- Confirmation prompt shown the first time the user clicks Save on a
+-- multi-selection (two-click confirm — darktable Lua has no blocking modal).
+-- Returns nil when there is nothing to apply (the caller reports "no changes").
+-- `count` is the number of selected images.
+function M.confirm_text(apply_entries, count, translate)
+  local tr = type(translate) == "function" and translate or function(s) return s end
+  if not apply_entries or #apply_entries == 0 then return nil end
+  return string.format(
+    tr("Flickr: apply %s to %d selected photo(s)? Click Save again to confirm."),
+    friendly_list(apply_entries), tonumber(count) or 0)
+end
+
+-- One-line summary of a completed batch apply. `tally` is
+-- { applied=<# photos all-ok>, with_errors=<# photos with >=1 failed field>,
+--   unlinked=<# selected not published>, count=<# selected> }.
+function M.result_summary(tally, translate)
+  local tr = type(translate) == "function" and translate or function(s) return s end
+  tally = tally or {}
+  return string.format(
+    tr("Flickr: batch settings — %d updated, %d with errors, %d not linked (of %d selected)"),
+    tally.applied or 0, tally.with_errors or 0, tally.unlinked or 0, tally.count or 0)
+end
+
+-- Batch-mode indicator shown in the panel when >1 image is selected, so the
+-- user knows the comboboxes reflect the focused photo but Save targets all.
+-- Returns "" for a single (or empty) selection so the line blanks itself.
+function M.batch_indicator(count, translate)
+  local tr = type(translate) == "function" and translate or function(s) return s end
+  if (tonumber(count) or 0) <= 1 then return "" end
+  return string.format(
+    tr("%d photos selected — Save applies your setting changes to all of them"), tonumber(count))
+end
+
+return M
+end
+
 package.preload["dtrmflickr.settings"] = function(...)
 -- settings.lua — stable Flickr option tables and preference lookup helpers.
 
@@ -8036,6 +8145,7 @@ local remote_pull = require "dtrmflickr.remote_pull"  -- pull remote edits back 
 local panel_helpers = require "dtrmflickr.panel_helpers"  -- pure panel parse/index/label helpers (#46)
 local account_ui = require "dtrmflickr.account_ui"  -- account-login widget + session state (#47)
 local queue_panel = require "dtrmflickr.queue_panel"  -- pure live job-lifecycle grid formatter (#56)
+local batch_apply = require "dtrmflickr.batch_apply"  -- pure multi-select settings-apply planner/formatter (#49)
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -9004,6 +9114,12 @@ local panel_tags_label = dt.new_widget("label") { label = "" }
 -- from counts that come free with calls the panel already makes (getInfo comments,
 -- the content-type search widened to extras=views) — no extra request, no faves.
 local panel_stats_label = dt.new_widget("label") { label = "" }
+-- Multi-select batch-mode indicator (issue #49): when >1 image is selected the
+-- settings comboboxes reflect the focused photo, but "save" applies the user's
+-- changes to every selected published photo. This line tells the user that.
+-- Blank for a single (or empty) selection. Kept on panel_sets (not a new
+-- main-chunk local) to respect Lua's per-function local limit (see CLAUDE.md).
+panel_sets.batch_indicator_label = dt.new_widget("label") { label = "" }
 -- Tag reconciler (issue #3): side-by-side local-keyword vs Flickr-tag view plus
 -- explicit actions. All widgets/handlers/state live in this one table to keep the
 -- main chunk under Lua's per-function local limit (see CLAUDE.md).
@@ -9717,6 +9833,96 @@ function panel_sets.add()
   end
 end
 
+-- Batch add-to-album for a multi-selection (issue #49). panel_sets.add() files
+-- the one focused photo into the typed album(s); this files EVERY selected
+-- published photo into them. The "add existing album" button dispatches here when
+-- selection_count > 1, leaving the single-image add() untouched. Unlike the
+-- settings batch this needs no two-click confirm: addPhoto is purely additive and
+-- idempotent (Flickr error 3 "already in set" is treated as success), so it can
+-- never destroy data the way overwriting privacy/safety can. The album target(s)
+-- are resolved once (identical for every photo); photos with no linked Flickr id
+-- are skipped. Reports a per-photo tally; mirrors create_from_selection's style.
+function panel_sets.add_to_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection <= 1 then
+    panel_sets.add()
+    return
+  end
+  local acc = panel_current.account or load_token()
+  if not acc then
+    dt.print(_("Flickr: log in before editing albums."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+  if not album_cache_matches(acc) then clear_album_cache() end
+  if #album_cache == 0 then panel_sets.refresh_list() end
+  panel_sets.search()
+  local value = panel_sets.input_value()
+  if value == "" then
+    dt.print(_("Flickr: type an album name or ID first."))
+    return
+  end
+
+  -- Resolve the requested album(s) once; the resolution is the same for every
+  -- selected photo. Bail before touching Flickr if any part is ambiguous/unknown.
+  local targets, unresolved = {}, {}
+  for part in value:gmatch("[^,]+") do
+    local item, kind = panel_sets.resolve(part)
+    if item and item.id and item.id ~= "" then
+      targets[#targets + 1] = item
+    else
+      unresolved[#unresolved + 1] = string.format("%s: %s", trim(part),
+        kind == "ambiguous" and "too many matches; type more or choose from matching albums"
+        or "no matching album; refresh albums or check the name")
+    end
+  end
+  if #unresolved > 0 then
+    panel_sets.status_label.label = _("choose a matching album")
+    dt.print(_("Flickr: choose a matching album: ") .. table.concat(unresolved, "; "))
+    return
+  end
+  if #targets == 0 then
+    dt.print(_("Flickr: type an album name or ID first."))
+    return
+  end
+
+  local added_photos, unlinked, errors = 0, 0, {}
+  for _, image in ipairs(selection) do
+    local photo_id = state.get_photo_id(image, acc.nsid)
+    if not photo_id then
+      unlinked = unlinked + 1
+    else
+      local photo_added = false
+      for _, item in ipairs(targets) do
+        local ok, err = __dtrmflickr_call("flickr.photosets.addPhoto", function()
+          return rest.photosets_add_photo(api_key, api_secret, acc, item.id, photo_id)
+        end)
+        if ok or photoset_add_is_already_present(err) then
+          state.add_set(image, acc.nsid, item.id)
+          photo_added = true
+        else
+          errors[#errors + 1] = string.format("%s/%s: %s",
+            tostring(photo_id), tostring(item.title or item.id), tostring(err))
+        end
+      end
+      if photo_added then added_photos = added_photos + 1 end
+    end
+  end
+
+  refresh_panel(true, false)
+  panel_sets.status_label.label = string.format(
+    _("Flickr: album add — %d photo(s) filed into %d album(s), %d not linked (of %d selected)"),
+    added_photos, #targets, unlinked, #selection)
+  dt.print(panel_sets.status_label.label)
+  if #errors > 0 then
+    dt.print(_("Flickr: album add errors: ") .. table.concat(errors, "; "))
+  end
+end
+
 function panel_sets.create()
   local image, acc, photo_id, api_key, api_secret = panel_sets.api_context(_("creating an album"))
   if not image then return end
@@ -10211,6 +10417,188 @@ local function save_panel_settings()
     panel_remote_label.label = _("Flickr: settings saved")
     dt.print(_("Flickr: settings saved."))
     load_remote_settings(api_key, api_secret, acc, photo_id)
+  end
+end
+
+-- Batch apply the panel's settings comboboxes (privacy / safety / content-type /
+-- license / comment+add-meta permissions / hide-from-search) to every selected
+-- published photo (issue #49). save_panel_settings handles selection_count == 1;
+-- this handles > 1 and is what the "save" button dispatches to in that case, so
+-- the verified single-image path stays byte-for-byte untouched.
+--
+-- Only the fields the user actually changed (panel_dirty) are applied, and only
+-- those still enabled by the Lua sync toggles (batch_apply.partition_fields);
+-- the chosen widget values are the same for every photo. Per-photo apply mirrors
+-- save_panel_settings exactly: setPerms folds privacy+permissions, setSafetyLevel
+-- folds safety+hide-from-search, the same publish-state reasons are cleared on
+-- success / marked on failure, and the same settings fingerprints are stored so
+-- the photos read as current afterwards. Photos with no linked Flickr id are
+-- skipped (never touched). Reports a per-photo tally like push_selected_metadata.
+--
+-- Confirmation is two-click (darktable Lua has no blocking modal dialog): the
+-- first save on a multi-selection shows exactly which fields will be overwritten
+-- on N photos and arms panel_sets.batch_save_armed; the second save performs it.
+-- Any selection change disarms it (refresh_panel).
+function panel_sets.apply_settings_to_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection <= 1 then
+    -- Not actually a multi-selection — fall back to the single-image path.
+    panel_sets.batch_save_armed = nil
+    save_panel_settings()
+    return
+  end
+  local acc = panel_current.account
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before saving Flickr settings."))
+    return
+  end
+  if not panel_current.remote_loaded then
+    dt.print(_("Flickr: remote settings are not loaded yet (select/refresh the focused photo first)."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+
+  local sync = master_sync_fields()
+  local apply_entries, skipped_entries = batch_apply.partition_fields(panel_dirty, sync)
+  if #apply_entries == 0 then
+    panel_sets.batch_save_armed = nil
+    if #skipped_entries > 0 then
+      dt.print(_("Flickr: every changed setting is disabled by the Lua sync options; nothing to apply."))
+    else
+      dt.print(_("Flickr: change a setting before saving to the selection."))
+    end
+    return
+  end
+
+  -- First click arms + previews; second click (still armed, same selection) runs.
+  if not panel_sets.batch_save_armed then
+    panel_sets.batch_save_armed = true
+    local msg = batch_apply.confirm_text(apply_entries, #selection, _)
+    panel_remote_label.label = msg
+    dt.print(msg)
+    return
+  end
+  panel_sets.batch_save_armed = nil
+
+  -- Snapshot the user-chosen values once; they are identical for every photo.
+  local want = {}
+  for _, e in ipairs(apply_entries) do want[e.dirty_key] = true end
+  local is_public, is_friend, is_family = panel_privacy_flags()
+  local comment_val = panel_comment_perm_value()
+  local addmeta_val = panel_addmeta_perm_value()
+  local safety_val = panel_safety_value()
+  local content_val = panel_content_type_value()
+  local license_val = panel_license_value()
+  local hidden_val = panel_sets.hidden_widget.value == true and "1" or "0"
+  local want_perm = want.comment_perm or want.addmeta_perm
+
+  local applied, with_errors, unlinked = 0, 0, 0
+  local fail_notes = {}
+
+  for _, image in ipairs(selection) do
+    local photo_id = state.get_photo_id(image, acc.nsid)
+    if not photo_id then
+      unlinked = unlinked + 1
+    else
+      local photo_ok, photo_failed = false, false
+      local saved_fields = {}
+
+      -- privacy + permissions fold into one setPerms call (mirrors single path).
+      if want.privacy or want_perm then
+        local ok, err = __dtrmflickr_call("flickr.photos.setPerms", function()
+          return rest.photos_set_perms(api_key, api_secret, acc, photo_id, is_public, is_friend, is_family,
+            want.comment_perm and comment_val or nil,
+            want.addmeta_perm and addmeta_val or nil)
+        end)
+        if ok then
+          photo_ok = true
+          if want.privacy then state.clear_reason(image, acc.nsid, "visibility"); saved_fields[#saved_fields + 1] = "visibility" end
+          if want_perm then state.clear_reason(image, acc.nsid, "permissions"); saved_fields[#saved_fields + 1] = "permissions" end
+        else
+          photo_failed = true
+          if want.privacy then state.mark_reason(image, acc.nsid, "visibility") end
+          if want_perm then state.mark_reason(image, acc.nsid, "permissions") end
+          fail_notes[#fail_notes + 1] = string.format("%s/privacy: %s", tostring(photo_id), tostring(err))
+        end
+      end
+
+      -- safety + hide-from-search fold into one setSafetyLevel call.
+      if want.safety or want.hidden then
+        local ok, err = __dtrmflickr_call("flickr.photos.setSafetyLevel", function()
+          return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id,
+            want.safety and safety_val or nil,
+            want.hidden and hidden_val or nil)
+        end)
+        if ok then
+          photo_ok = true
+          if want.safety then state.clear_reason(image, acc.nsid, "safety"); saved_fields[#saved_fields + 1] = "safety" end
+        else
+          photo_failed = true
+          if want.safety then state.mark_reason(image, acc.nsid, "safety") end
+          fail_notes[#fail_notes + 1] = string.format("%s/safety: %s", tostring(photo_id), tostring(err))
+        end
+      end
+
+      if want.content_type then
+        if content_val then
+          local ok, err = __dtrmflickr_call("flickr.photos.setContentType", function()
+            return rest.photos_set_content_type(api_key, api_secret, acc, photo_id, content_val)
+          end)
+          if ok then
+            photo_ok = true
+            state.clear_reason(image, acc.nsid, "content_type"); saved_fields[#saved_fields + 1] = "content_type"
+          else
+            photo_failed = true
+            state.mark_reason(image, acc.nsid, "content_type")
+            fail_notes[#fail_notes + 1] = string.format("%s/content type: %s", tostring(photo_id), tostring(err))
+          end
+        else
+          photo_failed = true
+          fail_notes[#fail_notes + 1] = string.format("%s/content type: choose a value first", tostring(photo_id))
+        end
+      end
+
+      if want.license then
+        local ok, err = __dtrmflickr_call("flickr.photos.licenses.setLicense", function()
+          return rest.photos_licenses_set_license(api_key, api_secret, acc, photo_id, license_val)
+        end)
+        if ok then
+          photo_ok = true
+          state.clear_reason(image, acc.nsid, "license"); saved_fields[#saved_fields + 1] = "license"
+        else
+          photo_failed = true
+          state.mark_reason(image, acc.nsid, "license")
+          fail_notes[#fail_notes + 1] = string.format("%s/license: %s", tostring(photo_id), tostring(err))
+        end
+      end
+
+      if photo_ok then
+        -- Record the just-pushed settings as current so publish-state stops
+        -- flagging them (same bookkeeping as the single-image save).
+        state.set_metadata_published_at(image, acc.nsid)
+        store_metadata_fingerprints(image, acc.nsid,
+          effective_metadata_fingerprints(image, sync), saved_fields)
+      end
+      if photo_failed then with_errors = with_errors + 1
+      elseif photo_ok then applied = applied + 1 end
+    end
+  end
+
+  refresh_panel(true, false)
+  local summary = batch_apply.result_summary(
+    { applied = applied, with_errors = with_errors, unlinked = unlinked, count = #selection }, _)
+  panel_remote_label.label = summary
+  dt.print(summary)
+  if #skipped_entries > 0 then
+    dt.print(string.format(_("Flickr: skipped by Lua sync options: %s"),
+      batch_apply.friendly_list(skipped_entries)))
+  end
+  if #fail_notes > 0 then
+    dt.print(_("Flickr: batch settings errors: ") .. table.concat(fail_notes, "; "))
   end
 end
 
@@ -11375,6 +11763,12 @@ function refresh_panel(force, fetch_remote)
   if panel_sets.candidate_image and (#selection ~= 1 or panel_sets.candidate_image ~= image) then
     panel_sets.clear_candidates()
   end
+  -- The selection changed, so disarm any pending two-click batch-save confirm
+  -- (issue #49) and refresh the batch-mode indicator (blank for 0/1 selected).
+  panel_sets.batch_save_armed = nil
+  if panel_sets.batch_indicator_label then
+    panel_sets.batch_indicator_label.label = batch_apply.batch_indicator(#selection, _)
+  end
   panel_current = { image = image, account = nil, photo_id = nil, selection_count = #selection, remote_loaded = false }
   if not image then
     panel_sets.update_photo_link_buttons(selection, nil, nil)
@@ -11729,7 +12123,16 @@ local panel_widget = dt.new_widget("box") {
     },
     dt.new_widget("button") {
       label = _("add existing album"),
-      clicked_callback = function() panel_sets.add() end,
+      tooltip = _("add the typed album(s) to the published photo; with more than one image selected, files every selected published photo into them (idempotent)"),
+      clicked_callback = function()
+        -- Dispatch by selection size (issue #49): one image keeps the single
+        -- add() path; >1 files the whole selection into the album(s).
+        if (panel_current.selection_count or 0) > 1 then
+          panel_sets.add_to_selection()
+        else
+          panel_sets.add()
+        end
+      end,
     },
   },
   panel_sets.match_widget,
@@ -11816,6 +12219,7 @@ local panel_widget = dt.new_widget("box") {
   panel_remote_label,
   panel_tags_label,
   panel_stats_label,
+  panel_sets.batch_indicator_label,
   panel_privacy_widget,
   panel_safety_widget,
   panel_sets.hidden_widget,
@@ -11825,7 +12229,17 @@ local panel_widget = dt.new_widget("box") {
   panel_addmeta_perm_widget,
   dt.new_widget("button") {
     label = _("save"),
-    clicked_callback = function() save_panel_settings() end,
+    tooltip = _("apply the settings comboboxes to the published photo; with more than one image selected, save applies your changes to every selected published photo (two-click confirm)"),
+    clicked_callback = function()
+      -- Dispatch by selection size (issue #49): one image keeps the verified
+      -- single-image path untouched; >1 routes to the batch applier with
+      -- two-click confirmation.
+      if (panel_current.selection_count or 0) > 1 then
+        panel_sets.apply_settings_to_selection()
+      else
+        save_panel_settings()
+      end
+    end,
   },
   dt.new_widget("button") {
     label = _("sync title/description"),
