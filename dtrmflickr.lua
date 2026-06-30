@@ -4449,22 +4449,48 @@ function M.new(opts)
 
   local self = { queue_jobs = qj, tracker = tracker, backend = backend }
 
-  -- The current live (non-terminal) record set the tracker is holding. This is
-  -- exactly the set a restart would need to resume; `save_records` filters it
-  -- again through `to_resumable`, so a record that went terminal between the
-  -- snapshot and the write is still never persisted.
+  -- The "parked" set: records the durable store must keep persisted even though
+  -- they are NOT in the active session's tracker — the resume executor's keep-set
+  -- (issue #57): `uncertain` records awaiting a user decision and `orphaned`
+  -- records owned by another (logged-out) account. Without this, the async pump's
+  -- own `on_event` persistence (which writes only the tracker's live set) would
+  -- clobber them — and a clean drain would clear the blob entirely, losing the
+  -- parked work. `persist`/`on_event` therefore always union the tracker's live
+  -- set with this parked set. Empty until `resume` populates it.
+  local parked = {}
+
+  -- The current live (non-terminal) record set the tracker is holding, unioned
+  -- with the sticky parked set. This is exactly the set a restart would need to
+  -- resume; `save_records` filters it again through `to_resumable`, so a record
+  -- that went terminal between the snapshot and the write is still never
+  -- persisted. The parked records are non-terminal by construction.
   local function live_records()
-    if type(tracker.active) == "function" then return tracker:active() end
-    return {}
+    local out = {}
+    if type(tracker.active) == "function" then
+      for _, rec in ipairs(tracker:active()) do out[#out + 1] = rec end
+    end
+    for _, rec in ipairs(parked) do out[#out + 1] = rec end
+    return out
   end
 
-  -- Persist the current resumable set. Returns the blob written (for tests/logs).
+  -- Replace the parked keep-set (issue #57's resume executor owns this). Defensive
+  -- copy so the caller's table cannot mutate the store's state afterward.
+  function self.set_parked(records)
+    parked = {}
+    for _, rec in ipairs(records or {}) do parked[#parked + 1] = rec end
+  end
+
+  -- Persist the current resumable set (tracker-live ∪ parked). Returns the blob
+  -- written (for tests/logs).
   function self.persist()
     return qj.save_records(backend, live_records())
   end
 
-  -- Drop the persisted blob (clean drain / logout / post-resume).
+  -- Drop the persisted blob (clean drain / logout / post-resume). Also drops the
+  -- parked keep-set: a clean drain only fires when nothing live remains, and an
+  -- explicit logout must not leave another account's orphaned work persisted.
   function self.clear()
+    parked = {}
     qj.clear_records(backend)
   end
 
@@ -4513,6 +4539,110 @@ function M.new(opts)
         #records, #runnable, #uncertain, #orphaned, #finished))
     end
     return plan
+  end
+
+  -- Resume-and-rerun execution (issue #57). Consume the start-up plan produced by
+  -- `load_plan` and actually re-enqueue the `runnable` records on the async queue,
+  -- then rewrite the persisted blob so the consumed resume set is drained. This is
+  -- the one piece #55 deliberately left out: load_plan only classifies.
+  --
+  -- The thin persisted record (method/nsid/attempts/image/label) cannot by itself
+  -- rebuild the work closure — only the producer that enqueued the async job knows
+  -- how to reconstruct it — so reconstruction is INJECTED via `opts.rebuild`, the
+  -- same dependency-injection discipline the rest of this module uses. `rebuild`
+  -- maps one record to a job descriptor `{ method, fn, opts }` (or nil when it has
+  -- no handler for that record's method — e.g. a method whose async producer is
+  -- not wired yet). A rebuilt job is handed to `opts.submit` (the live
+  -- `Queue:submit_async` wrapper) and, if `opts.bind_account` is given and the
+  -- submit returns a job with an id, bound to its owning nsid so the resumed job
+  -- re-persists under the right account as the pump drains it.
+  --
+  -- Safety contract (no duplicate photo/album on resume):
+  --   * Only `plan.runnable` is auto-run. `plan_resume_safe` already excluded every
+  --     terminal job (finished) and every non-idempotent job that may already have
+  --     reached Flickr (uncertain) — so a record in `runnable` is provably safe to
+  --     replay (idempotent, or a non-idempotent upload still `queued` that never
+  --     started). The executor trusts that classification and never re-runs
+  --     uncertain/finished/orphaned.
+  --   * `uncertain` stays parked for a user decision (surfaced in the panel via the
+  --     stashed plan); `orphaned` stays recoverable for when that account logs back
+  --     in. Both are written back into the blob so a record we did NOT consume is
+  --     never lost by the rewrite.
+  --
+  -- Blob rewrite (the "clear_records once the resume set is drained" requirement):
+  --   keep = orphaned ++ uncertain ++ runnable-we-could-not-rebuild. `finished` and
+  --   successfully re-enqueued `runnable` are dropped from the blob — the live queue
+  --   now owns the re-enqueued jobs and re-persists them through `on_event` while it
+  --   pumps. An unreconstructable runnable record is kept (never silently dropped):
+  --   its producer can rebuild it in a later session.
+  --
+  -- opts:
+  --   rebuild(record)       -> { method, fn, opts } | nil   (required)
+  --   submit(method,fn,opts)-> job | nil                    (required; submit_async)
+  --   bind_account(id,nsid) -> nil                          (optional)
+  --   plan                  -> override self.plan           (optional; tests)
+  -- Returns a summary: { enqueued, skipped, uncertain, orphaned, finished }.
+  function self.resume(opts)
+    opts = opts or {}
+    local rebuild = assert(opts.rebuild, "queue_resume.resume requires a rebuild(record) function")
+    local submit = assert(opts.submit, "queue_resume.resume requires a submit(method,fn,opts) function")
+    local bind_account = opts.bind_account
+    local plan = opts.plan or self.plan
+    if type(plan) ~= "table" then
+      return { enqueued = 0, skipped = 0, uncertain = 0, orphaned = 0, finished = 0 }
+    end
+
+    local runnable = plan.runnable or {}
+    local uncertain = plan.uncertain or {}
+    local orphaned = plan.orphaned or {}
+    local finished = plan.finished or {}
+
+    -- Records we did NOT consume must survive the rewrite. Start with the two sets
+    -- the executor never runs, then add any runnable record we cannot rebuild.
+    local keep = {}
+    for _, rec in ipairs(orphaned) do keep[#keep + 1] = rec end
+    for _, rec in ipairs(uncertain) do keep[#keep + 1] = rec end
+
+    local enqueued, skipped = 0, 0
+    for _, rec in ipairs(runnable) do
+      local spec = rebuild(rec)
+      if type(spec) == "table" and type(spec.fn) == "function" then
+        local job = submit(spec.method or rec.method, spec.fn, spec.opts)
+        enqueued = enqueued + 1
+        if bind_account and job and job.id ~= nil and rec.nsid ~= nil then
+          bind_account(job.id, rec.nsid)
+        end
+      else
+        -- No handler for this record's method (its async producer is not wired
+        -- yet). Keep it persisted rather than dropping the user's pending work.
+        skipped = skipped + 1
+        keep[#keep + 1] = rec
+      end
+    end
+
+    -- Make the keep-set sticky and rewrite the blob to (tracker-live ∪ keep).
+    -- Stickiness is essential: the re-enqueued runnable jobs are now draining on
+    -- the async pump, whose own `on_event` persistence writes only the tracker's
+    -- live set — without parking the keep-set, the pump (and especially its
+    -- clean-drain clear) would clobber the orphaned/uncertain work. `persist`
+    -- unions the two; `save_records` re-filters through `to_resumable`, so
+    -- `finished` and the re-enqueued runnable jobs are dropped and only resumable
+    -- records survive.
+    self.set_parked(keep)
+    self.persist()
+
+    if #runnable > 0 or #finished > 0 then
+      log(string.format(
+        "[dtrmflickr] resume execute: %d re-enqueued, %d kept (no handler), %d uncertain parked, %d orphaned kept, %d finished dropped",
+        enqueued, skipped, #uncertain, #orphaned, #finished))
+    end
+
+    local summary = {
+      enqueued = enqueued, skipped = skipped,
+      uncertain = #uncertain, orphaned = #orphaned, finished = #finished,
+    }
+    self.last_resume = summary
+    return summary
   end
 
   return self
@@ -12210,15 +12340,40 @@ end)
 account.refresh_status()
 refresh_panel(false, http.quiet_rest_available())
 
--- darktable-start resume classification (issue #55). Load any persisted resume
--- blob from a previous session and classify it against the currently active
--- account with the idempotency-aware planner. This honors the account-binding
--- contract by classification only: nothing is executed here (issue #57 owns
--- running the `runnable` plan and prompting over `uncertain` records), and
--- other-account / logged-out records are surfaced as `orphaned`, never run. The
--- store is not mutated at start, so an other-account batch stays recoverable.
+-- Resume-job reconstruction registry (issue #57). A persisted resume record is a
+-- thin descriptor (method/nsid/attempts/image/label) and cannot by itself rebuild
+-- the work closure — only the producer that enqueued the async job knows how. Each
+-- async producer registers a `method -> function(record) -> { method, fn, opts }`
+-- handler here; the resume executor calls the matching handler to reconstruct each
+-- runnable record before re-submitting it. A global table (not a main-chunk local)
+-- so it costs nothing against the per-function local limit and producers added by
+-- the #36 children can register into it from their own modules. Empty today: the
+-- export path is still synchronous (Queue:call), so no async producer persists a
+-- reconstructable record yet — the executor therefore keeps any unhandled runnable
+-- record persisted rather than dropping it.
+__dtrmflickr_resume_handlers = __dtrmflickr_resume_handlers or {}
+
+-- darktable-start resume classification + execution (issues #55 / #57). Load any
+-- persisted resume blob from a previous session and classify it against the
+-- currently active account with the idempotency-aware planner (#55), then run the
+-- `runnable` plan through the async queue and rewrite the blob to the keep-set
+-- (#57). The account-binding contract holds by construction: `load_plan` already
+-- routed other-account / logged-out records to `orphaned` (never run), and the
+-- executor re-runs only `runnable`, leaves `uncertain` parked for a user decision,
+-- and re-persists orphaned/uncertain so nothing we did not consume is lost.
 if __dtrmflickr_resume then
   __dtrmflickr_resume.load_plan(dt.preferences.read(PLUGIN, "active_nsid", "string"))
+  __dtrmflickr_resume.resume {
+    rebuild = function(rec)
+      local handler = __dtrmflickr_resume_handlers[rec and rec.method]
+      if type(handler) == "function" then return handler(rec) end
+      return nil
+    end,
+    submit = function(method, fn, job_opts)
+      return __dtrmflickr_queue:submit_async(method, fn, job_opts)
+    end,
+    bind_account = function(id, nsid) __dtrmflickr_jobs:bind_account(id, nsid) end,
+  }
   -- Surface any uncertain resume records in the panel grid right away (issue #56)
   -- so they are visible for a user decision at startup, not only after the next
   -- queue activity repaints the grid.
