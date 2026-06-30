@@ -4258,8 +4258,33 @@ end
 
 local HEADER = "dtrmflickr-jobs 1"
 local FS = "\31"          -- field separator (unit separator)
--- Fixed field order. Append-only for forward compatibility; never reorder.
-local FIELDS = { "nsid", "method", "state", "attempts", "image", "label", "error", "reason" }
+-- Fixed field order. Append-only for forward compatibility; never reorder. A blob
+-- written by an older build simply lacks the trailing columns, which read back as
+-- nil — so `sets` (#79) is safe to append: an older blob deserializes with no sets.
+local FIELDS = { "nsid", "method", "state", "attempts", "image", "label", "error", "reason", "sets" }
+-- A record field that is a LIST rather than a scalar gets a custom codec keyed
+-- here; everything else round-trips as a plain (escaped) string cell. `sets` is a
+-- list of Flickr photoset ids (numeric strings), joined with a comma — safe
+-- because ids never contain a comma; the whole cell is still %-escaped by `esc`.
+local SETS_SEP = ","
+local function encode_sets(sets)
+  if type(sets) ~= "table" or #sets == 0 then return "" end
+  local parts = {}
+  for _, s in ipairs(sets) do
+    local str = tostring(s)
+    if str ~= "" then parts[#parts + 1] = str end
+  end
+  return table.concat(parts, SETS_SEP)
+end
+local function decode_sets(cell)
+  if type(cell) ~= "string" or cell == "" then return nil end
+  local out = {}
+  for part in (cell .. SETS_SEP):gmatch("(.-)" .. SETS_SEP) do
+    if part ~= "" then out[#out + 1] = part end
+  end
+  if #out == 0 then return nil end
+  return out
+end
 
 local function esc(v)
   return (tostring(v == nil and "" or v)
@@ -4281,7 +4306,11 @@ function M.serialize(records)
     if type(rec) == "table" then
       local cells = {}
       for i, field in ipairs(FIELDS) do
-        cells[i] = esc(rec[field])
+        if field == "sets" then
+          cells[i] = esc(encode_sets(rec.sets))
+        else
+          cells[i] = esc(rec[field])
+        end
       end
       lines[#lines + 1] = table.concat(cells, FS)
     end
@@ -4311,6 +4340,8 @@ function M.deserialize(blob)
         for _, field in ipairs(FIELDS) do
           if field ~= "attempts" and rec[field] == "" then rec[field] = nil end
         end
+        -- Decode the `sets` list column from its comma-joined cell (nil when empty).
+        rec.sets = decode_sets(rec.sets)
         if rec.state == nil or M.STATES[rec.state] == nil then rec.state = "queued" end
       end
       if rec then out[#out + 1] = rec end
@@ -4517,6 +4548,17 @@ function M.new(opts)
     if type(rec) ~= "table" or rec.image == nil then return nil end
     pending[pending_key(rec.image, rec.nsid)] = rec
     return self.persist()
+  end
+
+  -- Read the currently-registered synchronous-export resume record for an
+  -- image+account, or nil if none. The producer uses this to MERGE late-known
+  -- state into an in-flight record (issue #79: a photoset id only known once
+  -- finalize creates it must be folded into each uploaded image's existing
+  -- record). Returns the live record table (not a copy) so the caller can mutate
+  -- it and re-`add_pending` to persist; a clone would lose nothing but the caller
+  -- always re-adds, so the live reference is fine and avoids a needless copy.
+  function self.pending_record(image_key, nsid)
+    return pending[pending_key(image_key, nsid)]
   end
 
   -- Drop a synchronous-export resume record once its image's post-upload remainder
@@ -4762,14 +4804,63 @@ function M.image_key(image)
   return id
 end
 
--- Build a resume record describing the post-upload metadata remainder for one
--- uploaded image. Pure. Returns nil when there is no usable image key (so a
--- caller can `if rec then add_pending(rec) end` unconditionally).
+-- Normalize a value into a clean list of distinct, non-empty photoset-id strings.
+-- Accepts nil, a single id, or a list; trims out empties and de-dupes (stable
+-- order). Used both to seed a record's intended-album set and to merge a freshly
+-- created photoset id into an existing record. Returns nil for an empty result so
+-- a record never carries an empty `sets` table (keeps a clean record minimal).
+function M.normalize_sets(...)
+  local out, seen = {}, {}
+  local function add_one(v)
+    if v == nil then return end
+    local s = tostring(v)
+    if s == "" or seen[s] then return end
+    seen[s] = true
+    out[#out + 1] = s
+  end
+  for _, arg in ipairs({ ... }) do
+    if type(arg) == "table" then
+      for _, v in ipairs(arg) do add_one(v) end
+    else
+      add_one(arg)
+    end
+  end
+  if #out == 0 then return nil end
+  return out
+end
+
+-- Collect the intended Flickr photoset id(s) from a resolved export-album spec
+-- (`extra_data.album`) that are known UP FRONT — i.e. EXISTING albums (kind
+-- "existing", including a "create" that matched an existing title). A pure
+-- `kind == "create"` target has no photoset id yet (it is created in finalize),
+-- so it is deliberately excluded: a never-created set must never be re-created
+-- from a resume record (no-duplicate-album contract — finalize keeps
+-- photosets.create at max_attempts=1 and resume never re-runs it). Returns nil
+-- when there are no known set ids (so build_record gets a minimal record).
+function M.existing_set_ids(album)
+  if type(album) ~= "table" then return nil end
+  local ids = {}
+  for _, target in ipairs(album.targets or {}) do
+    if type(target) == "table" and target.kind ~= "create"
+       and target.photoset_id ~= nil and tostring(target.photoset_id) ~= "" then
+      ids[#ids + 1] = target.photoset_id
+    end
+  end
+  return M.normalize_sets(ids)
+end
+
+-- Build a resume record describing the post-upload remainder for one uploaded
+-- image. Pure. Returns nil when there is no usable image key (so a caller can
+-- `if rec then add_pending(rec) end` unconditionally).
 --
 --   image_key : durable id string (from M.image_key)
 --   nsid      : owning account nsid (account-binding contract)
 --   label     : optional human label (filename) for the panel/log
-function M.build_record(image_key, nsid, label)
+--   sets      : optional intended Flickr photoset id(s) this image should belong
+--               to (issue #79) — a single id or a list. The reconstruction files
+--               the photo into each one not already a member, via idempotent
+--               addPhoto. Omitted/empty for a no-album export.
+function M.build_record(image_key, nsid, label, sets)
   if image_key == nil or image_key == "" then return nil end
   return {
     method = M.METHOD,
@@ -4780,6 +4871,7 @@ function M.build_record(image_key, nsid, label)
     -- routes the record to `runnable` (not `uncertain`) at restart.
     state = "queued",
     label = label,
+    sets = M.normalize_sets(sets),
   }
 end
 
@@ -4797,16 +4889,22 @@ end
 --   fingerprints(image, sync)        -> effective_metadata_fingerprints
 --   store_fingerprints(image, nsid, fingerprints, fields) -> persist helper
 --   keyword_tags(image)              -> rules.image_keyword_tags
+--   sets                             -> optional intended photoset id(s) (#79):
+--                                       file the photo into each one it is not yet
+--                                       a member of, via idempotent addPhoto
+--   already_in_set(err)              -> optional predicate: true when an addPhoto
+--                                       error means "already in set" (Flickr err 3),
+--                                       treated as success. Defaults to false.
 --   tr(s)                            -> optional translate hook (defaults identity)
 --
 -- Returns (status, detail):
---   "synced"   detail = number of fields pushed   (>=1 setter succeeded)
+--   "synced"   detail = number of fields/album-adds pushed (>=1 action succeeded)
 --   "clean"    detail = nil                        (nothing was pending — no-op)
 --   "unlinked" detail = nil                        (no Flickr photo id for account)
---   "error"    detail = error string              (a setter failed)
+--   "error"    detail = error string              (a setter/add failed)
 -- A truthy first return (any non-"error" status string) lets the queue treat the
 -- resumed job as success; "error" returns (nil, detail) to trigger normal retry of
--- the idempotent setters.
+-- the idempotent setters/adds.
 function M.resend_image(image, acc, deps)
   deps = deps or {}
   local call = deps.call
@@ -4823,16 +4921,33 @@ function M.resend_image(image, acc, deps)
     -- No linked photo for this account: nothing to resend (and never re-upload).
     return "unlinked"
   end
+  -- Album-membership remainder (issue #79): the intended set ids this image
+  -- should belong to but may not yet (a quit before/inside finalize's addPhoto
+  -- loop). Compute the still-pending adds up front so a record whose ONLY pending
+  -- work is an album add is not short-circuited as "clean" by the metadata plan.
+  local pending_sets = {}
+  if deps.sets ~= nil then
+    local member = {}
+    for _, sid in ipairs(state.get_sets(image, acc.nsid) or {}) do
+      member[tostring(sid)] = true
+    end
+    local wanted = M.normalize_sets(deps.sets) or {}
+    for _, sid in ipairs(wanted) do
+      if not member[sid] then pending_sets[#pending_sets + 1] = sid end
+    end
+  end
+
   local fingerprints = deps.fingerprints and deps.fingerprints(image, sync) or nil
   local _status, _pub, _pid, reasons = state.evaluate_publish_state(image, acc.nsid, {
     metadata_fingerprints = fingerprints,
   })
   local plan = meta.metadata_resend_plan(sync, reasons)
-  if not plan.any then
+  if not plan.any and #pending_sets == 0 then
     return "clean"
   end
 
   local pushed = 0
+  local meta_pushed = 0
   local function push(reason, method, fn)
     local ok, err = call(method, fn)
     if ok then
@@ -4841,6 +4956,7 @@ function M.resend_image(image, acc, deps)
         deps.store_fingerprints(image, acc.nsid, fingerprints, { reason })
       end
       pushed = pushed + 1
+      meta_pushed = meta_pushed + 1
       return true
     end
     state.mark_reason(image, acc.nsid, reason)
@@ -4877,8 +4993,31 @@ function M.resend_image(image, acc, deps)
     if not ok then return nil, err end
   end
 
-  if pushed > 0 then
+  -- File the photo into any still-pending intended albums (issue #79). addPhoto
+  -- is idempotent: replaying a member add converges, and Flickr error 3 ("already
+  -- in set") is treated as success — so a resume that races a partly-filed batch
+  -- never duplicates membership. A genuine add failure returns (nil, err) to
+  -- retry the whole idempotent job; the metadata reasons cleared above stay
+  -- cleared in state.lua, so the retry re-runs only what is still pending.
+  local already_in_set = deps.already_in_set or function() return false end
+  for _, set_id in ipairs(pending_sets) do
+    local ok, err = call("flickr.photosets.addPhoto", function()
+      return rest.photosets_add_photo(deps.api_key, deps.api_secret, acc, set_id, photo_id)
+    end)
+    if ok or already_in_set(err) then
+      state.add_set(image, acc.nsid, set_id)
+      pushed = pushed + 1
+    else
+      return nil, err
+    end
+  end
+
+  if meta_pushed > 0 then
+    -- Only stamp the metadata-published marker when a metadata setter actually
+    -- ran; an album-only resend (pushed > 0, meta_pushed == 0) leaves it untouched.
     state.set_metadata_published_at(image, acc.nsid)
+  end
+  if pushed > 0 then
     return "synced", pushed
   end
   return "clean"
@@ -4891,7 +5030,8 @@ end
 -- deps:
 --   resolve_image(image_key) -> image | nil   (find the darktable image by id)
 --   account()                -> acc   | nil   (the active account)
---   resend(image, acc)       -> status, detail (M.resend_image bound to live deps)
+--   resend(image, acc, sets) -> status, detail (M.resend_image bound to live deps);
+--                               `sets` is the record's intended-album id list (#79)
 --
 -- Returns a `{ method, fn, opts }` descriptor for Queue:submit_async, or nil when
 -- the image can no longer be resolved / there is no active account (the executor
@@ -4913,7 +5053,7 @@ function M.rebuild(rec, deps)
   if rec.nsid ~= nil and tostring(rec.nsid) ~= tostring(acc.nsid) then return nil end
   return {
     method = M.METHOD,
-    fn = function() return deps.resend(image, acc) end,
+    fn = function() return deps.resend(image, acc, rec.sets) end,
     opts = {},
   }
 end
@@ -12199,8 +12339,13 @@ local function store(storage, image, format, filename, number, total, high_quali
     if __dtrmflickr_resume and __dtrmflickr_resume.add_pending then
       pcall(function()
         local ur = require("dtrmflickr.upload_resume")
+        -- Seed the record with the EXISTING-album target id(s) (known up front),
+        -- so a quit during the store loop (before finalize files albums) still
+        -- leaves a record that re-files this already-uploaded photo into its
+        -- intended sets (issue #79). A pure "create" target has no id yet and is
+        -- folded in later by finalize once the photoset exists.
         local rec = ur.build_record(ur.image_key(image), extra_data.account.nsid,
-          image and image.filename or filename)
+          image and image.filename or filename, ur.existing_set_ids(extra_data.album))
         if rec then __dtrmflickr_resume.add_pending(rec) end
       end)
     end
@@ -12364,17 +12509,23 @@ local function store(storage, image, format, filename, number, total, high_quali
       state.set_published_at(image, extra_data.account.nsid, extra_data.publish_stamp)
       store_metadata_fingerprints(image, extra_data.account.nsid, upload_fingerprints)
     end
-    -- (#78) Metadata remainder confirmed for this image: a clean image drops its
-    -- resume record (so a clean batch leaves an empty resume blob), while a
-    -- post_failed image KEEPS its record so the failed idempotent setters replay at
-    -- the next startup. Guarded so it can never break the export.
-    if not post_failed and __dtrmflickr_resume and __dtrmflickr_resume.remove_pending then
+    -- (#78/#79) Metadata remainder confirmed for this image. Drop its resume
+    -- record ONLY when the metadata is clean AND this batch has no album targets:
+    -- album filing happens later in finalize, so when the export wants albums the
+    -- record must survive the store loop to carry the album remainder (finalize
+    -- removes it once the photo is filed). A post_failed image likewise KEEPS its
+    -- record so the failed idempotent setters replay at the next startup. Guarded
+    -- so it can never break the export.
+    local has_album_targets = extra_data.album and extra_data.album.targets
+      and #extra_data.album.targets > 0
+    if not post_failed and not has_album_targets
+       and __dtrmflickr_resume and __dtrmflickr_resume.remove_pending then
       pcall(function()
         local ur = require("dtrmflickr.upload_resume")
         __dtrmflickr_resume.remove_pending(ur.image_key(image), extra_data.account.nsid)
       end)
     end
-    extra_data.uploaded[#extra_data.uploaded + 1] = { image = image, filename = filename, photo_id = photo_id, attempts = image_attempts, replaced = is_replace }
+    extra_data.uploaded[#extra_data.uploaded + 1] = { image = image, filename = filename, photo_id = photo_id, attempts = image_attempts, replaced = is_replace, post_failed = post_failed }
     if is_replace then
       dt.print(string.format(_("Flickr: updated %s (photo %s) in place"), image.filename or "image", photo_id))
       dt.print_log(string.format("[dtrmflickr] store: replaced '%s' -> photo_id=%s", filename, photo_id))
@@ -12418,6 +12569,33 @@ local function finalize(storage, image_table, extra_data)
   -- add all uploads. A failure against one album does not abort the others.
   if uploaded > 0 then
     local first = extra_data.uploaded[1]
+    -- (#79) Every photoset id this batch resolves (existing up front, created
+    -- below). Used by the resume-record bookkeeping: fold each id into every
+    -- uploaded image's resume record BEFORE its addPhoto runs (so a quit inside
+    -- the loop resumes filing), and after the loop drop a record only once its
+    -- image is confirmed in every batch set (and its metadata is clean).
+    local batch_set_ids = {}
+    -- Fold a now-known photoset id into each uploaded image's pending resume
+    -- record so the album remainder is reconstructable across a restart. Guarded:
+    -- a resume-store hiccup must never break album filing.
+    local function fold_set_into_records(set_id)
+      if not (__dtrmflickr_resume and __dtrmflickr_resume.add_pending) then return end
+      pcall(function()
+        local ur = require("dtrmflickr.upload_resume")
+        for _, it in ipairs(extra_data.uploaded) do
+          local key = ur.image_key(it.image)
+          if key then
+            local rec = (__dtrmflickr_resume.pending_record
+              and __dtrmflickr_resume.pending_record(key, extra_data.account.nsid))
+              or ur.build_record(key, extra_data.account.nsid, it.image and it.image.filename or it.filename)
+            if rec then
+              rec.sets = ur.normalize_sets(rec.sets, set_id)
+              __dtrmflickr_resume.add_pending(rec)
+            end
+          end
+        end
+      end)
+    end
     for _ti, target in ipairs(album.targets or {}) do
       local photoset_id = target.photoset_id
       if target.kind == "create" then
@@ -12445,6 +12623,12 @@ local function finalize(storage, image_table, extra_data)
       end
 
       if photoset_id and photoset_id ~= "" then
+        -- (#79) Persist the album intent for every uploaded image BEFORE filing,
+        -- so a quit mid-loop leaves a record that re-files the not-yet-added
+        -- photos into this set on restart (addPhoto is idempotent, so an already-
+        -- filed photo just no-ops). Record the id for the post-loop cleanup.
+        batch_set_ids[#batch_set_ids + 1] = tostring(photoset_id)
+        fold_set_into_records(photoset_id)
         local start = target.kind == "create" and 2 or 1
         for i = start, uploaded do
           local item = extra_data.uploaded[i]
@@ -12462,6 +12646,33 @@ local function finalize(storage, image_table, extra_data)
           end
         end
       end
+    end
+
+    -- (#79) Album filing done: drop the resume record for every uploaded image
+    -- whose metadata is clean AND which is now confirmed in every batch set (so a
+    -- clean batch leaves an EMPTY blob, matching #78). An image that failed a
+    -- setter (post_failed) keeps its record for the metadata replay; an image not
+    -- in some batch set (a failed addPhoto, or a never-created album) keeps its
+    -- record so resume re-files the remainder. Guarded so it never breaks finalize.
+    if __dtrmflickr_resume and __dtrmflickr_resume.remove_pending then
+      pcall(function()
+        local ur = require("dtrmflickr.upload_resume")
+        for _, item in ipairs(extra_data.uploaded) do
+          if not item.post_failed then
+            local member = {}
+            for _, sid in ipairs(state.get_sets(item.image, extra_data.account.nsid) or {}) do
+              member[tostring(sid)] = true
+            end
+            local all_filed = true
+            for _, sid in ipairs(batch_set_ids) do
+              if not member[sid] then all_filed = false break end
+            end
+            if all_filed then
+              __dtrmflickr_resume.remove_pending(ur.image_key(item.image), extra_data.account.nsid)
+            end
+          end
+        end
+      end)
     end
   end
 
@@ -12668,7 +12879,7 @@ __dtrmflickr_resume_handlers[require("dtrmflickr.upload_resume").METHOD] = funct
       return nil
     end,
     account = function() return load_token() end,
-    resend = function(image, acc)
+    resend = function(image, acc, sets)
       local api_key, api_secret = get_credentials()
       if not api_key or not api_secret then
         return nil, "resume resend: missing API key/secret"
@@ -12682,6 +12893,11 @@ __dtrmflickr_resume_handlers[require("dtrmflickr.upload_resume").METHOD] = funct
         fingerprints = function(im, sy) return effective_metadata_fingerprints(im, sy) end,
         store_fingerprints = store_metadata_fingerprints,
         keyword_tags = function(im) return rules.image_keyword_tags(im) end,
+        -- (#79) Replay the pending album adds reconstructed from the record.
+        -- addPhoto is idempotent; treat Flickr error 3 ("already in set") as
+        -- success so a resume racing a partly-filed batch never duplicates.
+        sets = sets,
+        already_in_set = photoset_add_is_already_present,
         api_key = api_key,
         api_secret = api_secret,
         tr = _,
