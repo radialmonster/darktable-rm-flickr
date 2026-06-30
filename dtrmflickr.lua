@@ -9644,17 +9644,23 @@ local panel_addmeta_perm_widget = dt.new_widget("combobox") {
   _("only you"), _("friends & family"), _("people you follow"), _("any Flickr member"),
 }
 -- Hide-from-public-search panel control (issue #71). Flickr exposes NO read API for
--- a photo's search-hidden state (getInfo's <visibility> is ispublic/isfriend/isfamily
--- only; getPerms is comment/meta perms only), so this is a write-only toggle: it
--- starts unchecked on every selection and never reflects the photo's current remote
--- state. It is pushed via setSafetyLevel's `hidden` param ONLY when the user actually
--- toggles it (panel_dirty.hidden), so an untouched panel never un-hides a photo. Lives
--- on panel_sets (table field, not a main-chunk local) to stay under Lua's per-function
--- local limit (see CLAUDE.md). check_button fires clicked_callback, not changed_callback.
-panel_sets.hidden_widget = dt.new_widget("check_button") {
-  label = _("hide from public site searches"),
-  tooltip = _("check then save to hide the selected photo from public Flickr searches; uncheck then save to include it again. Flickr provides no way to read the current state, so this box always starts unchecked and only acts when you change it."),
-  value = false,
+-- a photo's search-hidden state — verified live against the real account: flipping
+-- it with setSafetyLevel hidden=1/0 leaves getInfo and getPerms byte-identical
+-- (getInfo's <visibility> is ispublic/isfriend/isfamily only; getPerms is
+-- comment/meta perms only). So the control CANNOT reflect the photo's current
+-- state. It used to be a check_button that always loaded unchecked, which was a
+-- trap: a single click on the (always-unchecked) box read as "hide" and an
+-- intended un-hide silently hid the photo instead. It is now a TRI-STATE combobox
+-- whose neutral default ("leave unchanged") does nothing, so only an explicit
+-- hide/include choice ever touches the photo. Pushed via setSafetyLevel's `hidden`
+-- param (1 = hide, 0 = include). Lives on panel_sets (table field, not a main-chunk
+-- local) to stay under Lua's per-function local limit (see CLAUDE.md). Comboboxes
+-- fire changed_callback (a check_button would need clicked_callback).
+panel_sets.hidden_widget = dt.new_widget("combobox") {
+  label = _("hide from search"),
+  tooltip = _("change a published photo's public-search visibility, then save.\nFlickr provides NO way to read the current state, so this starts at \"leave unchanged\" and only acts when you pick hide or include:\n  leave unchanged — do nothing\n  hide from public searches — exclude from Flickr search / search engines\n  include in public searches — make it findable again"),
+  selected = 1,
+  _("leave unchanged"), _("hide from public searches"), _("include in public searches"),
 }
 local panel_photo_id_entry = dt.new_widget("entry") {
   text = "",
@@ -9709,11 +9715,12 @@ end
 panel_addmeta_perm_widget.changed_callback = function()
   if not panel_loading then panel_dirty.addmeta_perm = true end
 end
--- check_button uses clicked_callback (changed_callback is invalid for this type and
--- aborts script load — see the export hidden_widget note). Guard with panel_loading
--- so the programmatic resets in panel_reset_remote/load_remote_settings don't mark dirty.
-panel_sets.hidden_widget.clicked_callback = function()
-  if not panel_loading then panel_dirty.hidden = true end
+-- Tri-state combobox (issue #71): index 1 = "leave unchanged" (neutral, no push),
+-- 2 = hide, 3 = include. dirty is true only for an explicit hide/include choice, so
+-- returning to "leave unchanged" clears it and an untouched panel never acts. Guard
+-- with panel_loading so the programmatic resets don't mark dirty.
+panel_sets.hidden_widget.changed_callback = function()
+  if not panel_loading then panel_dirty.hidden = (panel_sets.hidden_widget.selected or 1) > 1 end
 end
 
 local function panel_is_visible()
@@ -9918,7 +9925,7 @@ local function panel_reset_remote(message)
   panel_license_widget.selected = 0
   panel_comment_perm_widget.selected = 0
   panel_addmeta_perm_widget.selected = 0
-  panel_sets.hidden_widget.value = false
+  panel_sets.hidden_widget.selected = 1
   panel_loading = false
   panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false, hidden = false }
   panel_privacy_widget.sensitive = false
@@ -10053,6 +10060,16 @@ end
 local function panel_safety_value()
   local selected = settings.safety_values[panel_safety_widget.selected or 1] or settings.safety_values[1]
   return selected.flickr_value
+end
+
+-- Tri-state hide-from-search (issue #71): combobox 1 = leave unchanged, 2 = hide,
+-- 3 = include. Returns the setSafetyLevel `hidden` arg ("1" hide / "0" include) or
+-- nil to leave the photo's current search visibility untouched. Flickr exposes no
+-- read API for this state (verified live), so the control is action-only — it never
+-- starts on a real value and only acts on an explicit hide/include choice.
+local function panel_hidden_arg()
+  local sel = panel_sets.hidden_widget.selected or 1
+  if sel == 2 then return "1" elseif sel == 3 then return "0" else return nil end
 end
 
 local function panel_content_type_value()
@@ -10661,7 +10678,7 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   panel_safety_widget.selected = panel_helpers.panel_safety_index_from_remote(panel_helpers.remote_attr(body, "safety_level")) or 0
   -- Flickr exposes no read for the search-hidden state, so the panel toggle always
   -- starts unchecked on a fresh load (see its definition / issue #71).
-  panel_sets.hidden_widget.value = false
+  panel_sets.hidden_widget.selected = 1
   panel_license_widget.selected = panel_helpers.panel_license_index_from_id(panel_helpers.remote_attr(body, "license")) or 0
   local remote_dateuploaded = panel_helpers.remote_attr(body, "dateuploaded")
   -- Persist Flickr's authoritative upload date/time (issue #21). This is the
@@ -10805,14 +10822,14 @@ local function save_panel_settings()
   -- (issue #71). Fold both into one call, mirroring the resend path: safety is gated
   -- by its sync master toggle, but hide-from-search is NOT a sync.* field (it follows
   -- the upload model — see design-notes "Hide-from-public-search"), so it pushes
-  -- whenever the user toggled the box. We send the explicit value the user chose
-  -- (1 = hide, 0 = include) only when panel_dirty.hidden is set, so an untouched box
-  -- never alters the photo's current visibility.
+  -- whenever the user picked an explicit hide/include in the tri-state combobox.
+  -- panel_hidden_arg() returns "1"/"0" for hide/include or nil for "leave unchanged",
+  -- so a neutral selection never alters the photo's current visibility.
   local push_safety = panel_dirty.safety and sync.safety
-  local push_hidden = panel_dirty.hidden == true
+  local hidden_arg = panel_hidden_arg()
+  local push_hidden = hidden_arg ~= nil
   if push_safety or push_hidden then
     local safety_arg = push_safety and safety or nil
-    local hidden_arg = push_hidden and (panel_sets.hidden_widget.value == true and "1" or "0") or nil
     local ok, err = __dtrmflickr_call("flickr.photos.setSafetyLevel", function()
       return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety_arg, hidden_arg)
     end)
@@ -10960,7 +10977,7 @@ function panel_sets.apply_settings_to_selection()
   local safety_val = panel_safety_value()
   local content_val = panel_content_type_value()
   local license_val = panel_license_value()
-  local hidden_val = panel_sets.hidden_widget.value == true and "1" or "0"
+  local hidden_val = panel_hidden_arg()
   local want_perm = want.comment_perm or want.addmeta_perm
 
   local applied, with_errors, unlinked = 0, 0, 0
@@ -13699,6 +13716,7 @@ script_data.__test = {
   current_content_type = current_content_type,
   current_license = current_license,
   current_hidden = current_hidden,
+  panel_hidden_arg = panel_hidden_arg,
   image_tag_names = metadata.image_tag_names,
   apply_keyword_overrides = rules.apply_keyword_overrides,
   format_keyword_conflict = rules.format_keyword_conflict,
