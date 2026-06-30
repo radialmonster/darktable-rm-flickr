@@ -7496,19 +7496,48 @@ function M.search_views(body, photo_id)
   return nil
 end
 
--- format_stats(views, comments): a compact, panel-only stats line built from the
--- counts that come free with calls the panel already makes (no extra request;
--- faves have no free source so are never shown — issue #73). Returns nil when
--- nothing is available, so the caller can clear/hide the line. Pluralises and
--- joins with a middot, e.g. "42 views · 1 comment".
+-- favorites_count(body): the total fave count from a flickr.photos.getFavorites
+-- response, whose <photo> wrapper carries total="N" (the number of people who
+-- favourited the photo). Unlike views/comments there is no free source for this,
+-- so issue #9 spends one explicit getFavorites call to fill it in. Returns nil
+-- when absent/non-numeric. Pure/offline-testable.
+function M.favorites_count(body)
+  local tag = tostring(body or ""):match("<photo%s+[^>]*>")
+  if not tag then return nil end
+  local n = tag:match('total="(%d+)"') or tag:match("total='(%d+)'")
+  return tonumber(n)
+end
+
+-- format_upload_date(dateuploaded): turn Flickr's `dateuploaded` (a unix
+-- timestamp string) into a stable YYYY-MM-DD date for the panel stats line.
+-- UTC ("!") so the rendered date is deterministic regardless of the machine's
+-- timezone (and so offline tests are reproducible). Returns nil for a
+-- missing/garbage value. Pure/offline-testable.
+function M.format_upload_date(dateuploaded)
+  local ts = tonumber(dateuploaded)
+  if not ts then return nil end
+  local ok, s = pcall(os.date, "!%Y-%m-%d", ts)
+  if not ok or type(s) ~= "string" then return nil end
+  return s
+end
+
+-- format_stats(views, comments, faves, dateuploaded): a compact, panel-only stats
+-- line. views + comments come free with calls the panel already makes; faves comes
+-- from one explicit getFavorites and upload date from the getInfo body (issue #9,
+-- extending the free-only #73 line). Any subset may be nil/absent. Returns nil when
+-- nothing is available, so the caller can clear/hide the line. Pluralises and joins
+-- with a middot, e.g. "42 views · 3 faves · 1 comment · uploaded 2004-11-19".
 local function plural(n, one, many)
   return tostring(n) .. " " .. (n == 1 and one or many)
 end
 
-function M.format_stats(views, comments)
+function M.format_stats(views, comments, faves, dateuploaded)
   local parts = {}
   if type(views) == "number" then parts[#parts + 1] = plural(views, "view", "views") end
+  if type(faves) == "number" then parts[#parts + 1] = plural(faves, "fave", "faves") end
   if type(comments) == "number" then parts[#parts + 1] = plural(comments, "comment", "comments") end
+  local up = M.format_upload_date(dateuploaded)
+  if up then parts[#parts + 1] = "uploaded " .. up end
   if #parts == 0 then return nil end
   return table.concat(parts, " \u{00B7} ")
 end
@@ -10311,9 +10340,25 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   end
   local content_type_index, _ctv, _cte, remote_views = load_remote_content_type(api_key, api_secret, acc, photo_id, remote_dateuploaded)
   panel_content_type_widget.selected = content_type_index or 0
-  -- Panel-only Flickr stats (#73): views (from the search above) + comment count
-  -- (from the getInfo body). Display-only; both are free with calls we already make.
-  panel_stats_label.label = remote_pull.format_stats(remote_views, remote_pull.comment_count(body)) or ""
+  -- Faves count (issue #9): unlike views/comments there is no free source, so spend
+  -- one explicit flickr.photos.getFavorites per panel load. Display-only and
+  -- best-effort — a failure just omits the faves part. per_page=1 keeps the page
+  -- tiny; we only read the wrapper's total= attribute. Works public or authed.
+  local remote_faves
+  do
+    local fav_body = __dtrmflickr_call("flickr.photos.getFavorites", function()
+      if acc then
+        return rest.call(api_key, api_secret, acc, "flickr.photos.getFavorites", { photo_id = photo_id, per_page = 1 })
+      end
+      return rest.public_call(api_key, "flickr.photos.getFavorites", { photo_id = photo_id, per_page = 1 })
+    end, { coalesce_key = "panel-refresh-faves:" .. tostring(photo_id) })
+    if fav_body then remote_faves = remote_pull.favorites_count(fav_body) end
+  end
+  -- Panel-only Flickr stats: views (from the search above) + comment count (from the
+  -- getInfo body) — both free — plus faves (#9) and the upload date (#9, from the
+  -- getInfo dateuploaded). Display-only; never persisted.
+  panel_stats_label.label = remote_pull.format_stats(
+    remote_views, remote_pull.comment_count(body), remote_faves, remote_dateuploaded) or ""
   local perms_unavailable = false
   if acc then
     local perms_body, perms_err = __dtrmflickr_call("flickr.photos.getPerms", function()
