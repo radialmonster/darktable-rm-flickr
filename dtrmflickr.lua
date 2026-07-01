@@ -12511,7 +12511,7 @@ end
 local panel_tab_label = dt.new_widget("label") { label = _("section: meta") }
 
 local panel_tab_stack = dt.new_widget("stack") {
-  -- 1: meta — Flickr settings + title/description/keyword/GPS sync + people tags
+  -- 1: meta — Flickr settings (save settings) + title/description sync + GPS/date
   dt.new_widget("box") {
     orientation = "vertical",
     panel_remote_label,
@@ -12612,7 +12612,7 @@ local panel_tab_stack = dt.new_widget("stack") {
       clicked_callback = function() panel_sets.tag_people() end,
     },
   },
-  -- 4: albums — albums + groups/pools
+  -- 4: albums — album membership, cover/order, create
   dt.new_widget("box") {
     orientation = "vertical",
     panel_sets_label,
@@ -12686,6 +12686,10 @@ local panel_tab_stack = dt.new_widget("stack") {
       },
     },
     panel_sets.status_label,
+  },
+  -- 5: groups — Flickr groups / pools
+  dt.new_widget("box") {
+    orientation = "vertical",
     dt.new_widget("label") { label = _("groups / pools") },
     panel_pools.entry,
     dt.new_widget("box") {
@@ -12708,7 +12712,7 @@ local panel_tab_stack = dt.new_widget("stack") {
     panel_pools.match_widget,
     panel_pools.status_label,
   },
-  -- 5: link — the linked photo's URL, plus photo link / claim / batch claim
+  -- 6: link — the linked photo's URL, plus photo link / claim / batch claim
   dt.new_widget("box") {
     orientation = "vertical",
     panel_sets.url_label,
@@ -12742,7 +12746,7 @@ local panel_tab_stack = dt.new_widget("stack") {
       clicked_callback = function() panel_sets.batch_claim_from_list() end,
     },
   },
-  -- 6: publish — publish-state actions + destructive delete
+  -- 7: publish — publish-state actions + destructive delete
   dt.new_widget("box") {
     orientation = "vertical",
     dt.new_widget("box") {
@@ -12781,7 +12785,7 @@ local panel_tab_stack = dt.new_widget("stack") {
       clicked_callback = function() panel_sets.delete_selected() end,
     },
   },
-  -- 7: jobs — the live queue job-lifecycle grid (issue #56)
+  -- 8: jobs — the live queue job-lifecycle grid (issue #56)
   dt.new_widget("box") {
     orientation = "vertical",
     panel_sets.queue_label,
@@ -12821,26 +12825,31 @@ local panel_widget = dt.new_widget("box") {
     },
     dt.new_widget("button") {
       label = _("albums"),
-      tooltip = _("albums and groups/pools"),
+      tooltip = _("album membership, cover/order, create"),
       clicked_callback = function() panel_tab_stack.active = 4; panel_tab_label.label = _("section: albums") end,
     },
   },
   dt.new_widget("box") {
     orientation = "horizontal",
     dt.new_widget("button") {
+      label = _("groups"),
+      tooltip = _("Flickr groups / pools"),
+      clicked_callback = function() panel_tab_stack.active = 5; panel_tab_label.label = _("section: groups") end,
+    },
+    dt.new_widget("button") {
       label = _("link"),
       tooltip = _("the linked photo's URL + link/claim this image to an existing Flickr photo"),
-      clicked_callback = function() panel_tab_stack.active = 5; panel_tab_label.label = _("section: link") end,
+      clicked_callback = function() panel_tab_stack.active = 6; panel_tab_label.label = _("section: link") end,
     },
     dt.new_widget("button") {
       label = _("publish"),
       tooltip = _("publish-state actions, push metadata, delete"),
-      clicked_callback = function() panel_tab_stack.active = 6; panel_tab_label.label = _("section: publish") end,
+      clicked_callback = function() panel_tab_stack.active = 7; panel_tab_label.label = _("section: publish") end,
     },
     dt.new_widget("button") {
       label = _("jobs"),
       tooltip = _("live upload/queue job tracker"),
-      clicked_callback = function() panel_tab_stack.active = 7; panel_tab_label.label = _("section: jobs") end,
+      clicked_callback = function() panel_tab_stack.active = 8; panel_tab_label.label = _("section: jobs") end,
     },
   },
   panel_tab_label,
