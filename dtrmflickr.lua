@@ -12703,9 +12703,15 @@ local panel_tab_stack = dt.new_widget("stack") {
     panel_pools.match_widget,
     panel_pools.status_label,
   },
-  -- 4: link — photo link / claim / batch claim
+  -- 4: link — the linked photo's URL, plus photo link / claim / batch claim
   dt.new_widget("box") {
     orientation = "vertical",
+    panel_sets.url_label,
+    dt.new_widget("box") {
+      orientation = "horizontal",
+      panel_sets.open_url_button,
+      panel_sets.copy_url_button,
+    },
     dt.new_widget("label") { label = _("photo link") },
     panel_photo_id_entry,
     dt.new_widget("box") {
@@ -12791,12 +12797,6 @@ local panel_widget = dt.new_widget("box") {
   panel_file_label,
   panel_account_label,
   panel_photo_label,
-  panel_sets.url_label,
-  dt.new_widget("box") {
-    orientation = "horizontal",
-    panel_sets.open_url_button,
-    panel_sets.copy_url_button,
-  },
   panel_sets.publish_label,
   panel_sets.dashboard_label,
   -- Tab bar (issue #82): two rows of buttons switch panel_tab_stack. Two rows
