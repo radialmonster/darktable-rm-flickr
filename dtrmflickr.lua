@@ -5807,6 +5807,27 @@ function M.selection_links(entries, owner)
   return result
 end
 
+-- One-line linked-URL summary for the always-visible panel header (issue #86).
+-- Given a selection_links() result, return the text to show beside the rest of
+-- the header state so a Flickr user sees the linked page without switching to
+-- the "link" tab:
+--   0 published  -> "" (nothing linked yet; header stays quiet)
+--   1 published  -> the photo URL verbatim (click-to-open lives in the link tab)
+--   N published  -> a compact "N Flickr URLs (link tab)" count
+-- `translate` is an optional gettext-style wrapper (defaults to identity) so the
+-- formatting stays pure and offline-testable while the caller localizes.
+function M.header_url_summary(result, translate)
+  local tr = translate
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  local published = result and result.published or 0
+  if published <= 0 then return "" end
+  if published == 1 then
+    local link = result.links and result.links[1]
+    return (link and link.url) or ""
+  end
+  return string.format(tr("%d Flickr URLs (link tab)"), published)
+end
+
 -- Newline-joined URL text for a selection_links() result — the payload the panel
 -- copies to the clipboard and writes to the log (one URL per line, in order).
 -- Returns "" when there are no published links.
@@ -9519,6 +9540,13 @@ panel_sets.publish_label = dt.new_widget("label") { label = "" }
 -- refresh_publish_state_label (single image) and scan_selected_publish_state
 -- (whole selection) via panel_helpers.publish_dashboard.
 panel_sets.dashboard_label = dt.new_widget("label") { label = "" }
+-- Linked Flickr URL surfaced in the always-visible header (issue #86): the photo
+-- URL for a single published selection, or a compact count for a multi-select.
+-- Populated by refresh_url_actions via urls.header_url_summary; blank when the
+-- selection has nothing linked. The click-to-open/copy actions stay in the link
+-- tab (panel_sets.url_label); this is a read-only header echo so the linked page
+-- is visible regardless of the active tab.
+panel_sets.header_url_label = dt.new_widget("label") { label = "" }
 panel_sets.queue_label = dt.new_widget("label") { label = "" }
 panel_sets.queue_detail_label = dt.new_widget("label") { label = "" }
 -- Live job-lifecycle grid (issue #56). A FIXED pool of label widgets the panel
@@ -9946,6 +9974,12 @@ function panel_sets.refresh_url_actions(selection, owner, account_nsid)
     panel_sets.url_label.label = result.links[1].url
   else
     panel_sets.url_label.label = string.format(_("%d Flickr URLs ready (open/copy)"), result.published)
+  end
+  -- Echo the linked URL into the always-visible header (issue #86) so a Flickr
+  -- user sees the linked page without opening the link tab; the interactive
+  -- open/copy buttons still live there acting on the same url_links set.
+  if panel_sets.header_url_label then
+    panel_sets.header_url_label.label = u.header_url_summary(result, _)
   end
   local has = result.published > 0
   if panel_sets.open_url_button then panel_sets.open_url_button.sensitive = has end
@@ -12832,6 +12866,9 @@ local panel_widget = dt.new_widget("box") {
   panel_photo_label,
   panel_sets.publish_label,
   panel_sets.dashboard_label,
+  -- Linked Flickr URL (issue #86): the photo page for a single published image or
+  -- a count for a multi-select, so the linked page is visible on every tab.
+  panel_sets.header_url_label,
   -- Remote stats (views/faves/comments/upload date, #9) live in the always-visible
   -- header so a Flickr user sees them regardless of the active tab (#85, "lead
   -- with state"). Populated on remote load; blank until then.
