@@ -64,7 +64,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $env:PATH = "$PWD\build;$env:PATH"
           $env:LUA_CPATH = "$PWD\build\artifact\?.dll;$PWD\build\artifact\?\init.dll"
-          .\build\lua.exe -e "local h=require('dtrmflickr_winhttp'); local b,e=h.request('GET','https://example.com/'); assert(b,b or e); assert(b:find('Example Domain',1,true), 'unexpected response'); print('WinHTTP module OK')"
+          .\build\lua.exe -e "local h=require('dtrmflickr_winhttp'); local b,e=h.request('GET','https://example.com/'); assert(b,b or e); assert(b:find('Example Domain',1,true), 'unexpected response'); assert(type(h.shell_open)=='function', 'shell_open export missing'); assert(type(h.clipboard_set)=='function', 'clipboard_set export missing'); local ok=h.clipboard_set('dtrmflickr ci clipboard test'); assert(ok, 'clipboard_set failed'); print('WinHTTP module OK (request + shell_open + clipboard_set)')"
 
       - name: Upload DLL artifact
         uses: actions/upload-artifact@v4

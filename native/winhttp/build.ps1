@@ -27,5 +27,5 @@ if (!(Test-Path $source)) {
 }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-cl.exe /nologo /LD /O2 /MT /I"$LuaInclude" "$source" /link /OUT:"$out" "$LuaLib" winhttp.lib
+cl.exe /nologo /LD /O2 /MT /I"$LuaInclude" "$source" /link /OUT:"$out" "$LuaLib" winhttp.lib shell32.lib user32.lib
 Write-Host "Built $out"

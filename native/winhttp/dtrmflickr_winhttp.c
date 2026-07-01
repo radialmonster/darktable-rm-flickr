@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winhttp.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -163,11 +164,82 @@ static int l_request(lua_State *L)
   return 1;
 }
 
+/* Open a URL (or any shell target) in the default handler WITHOUT allocating a
+   console. darktable is a GUI process with no console, so shelling out through
+   `explorer "url"` / `cmd /c` (as `dt.control.execute` does) makes Windows
+   allocate a fresh console for the child that briefly flashes on screen (#83).
+   ShellExecuteW performs the same "open in default browser" action in-process,
+   with no console. Returns true on success, or nil + reason on failure so the
+   Lua caller can fall back to the shell-out path. */
+static int l_shell_open(lua_State *L)
+{
+  const char *target8 = luaL_checkstring(L, 1);
+  wchar_t *target = utf8_to_wide(L, target8);
+  /* ShellExecuteW returns a value > 32 on success; <= 32 is an error code. */
+  HINSTANCE rc = ShellExecuteW(NULL, L"open", target, NULL, NULL, SW_SHOWNORMAL);
+  if((INT_PTR)rc <= 32) {
+    lua_pushnil(L);
+    lua_pushfstring(L, "ShellExecute failed (%d)", (int)(INT_PTR)rc);
+    return 2;
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+/* Set the clipboard to a UTF-8 string via the Win32 clipboard API, again with
+   no console (unlike piping a temp file to `clip` through cmd.exe, #83).
+   Returns true on success, or nil + reason on failure for the caller's
+   fallback. On SetClipboardData success the system owns the global handle, so
+   it must NOT be freed; on any earlier failure we free it ourselves. */
+static int l_clipboard_set(lua_State *L)
+{
+  const char *text8 = luaL_checkstring(L, 1);
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, text8, -1, NULL, 0);
+  if(wlen <= 0) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "utf8 conversion failed");
+    return 2;
+  }
+  HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)wlen * sizeof(wchar_t));
+  if(!hmem) {
+    push_win_error(L, "GlobalAlloc");
+    return 2;
+  }
+  wchar_t *dst = (wchar_t *)GlobalLock(hmem);
+  if(!dst) {
+    GlobalFree(hmem);
+    push_win_error(L, "GlobalLock");
+    return 2;
+  }
+  MultiByteToWideChar(CP_UTF8, 0, text8, -1, dst, wlen);
+  GlobalUnlock(hmem);
+
+  if(!OpenClipboard(NULL)) {
+    GlobalFree(hmem);
+    push_win_error(L, "OpenClipboard");
+    return 2;
+  }
+  EmptyClipboard();
+  if(!SetClipboardData(CF_UNICODETEXT, hmem)) {
+    CloseClipboard();
+    GlobalFree(hmem); /* ownership not transferred on failure */
+    push_win_error(L, "SetClipboardData");
+    return 2;
+  }
+  CloseClipboard(); /* clipboard now owns hmem; do not free it */
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
 static int open_module(lua_State *L)
 {
   lua_newtable(L);
   lua_pushcfunction(L, l_request);
   lua_setfield(L, -2, "request");
+  lua_pushcfunction(L, l_shell_open);
+  lua_setfield(L, -2, "shell_open");
+  lua_pushcfunction(L, l_clipboard_set);
+  lua_setfield(L, -2, "clipboard_set");
   return 1;
 }
 

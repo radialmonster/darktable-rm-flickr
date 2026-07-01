@@ -596,6 +596,39 @@ local function multipart_native()
   return nil
 end
 
+-- Like multipart_native() but does NOT require a request() field, so callers can
+-- probe for other DLL exports (shell_open / clipboard_set — #83). Honors the
+-- test override so the Windows-only branch is exercisable on any OS.
+local function native_helper()
+  if native_http_override then return native_http_override end
+  if is_windows() and native_http_ok and native_http then return native_http end
+  return nil
+end
+
+-- Open a URL in the default browser via the in-process WinHTTP DLL's
+-- ShellExecute wrapper — no console window, unlike an `explorer`/`cmd` shell-out
+-- (#83, mirrors the #77 upload fix). Returns true on success, or false + reason
+-- when the DLL (or the shell_open export) is unavailable / the call failed, so
+-- the caller can fall back to the dt.control.execute shell-out.
+function M.shell_open(url)
+  local nh = native_helper()
+  if not (nh and nh.shell_open) then return false, "native shell_open unavailable" end
+  local ok, err = nh.shell_open(url)
+  if ok then return true end
+  return false, err or "shell_open failed"
+end
+
+-- Set the OS clipboard to `text` via the DLL's Win32 clipboard wrapper — no
+-- console window, unlike piping a temp file to `clip` through cmd.exe (#83).
+-- Returns true on success, or false + reason for the caller's fallback.
+function M.clipboard_set(text)
+  local nh = native_helper()
+  if not (nh and nh.clipboard_set) then return false, "native clipboard_set unavailable" end
+  local ok, err = nh.clipboard_set(text)
+  if ok then return true end
+  return false, err or "clipboard_set failed"
+end
+
 -- POST multipart/form-data.
 --   fields: table of string form fields.
 --   file_field/file_path: uploaded file field, e.g. photo=@C:\path\out.jpg.
@@ -8896,6 +8929,10 @@ end
 ----------------------------------------------------------------------
 local function open_url(url)
   local osn = dt.configuration.running_os
+  -- On Windows, prefer the in-process ShellExecute helper in the WinHTTP DLL so
+  -- no console window flashes (#83). Only the degraded fallback (no DLL) shells
+  -- out through explorer/cmd, which allocates a console for the GUI process.
+  if osn == "windows" and http.shell_open and http.shell_open(url) then return end
   local cmd
   if osn == "windows" then     cmd = 'explorer "' .. url .. '"'
   elseif osn == "macos" then   cmd = 'open "' .. url .. '"'
@@ -10010,6 +10047,10 @@ end
 -- they remain recoverable if no clip tool is available.
 function panel_sets.copy_to_clipboard(text)
   local osn = dt.configuration.running_os
+  -- On Windows, prefer the in-process Win32 clipboard helper in the WinHTTP DLL
+  -- so no console window flashes (#83). Only the degraded fallback (no DLL)
+  -- writes a temp file and pipes it to `clip` through cmd.exe.
+  if osn == "windows" and http.clipboard_set and http.clipboard_set(text) then return true end
   local dir = dt.configuration.tmp_dir or dt.configuration.config_dir or "."
   local path = dir .. "/dtrmflickr_clip.txt"
   local f = io.open(path, "wb")
