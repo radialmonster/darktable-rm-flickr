@@ -8315,6 +8315,10 @@ local M = {}
 
 -- Normalize the raw selection numbers into a stable shape. `published` is clamped
 -- to [0, count] so a caller that miscounts can't produce a negative "unpublished".
+-- `configured` (whether the Flickr app credentials exist yet — the first-run
+-- signal for #90) defaults to true when the caller omits it, so older
+-- callers/tests keep their prior behavior; only an explicit `configured == false`
+-- triggers the not-yet-set-up guidance.
 local function normalize(state)
   state = state or {}
   local count = math.max(0, math.floor(tonumber(state.count) or 0))
@@ -8325,6 +8329,7 @@ local function normalize(state)
     published = published,
     unpublished = count - published,
     logged_in = state.logged_in == true,
+    configured = state.configured ~= false,
   }
 end
 M.normalize = normalize
@@ -8333,7 +8338,7 @@ M.normalize = normalize
 -- gettext-style function so the strings stay localizable while the logic stays
 -- pure. Returns:
 --   {
---     count, published, unpublished, logged_in,   -- the normalized inputs
+--     count, published, unpublished, logged_in, configured,  -- normalized inputs
 --     guidance = "...",                            -- one contextual line (may be "")
 --     caps = {
 --       write        = { enabled = bool, hint = "..." },
@@ -8350,7 +8355,11 @@ function M.evaluate(state, translate)
   local s = normalize(state)
 
   local HINT_SELECT   = tr("select an image first")
-  local HINT_LOGIN    = tr("log in to Flickr first")
+  -- The panel has no login control of its own — credentials and login both live
+  -- in the Lua options dialog — so the login/first-run hints name that location
+  -- (#90) rather than a bare "log in".
+  local HINT_CREDS    = tr("add Flickr app credentials in Lua ▸ options")
+  local HINT_LOGIN    = tr("log in from Lua ▸ options")
   local HINT_PUBLISH  = tr("not on Flickr yet — publish first (Export ▸ Flickr)")
   local HINT_NOTPUB   = tr("already on Flickr — nothing to link")
 
@@ -8361,16 +8370,22 @@ function M.evaluate(state, translate)
   local remote_write_enabled = s.logged_in and s.published > 0
 
   -- Per-capability disabled-reason hint. The most specific reason wins so the
-  -- user sees the single actionable step (select, then log in, then publish).
+  -- user sees the single actionable step (select, then set up / log in, then
+  -- publish). Login-gated caps distinguish "no credentials yet" (first run) from
+  -- "credentials present but logged out".
+  local function login_step_hint()
+    if not s.configured then return HINT_CREDS end
+    return HINT_LOGIN
+  end
   local function write_hint()
     if write_enabled then return "" end
     if s.count == 0 then return HINT_SELECT end
-    return HINT_LOGIN
+    return login_step_hint()
   end
   local function publish_hint()
     if publish_enabled then return "" end
     if s.count == 0 then return HINT_SELECT end
-    if not s.logged_in then return HINT_LOGIN end
+    if not s.logged_in then return login_step_hint() end
     return HINT_NOTPUB
   end
   local function remote_view_hint()
@@ -8381,22 +8396,28 @@ function M.evaluate(state, translate)
   local function remote_write_hint()
     if remote_write_enabled then return "" end
     if s.count == 0 then return HINT_SELECT end
-    if not s.logged_in then return HINT_LOGIN end
+    if not s.logged_in then return login_step_hint() end
     return HINT_PUBLISH
   end
 
   -- Primary guidance: the single most helpful line for the selection as a whole.
-  -- Precedence walks the user from "nothing selected" up to "everything ready".
+  -- Precedence leads with the step the user must take before the panel can do
+  -- anything at all — set up credentials, then log in — because those gate every
+  -- control; only once the account is usable does it fall through to the
+  -- selection-shaped advice (#90). "select an image" therefore shows only when
+  -- the account is ready but nothing is selected, not while logged out.
   local guidance = ""
-  if s.count == 0 then
-    guidance = tr("select an image to manage it on Flickr")
+  if not s.configured then
+    guidance = tr("add your Flickr app credentials in Lua ▸ options to get started")
   elseif not s.logged_in then
     if s.published > 0 then
       -- A stored photo-id tag lets the read-only URL/tag view work, but no edits.
-      guidance = tr("log in to Flickr to edit — showing public info only")
+      guidance = tr("log in from Lua ▸ options to edit — showing public info only")
     else
-      guidance = tr("log in to Flickr to manage your photos")
+      guidance = tr("log in from Lua ▸ options to manage your photos")
     end
+  elseif s.count == 0 then
+    guidance = tr("select an image to manage it on Flickr")
   elseif s.published == 0 then
     guidance = tr("not on Flickr yet — publish first with Export ▸ Flickr")
   elseif s.unpublished > 0 then
@@ -8410,6 +8431,7 @@ function M.evaluate(state, translate)
     published = s.published,
     unpublished = s.unpublished,
     logged_in = s.logged_in,
+    configured = s.configured,
     guidance = guidance,
     caps = {
       write        = { enabled = write_enabled,        hint = write_hint() },
@@ -10464,9 +10486,10 @@ end
 -- the post-remote-load path (load_remote_settings) to enable with the perms
 -- nuance; this method only ever disables them (never force-enables a stale/empty
 -- combobox), so the two writers never disagree.
-function panel_sets.apply_gating(count, logged_in, published)
+function panel_sets.apply_gating(count, logged_in, published, configured)
   local decision = panel_gating.evaluate(
-    { count = count, logged_in = logged_in, published = published }, _)
+    { count = count, logged_in = logged_in, published = published,
+      configured = configured }, _)
   if panel_sets.guidance_label then
     panel_sets.guidance_label.label = decision.guidance
   end
@@ -12874,7 +12897,11 @@ function refresh_panel(force, fetch_remote)
   end
   panel_current = { image = image, account = nil, photo_id = nil, selection_count = #selection, remote_loaded = false }
   if not image then
-    panel_sets.apply_gating(0, false, 0)  -- guidance: "select an image" (#88)
+    -- Nothing selected: still lead with the real account state so the guidance
+    -- reflects first-run / logged-out over a bare "select an image" (#90). A
+    -- logged-in user with no selection gets "select an image"; a logged-out or
+    -- unconfigured one is pointed at Lua ▸ options instead.
+    panel_sets.apply_gating(0, load_token() ~= nil, 0, get_credentials() ~= nil)
     panel_sets.update_photo_link_buttons(selection, nil, nil)
     panel_sets.refresh_url_actions(selection, nil, nil)
     panel_status_label.label = _("no image selected")
@@ -12908,8 +12935,9 @@ function refresh_panel(force, fetch_remote)
   -- published vs not, so the batch shape is visible before a batch action.
   panel_status_label.label = panel_helpers.selection_summary(selection, resolve_photo_id, _)
   panel_file_label.label = string.format(_("file: %s"), image.filename or "?")
-  -- Selection-aware guidance + control gating (issue #88).
-  panel_sets.apply_gating(#selection, acc ~= nil, published_count)
+  -- Selection-aware guidance + control gating (issue #88); pass the first-run
+  -- signal so a not-yet-configured account leads with the setup step (#90).
+  panel_sets.apply_gating(#selection, acc ~= nil, published_count, get_credentials() ~= nil)
 
   if not acc then
     local tag_account_nsid, tagged_photo_id = state.get_any_photo_id(image)
