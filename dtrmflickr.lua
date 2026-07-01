@@ -2860,7 +2860,7 @@ local function fingerprint_parts(parts)
   return fingerprint_hash(table.concat(parts or {}, "\31"))
 end
 
--- Decide what a single-image "sync GPS/date taken" panel resend should push,
+-- Decide what a single-image "push GPS/date taken to Flickr" panel resend should push,
 -- given the master sync flags and the values currently available on the image.
 -- Pure (no darktable calls) so the panel action's gating can be tested offline.
 -- Returns one of:
@@ -7724,13 +7724,13 @@ end
 -- "compare with Flickr" action. `status` is a classify_change() verdict for the
 -- field group; `fields` is an array of { label, local_value, remote } rendered one
 -- comparison line each (via describe_field). The first line is a plain-language
--- verdict that names the resolution: push (the sync button), pull (the pull
+-- verdict that names the resolution: push (the push button), pull (the pull
 -- button), or leave-as-is (skip). Pure/offline-testable.
 local STATUS_HEADLINE = {
   in_sync  = "Flickr matches darktable - nothing to resolve.",
-  ["local"] = "darktable is newer - use \"sync title/description\" to push to Flickr.",
+  ["local"] = "darktable is newer - use \"push title/description to Flickr\" to update Flickr.",
   remote   = "Flickr is newer - use \"pull title/description from Flickr\" to update darktable.",
-  conflict = "Conflict: both sides changed - push (sync), pull, or leave as-is to skip.",
+  conflict = "Conflict: both sides changed - push, pull, or leave as-is to skip.",
 }
 
 function M.conflict_summary(status, fields)
@@ -7747,8 +7747,8 @@ end
 package.preload["dtrmflickr.sync_surface"] = function(...)
 -- sync_surface.lua — pure model for the unified sync surface (issue #87).
 --
--- The panel used to scatter "sync" across several tabs/buttons: sync
--- title/description, sync keywords, sync GPS/date, compare-with-Flickr, push
+-- The panel used to scatter "sync" across several tabs/buttons: push
+-- title/description, push keywords, push GPS/date, compare-with-Flickr, push
 -- metadata to selected. This module folds all of that into ONE diff-driven
 -- model: given the per-field baseline/local/remote fingerprints for a single
 -- published photo, it classifies every syncable field into one of
@@ -10714,7 +10714,7 @@ function panel_sets.refresh_memberships()
   panel_sets_label.label = panel_sets.format_memberships(state.get_sets(image, acc.nsid))
   panel_sets.update_current_choices(image, acc.nsid)
   panel_sets.update_choices(panel_sets.input_value())
-  panel_sets.status_label.label = string.format(_("synced %d album membership(s)"), #memberships)
+  panel_sets.status_label.label = string.format(_("pulled %d album membership(s) from Flickr"), #memberships)
   dt.print(panel_sets.status_label.label)
   return memberships
 end
@@ -11763,7 +11763,7 @@ end
 -- linked photo's current title/description via flickr.photos.getInfo and shows
 -- them side by side against the local image, then classifies the field group with
 -- a three-way (baseline/local/remote) merge so the user is told whether to push
--- (the "sync title/description" button), pull (the "pull title/description from
+-- (the "push title/description to Flickr" button), pull (the "pull title/description from
 -- Flickr" button), or leave it (skip). A true conflict — both the local image and
 -- the Flickr photo changed since the last publish — is detected via the stored
 -- title_description fingerprint, so blindly pushing or pulling no longer silently
@@ -13251,7 +13251,8 @@ local panel_tab_stack = dt.new_widget("stack") {
       end,
     },
     dt.new_widget("button") {
-      label = _("sync title/description"),
+      label = _("push title/description to Flickr"),
+      tooltip = _("push the local title/description to the linked Flickr photo (only fields whose sync toggle is on)"),
       clicked_callback = function() sync_panel_meta() end,
     },
     dt.new_widget("button") {
@@ -13261,11 +13262,11 @@ local panel_tab_stack = dt.new_widget("stack") {
     },
     dt.new_widget("button") {
       label = _("compare title/description with Flickr"),
-      tooltip = _("show local vs Flickr title/description side by side and advise whether to push (sync), pull, or leave as-is; detects edit conflicts where both sides changed since the last publish. Read-only — changes nothing."),
+      tooltip = _("show local vs Flickr title/description side by side and advise whether to push, pull, or leave as-is; detects edit conflicts where both sides changed since the last publish. Read-only — changes nothing."),
       clicked_callback = function() panel_sets.compare_remote_meta() end,
     },
     dt.new_widget("button") {
-      label = _("sync GPS/date taken"),
+      label = _("push GPS/date taken to Flickr"),
       tooltip = _("push darktable GPS location and date taken to the linked Flickr photo without re-uploading"),
       clicked_callback = function() panel_sets.sync_geo_date() end,
     },
@@ -13279,7 +13280,7 @@ local panel_tab_stack = dt.new_widget("stack") {
   dt.new_widget("box") {
     orientation = "vertical",
     dt.new_widget("button") {
-      label = _("sync keywords"),
+      label = _("push keywords to Flickr"),
       tooltip = _("push the local darktable keywords to the linked Flickr photo's tags"),
       clicked_callback = function() sync_panel_tags() end,
     },
@@ -13336,7 +13337,8 @@ local panel_tab_stack = dt.new_widget("stack") {
         clicked_callback = function() panel_sets.refresh_list() end,
       },
       dt.new_widget("button") {
-        label = _("sync memberships"),
+        label = _("pull memberships from Flickr"),
+        tooltip = _("re-read this photo's album memberships from Flickr into the local record"),
         clicked_callback = function() panel_sets.refresh_memberships() end,
       },
     },
@@ -13535,12 +13537,12 @@ local panel_widget = dt.new_widget("box") {
     orientation = "horizontal",
     dt.new_widget("button") {
       label = _("meta"),
-      tooltip = _("Flickr settings (privacy/safety/license/…) + title/description sync + GPS/date"),
+      tooltip = _("Flickr settings (privacy/safety/license/…) + push/pull title/description + GPS/date"),
       clicked_callback = function() panel_tab_stack.active = 1; panel_tab_label.label = _("section: meta") end,
     },
     dt.new_widget("button") {
       label = _("keywords"),
-      tooltip = _("sync keywords + tag reconciler: local keywords vs Flickr tags"),
+      tooltip = _("push keywords + tag reconciler: local keywords vs Flickr tags"),
       clicked_callback = function() panel_tab_stack.active = 2; panel_tab_label.label = _("section: keywords") end,
     },
     dt.new_widget("button") {
