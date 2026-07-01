@@ -8280,6 +8280,149 @@ M.selection_summary = selection_summary
 return M
 end
 
+package.preload["dtrmflickr.panel_gating"] = function(...)
+-- panel_gating.lua — pure selection-aware control gating for the Flickr panel (#88).
+--
+-- Controls that cannot act on the current selection should be disabled or
+-- replaced with a hint, not shown as live-but-dead buttons: an unpublished image
+-- has no Flickr URL / remote tags / albums to act on, and a logged-out session
+-- cannot write anything. Given the current selection shape (how many images, how
+-- many are published on the active account, and whether an account is logged in),
+-- this module decides which panel capabilities apply and produces a single
+-- contextual guidance line plus a per-capability {enabled, hint} decision. It
+-- touches no darktable widgets or live account state, so it lives here as a small
+-- offline-testable function instead of bloating the main module's tight
+-- main-chunk local budget (Lua caps locals per function; see
+-- tests/test_lua_limits.lua). The panel requires this and applies the decision to
+-- widget `sensitive` flags and the guidance label on each selection change.
+--
+-- Capabilities (each is a control group in the panel):
+--   write        — any Flickr write at all: needs a logged-in account and >=1
+--                  selected image (claim/link, metadata push, album add, etc.).
+--   publish      — claim/link an unpublished image to an existing Flickr photo:
+--                  needs logged-in and >=1 selected image that is NOT yet on
+--                  Flickr.
+--   remote_view  — read-only actions on an already-published photo: open / copy
+--                  its Flickr URL, show its remote tags. Works even logged out
+--                  (the stored photo-id tag + api key are enough), so it only
+--                  needs >=1 published image in the selection.
+--   remote_write — edit an already-published photo's remote state: privacy /
+--                  safety / license / permissions, remote tags, albums, people,
+--                  GPS/date resend. Needs BOTH a logged-in account AND >=1
+--                  published image (there is nothing to edit until pixels land).
+
+local M = {}
+
+-- Normalize the raw selection numbers into a stable shape. `published` is clamped
+-- to [0, count] so a caller that miscounts can't produce a negative "unpublished".
+local function normalize(state)
+  state = state or {}
+  local count = math.max(0, math.floor(tonumber(state.count) or 0))
+  local published = math.max(0, math.floor(tonumber(state.published) or 0))
+  if published > count then published = count end
+  return {
+    count = count,
+    published = published,
+    unpublished = count - published,
+    logged_in = state.logged_in == true,
+  }
+end
+M.normalize = normalize
+
+-- Evaluate the selection state into a gating decision. `translate` is an optional
+-- gettext-style function so the strings stay localizable while the logic stays
+-- pure. Returns:
+--   {
+--     count, published, unpublished, logged_in,   -- the normalized inputs
+--     guidance = "...",                            -- one contextual line (may be "")
+--     caps = {
+--       write        = { enabled = bool, hint = "..." },
+--       publish      = { enabled = bool, hint = "..." },
+--       remote_view  = { enabled = bool, hint = "..." },
+--       remote_write = { enabled = bool, hint = "..." },
+--     },
+--   }
+-- A cap's `hint` is the reason it is disabled (""/nil when enabled), suitable for
+-- a tooltip on the disabled control. `guidance` is the single most useful line to
+-- show the user for the selection as a whole.
+function M.evaluate(state, translate)
+  local tr = translate or function(s) return s end
+  local s = normalize(state)
+
+  local HINT_SELECT   = tr("select an image first")
+  local HINT_LOGIN    = tr("log in to Flickr first")
+  local HINT_PUBLISH  = tr("not on Flickr yet — publish first (Export ▸ Flickr)")
+  local HINT_NOTPUB   = tr("already on Flickr — nothing to link")
+
+  -- Per-capability enablement.
+  local write_enabled        = s.logged_in and s.count > 0
+  local publish_enabled      = s.logged_in and s.unpublished > 0
+  local remote_view_enabled  = s.published > 0
+  local remote_write_enabled = s.logged_in and s.published > 0
+
+  -- Per-capability disabled-reason hint. The most specific reason wins so the
+  -- user sees the single actionable step (select, then log in, then publish).
+  local function write_hint()
+    if write_enabled then return "" end
+    if s.count == 0 then return HINT_SELECT end
+    return HINT_LOGIN
+  end
+  local function publish_hint()
+    if publish_enabled then return "" end
+    if s.count == 0 then return HINT_SELECT end
+    if not s.logged_in then return HINT_LOGIN end
+    return HINT_NOTPUB
+  end
+  local function remote_view_hint()
+    if remote_view_enabled then return "" end
+    if s.count == 0 then return HINT_SELECT end
+    return HINT_PUBLISH
+  end
+  local function remote_write_hint()
+    if remote_write_enabled then return "" end
+    if s.count == 0 then return HINT_SELECT end
+    if not s.logged_in then return HINT_LOGIN end
+    return HINT_PUBLISH
+  end
+
+  -- Primary guidance: the single most helpful line for the selection as a whole.
+  -- Precedence walks the user from "nothing selected" up to "everything ready".
+  local guidance = ""
+  if s.count == 0 then
+    guidance = tr("select an image to manage it on Flickr")
+  elseif not s.logged_in then
+    if s.published > 0 then
+      -- A stored photo-id tag lets the read-only URL/tag view work, but no edits.
+      guidance = tr("log in to Flickr to edit — showing public info only")
+    else
+      guidance = tr("log in to Flickr to manage your photos")
+    end
+  elseif s.published == 0 then
+    guidance = tr("not on Flickr yet — publish first with Export ▸ Flickr")
+  elseif s.unpublished > 0 then
+    guidance = string.format(
+      tr("%d of %d selected are on Flickr — remote actions apply to those"),
+      s.published, s.count)
+  end
+
+  return {
+    count = s.count,
+    published = s.published,
+    unpublished = s.unpublished,
+    logged_in = s.logged_in,
+    guidance = guidance,
+    caps = {
+      write        = { enabled = write_enabled,        hint = write_hint() },
+      publish      = { enabled = publish_enabled,      hint = publish_hint() },
+      remote_view  = { enabled = remote_view_enabled,  hint = remote_view_hint() },
+      remote_write = { enabled = remote_write_enabled, hint = remote_write_hint() },
+    },
+  }
+end
+
+return M
+end
+
 package.preload["dtrmflickr.account_info"] = function(...)
 -- account_info.lua — account-identity helpers for the login widget (issue #12).
 --
@@ -8918,6 +9061,7 @@ local panel_helpers = require "dtrmflickr.panel_helpers"  -- pure panel parse/in
 local account_ui = require "dtrmflickr.account_ui"  -- account-login widget + session state (#47)
 local queue_panel = require "dtrmflickr.queue_panel"  -- pure live job-lifecycle grid formatter (#56)
 local batch_apply = require "dtrmflickr.batch_apply"  -- pure multi-select settings-apply planner/formatter (#49)
+local panel_gating = require "dtrmflickr.panel_gating"  -- pure selection-aware control gating + guidance (#88)
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -9896,6 +10040,13 @@ local panel_stats_label = dt.new_widget("label") { label = "" }
 -- Blank for a single (or empty) selection. Kept on panel_sets (not a new
 -- main-chunk local) to respect Lua's per-function local limit (see CLAUDE.md).
 panel_sets.batch_indicator_label = dt.new_widget("label") { label = "" }
+-- Selection-aware guidance (issue #88): one contextual line telling the user what
+-- to do when the selection can't drive a control — "select an image", "log in to
+-- Flickr first", "not on Flickr yet — publish first" — computed by the pure
+-- panel_gating module so it stays offline-testable. Blank when the selection is
+-- fully actionable. Kept on panel_sets (table field) to respect Lua's
+-- per-function local limit (see CLAUDE.md).
+panel_sets.guidance_label = dt.new_widget("label") { label = "" }
 -- Tag reconciler (issue #3): side-by-side local-keyword vs Flickr-tag view plus
 -- explicit actions. All widgets/handlers/state live in this one table to keep the
 -- main chunk under Lua's per-function local limit (see CLAUDE.md).
@@ -10295,6 +10446,43 @@ function panel_sets.refresh_url_actions(selection, owner, account_nsid)
   local has = result.published > 0
   if panel_sets.open_url_button then panel_sets.open_url_button.sensitive = has end
   if panel_sets.copy_url_button then panel_sets.copy_url_button.sensitive = has end
+end
+
+-- Selection-aware control gating (issue #88). Given the selection shape (image
+-- count, whether an account is logged in, and how many selected images are
+-- already published) set the one contextual guidance line and disable the
+-- remote-edit controls that cannot act on the selection — a logged-out session
+-- or an unpublished selection has no remote state to edit, so showing live
+-- metadata comboboxes / people entry would be dead buttons. The pure decision
+-- (which caps apply + what to hint) lives in dtrmflickr.panel_gating so it is
+-- offline-tested; this method only paints widget `sensitive` flags and the
+-- guidance label. Assigned onto panel_sets (not a main-chunk local) and reaching
+-- the metadata widgets as upvalues to respect Lua's local budget (see CLAUDE.md).
+-- The claim/set-link (publish) and open/copy-URL (remote_view) controls keep
+-- their own finer-grained gating in update_photo_link_buttons / refresh_url_actions.
+-- When the selection IS remote-write-capable the metadata comboboxes are left for
+-- the post-remote-load path (load_remote_settings) to enable with the perms
+-- nuance; this method only ever disables them (never force-enables a stale/empty
+-- combobox), so the two writers never disagree.
+function panel_sets.apply_gating(count, logged_in, published)
+  local decision = panel_gating.evaluate(
+    { count = count, logged_in = logged_in, published = published }, _)
+  if panel_sets.guidance_label then
+    panel_sets.guidance_label.label = decision.guidance
+  end
+  local rw = decision.caps.remote_write.enabled
+  -- Only push the disabled state; enabling stale controls is the remote-load
+  -- path's job (it also knows the perms-unavailable nuance).
+  if not rw then
+    panel_privacy_widget.sensitive = false
+    panel_safety_widget.sensitive = false
+    panel_content_type_widget.sensitive = false
+    panel_license_widget.sensitive = false
+    panel_comment_perm_widget.sensitive = false
+    panel_addmeta_perm_widget.sensitive = false
+    if panel_sets.people_entry then panel_sets.people_entry.sensitive = false end
+  end
+  return decision
 end
 
 -- Open each published Flickr page in the default browser. Capped per click so a
@@ -12686,6 +12874,7 @@ function refresh_panel(force, fetch_remote)
   end
   panel_current = { image = image, account = nil, photo_id = nil, selection_count = #selection, remote_loaded = false }
   if not image then
+    panel_sets.apply_gating(0, false, 0)  -- guidance: "select an image" (#88)
     panel_sets.update_photo_link_buttons(selection, nil, nil)
     panel_sets.refresh_url_actions(selection, nil, nil)
     panel_status_label.label = _("no image selected")
@@ -12701,16 +12890,26 @@ function refresh_panel(force, fetch_remote)
   end
 
   local acc = load_token()
-  -- Header selection summary (issue #85): for >1 selected show how many are
-  -- published vs not, so the batch shape is visible before a batch action. The
-  -- resolver reads the stored photo id for the active account (or any account
-  -- when logged out) so the count matches what a batch action would touch.
-  panel_status_label.label = panel_helpers.selection_summary(selection, function(img)
+  -- Resolve each selected image's stored Flickr photo id once (active account
+  -- when logged in, else any account's stored tag) and reuse it for both the
+  -- header selection summary (#85) and the selection-aware gating (#88): both
+  -- need "how many of the selection are already on Flickr".
+  local function resolve_photo_id(img)
     if acc then return state.get_photo_id(img, acc.nsid) end
     local _nsid, pid = state.get_any_photo_id(img)
     return pid
-  end, _)
+  end
+  local published_count = 0
+  for _, img in ipairs(selection) do
+    local pid = resolve_photo_id(img)
+    if pid and pid ~= "" then published_count = published_count + 1 end
+  end
+  -- Header selection summary (issue #85): for >1 selected show how many are
+  -- published vs not, so the batch shape is visible before a batch action.
+  panel_status_label.label = panel_helpers.selection_summary(selection, resolve_photo_id, _)
   panel_file_label.label = string.format(_("file: %s"), image.filename or "?")
+  -- Selection-aware guidance + control gating (issue #88).
+  panel_sets.apply_gating(#selection, acc ~= nil, published_count)
 
   if not acc then
     local tag_account_nsid, tagged_photo_id = state.get_any_photo_id(image)
@@ -13324,6 +13523,12 @@ local panel_widget = dt.new_widget("box") {
   -- header so a Flickr user sees them regardless of the active tab (#85, "lead
   -- with state"). Populated on remote load; blank until then.
   panel_stats_label,
+  -- Selection-aware guidance (issue #88): one contextual line telling the user
+  -- what the selection can/can't do ("select an image", "log in to Flickr first",
+  -- "not on Flickr yet — publish first"), so a control that doesn't apply reads as
+  -- an explained next step instead of a dead button. Blank when everything is
+  -- actionable. Sits above the tab bar it governs.
+  panel_sets.guidance_label,
   -- Tab bar (issue #82): two rows of buttons switch panel_tab_stack. Two rows
   -- keep the short labels readable in a narrow lighttable panel.
   dt.new_widget("box") {
