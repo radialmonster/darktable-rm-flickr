@@ -1549,6 +1549,98 @@ function M.photosets_get_memberships(api_key, api_secret, account, photo_id, use
 end
 
 -- ---------------------------------------------------------------------------
+-- Collections (issue #33) — read-only hierarchical grouping of photosets.
+-- A collection can contain sub-collections and/or sets; the API has no method
+-- to create a collection or add a set to one, so we only ever browse/display.
+-- ---------------------------------------------------------------------------
+
+-- Parse a flickr.collections.getTree response into a nested list of root
+-- collection nodes. Each node is:
+--   { id, title, description, collections = { <child nodes> }, sets = { <set> } }
+-- where each set is { id, title, description }. The tree can nest arbitrarily
+-- (a collection holding both sub-collections and sets), so this walks the tag
+-- stream with an explicit stack rather than a single Lua pattern. Self-closing
+-- `<collection ... />` (no children) and `<set ... />` are both handled. The
+-- `<collections>` wrapper element is ignored (only singular `<collection>` and
+-- `<set>` tags drive the tree). A `<set>` is attached to the collection that is
+-- currently open; sets appearing outside any collection are dropped.
+function M.parse_collections_tree(body)
+  body = tostring(body or "")
+  local roots, stack = {}, {}
+  local function children()
+    return (#stack > 0) and stack[#stack].collections or roots
+  end
+  local pos = 1
+  while true do
+    local s, e, slash, name, rest = body:find("<(/?)%s*(%a+)([^>]*)>", pos)
+    if not s then break end
+    pos = e + 1
+    name = name:lower()
+    if name == "collection" then
+      if slash == "/" then
+        if #stack > 0 then stack[#stack] = nil end
+      else
+        local self_closing = rest:sub(-1) == "/"
+        local attr = parse_attrs(self_closing and (rest:gsub("%s*/%s*$", "")) or rest)
+        local node = {
+          id = xml_unescape(attr.id or ""),
+          title = xml_unescape(attr.title or ""),
+          description = xml_unescape(attr.description or ""),
+          collections = {},
+          sets = {},
+        }
+        local kids = children()
+        kids[#kids + 1] = node
+        if not self_closing then stack[#stack + 1] = node end
+      end
+    elseif name == "set" and slash ~= "/" then
+      local attr = parse_attrs(rest:gsub("%s*/%s*$", ""))
+      local id = attr.id
+      if id and id ~= "" and #stack > 0 then
+        local owner = stack[#stack]
+        owner.sets[#owner.sets + 1] = {
+          id = xml_unescape(id),
+          title = xml_unescape(attr.title or ""),
+          description = xml_unescape(attr.description or ""),
+        }
+      end
+    end
+  end
+  return roots
+end
+
+-- Fetch the account's collection tree (flickr.collections.getTree). getTree does
+-- not require authentication, but we sign it when we have a token so the call is
+-- attributed to the user and respects private collections; otherwise it falls
+-- back to a public (api-key-only) call for the given user_id. Returns
+-- (roots, raw_body) or (nil, err). `roots` is the parse_collections_tree shape.
+function M.collections_get_tree(api_key, api_secret, account, opts)
+  if type(account) == "table" and account.nsid == nil and account.token == nil
+    and opts == nil then
+    -- tolerate collections_get_tree(api_key, api_secret, opts)
+    opts = account
+    account = nil
+  end
+  opts = opts or {}
+  local args = {}
+  local user_id = opts.user_id or (account and account.nsid) or nil
+  if user_id and user_id ~= "" then args.user_id = user_id end
+  if opts.collection_id and opts.collection_id ~= "" then
+    args.collection_id = opts.collection_id
+  end
+
+  local body, err
+  if opts.public or not (account and account.token and account.secret) then
+    if not (args.user_id) then return nil, "missing user id" end
+    body, err = M.public_call(api_key, "flickr.collections.getTree", args)
+  else
+    body, err = M.call(api_key, api_secret, account, "flickr.collections.getTree", args)
+  end
+  if not body then return nil, err end
+  return M.parse_collections_tree(body), body
+end
+
+-- ---------------------------------------------------------------------------
 -- Groups / pools (issue #32) — shared community galleries, distinct from
 -- albums/photosets. flickr.groups.pools.getGroups lists the groups the
 -- authenticated user can post to; add/remove move a photo in/out of a pool.
@@ -6636,10 +6728,15 @@ end
 function M.matches_query(item, query)
   query = trim(query):lower()
   if query == "" then return true end
+  -- collection_path (issue #33) is an optional annotation: when the album cache
+  -- has been enriched with each album's collection path, typing a collection
+  -- name surfaces its albums. Absent on un-annotated items, so it is a no-op
+  -- until collections are loaded.
   local haystack = table.concat({
     tostring(item.id or ""),
     tostring(item.title or ""),
     M.label(item),
+    tostring(item.collection_path or ""),
   }, " "):lower()
   return haystack:find(query, 1, true) ~= nil
 end
@@ -6664,6 +6761,10 @@ local function match_score(item, query)
   if id:find(query, 1, true) or title:find(query, 1, true) or label:find(query, 1, true) then
     return 3
   end
+  -- A collection-path hit (issue #33) is the weakest match: an album surfaces
+  -- when the user types the name of the collection it lives under.
+  local collection = tostring(item.collection_path or ""):lower()
+  if collection ~= "" and collection:find(query, 1, true) then return 3 end
   return nil
 end
 M.match_score = match_score
@@ -7052,6 +7153,195 @@ function M.resolve_create(value, exact_resolver)
     end
   end
   return targets, errors
+end
+
+-- ---------------------------------------------------------------------------
+-- Collections (issue #33) — read-only hierarchical grouping of photosets.
+--
+-- flickr.collections.getTree gives a nested tree of collections, each holding
+-- sub-collections and/or sets (photosets). The API cannot create collections or
+-- move sets between them, so this is browse/display only: we annotate the album
+-- cache with the collection path each album lives under so the picker can group
+-- albums by collection and the user can search a collection name to surface its
+-- albums. The tree shape is whatever flickr_rest.parse_collections_tree returns:
+--   { id, title, description, collections = {<child nodes>}, sets = {{id,...}} }
+-- ---------------------------------------------------------------------------
+
+-- Separator between collection titles in a rendered path ("Travel > Europe").
+M.COLLECTION_SEP = " > "
+
+-- Walk a collection tree (list of root nodes) and build a flat index keyed by
+-- set id. Returns:
+--   { path = { [set_id] = "Travel > Europe" },   -- collection path of the set
+--     order = { [set_id] = n } }                  -- first-seen pre-order rank
+-- A set listed under more than one collection keeps its FIRST-seen path/order
+-- (pre-order traversal, roots in tree order) so grouping/sorting is stable. Set
+-- and collection ids are stringified; untitled collections fall back to their id
+-- so a path never has empty segments. A node missing an id/title still
+-- contributes its title to descendants' paths.
+function M.collection_index(roots)
+  local index = { path = {}, order = {} }
+  local counter = 0
+  local function walk(nodes, prefix)
+    for _, node in ipairs(nodes or {}) do
+      local title = trim(node and node.title or "")
+      if title == "" then title = tostring(node and node.id or "") end
+      local path = (prefix ~= "" and title ~= "")
+        and (prefix .. M.COLLECTION_SEP .. title)
+        or (prefix ~= "" and prefix or title)
+      for _, set in ipairs(node and node.sets or {}) do
+        local sid = tostring(set and set.id or "")
+        if sid ~= "" and index.path[sid] == nil then
+          index.path[sid] = path
+          counter = counter + 1
+          index.order[sid] = counter
+        end
+      end
+      if node and node.collections and #node.collections > 0 then
+        walk(node.collections, path)
+      end
+    end
+  end
+  walk(roots, "")
+  return index
+end
+
+-- Group the album `cache` by collection for a browse view. Returns an ordered
+-- list of groups in collection pre-order, each:
+--   { path = "Travel > Europe", sets = { <cache item>, ... } }
+-- followed by a trailing { path = nil, sets = {<ungrouped albums>} } for albums
+-- in the cache that no collection references (path nil signals "not in any
+-- collection" to the caller). Albums are matched to collections by id against
+-- `index` (from collection_index); an album referenced by a collection but
+-- absent from the cache is skipped (it may be filtered out or unloaded). Within
+-- each group albums keep the cache's existing (natural-title) order. A set listed
+-- in more than one collection is grouped only under its first-seen collection
+-- (collection_index maps each set to a single path). `index` may be omitted/empty,
+-- in which case every album lands in the single trailing ungrouped group.
+function M.group_by_collection(cache, index)
+  cache = cache or {}
+  index = index or { path = {}, order = {} }
+  local paths = index.path or {}
+  local order = index.order or {}
+
+  -- Bucket cache albums by their collection path, preserving cache order, and
+  -- track which paths exist and in what collection-tree order they first appear.
+  local buckets, path_order, ungrouped = {}, {}, {}
+  for _, item in ipairs(cache) do
+    local sid = tostring(item and item.id or "")
+    local path = sid ~= "" and paths[sid] or nil
+    if path == nil then
+      ungrouped[#ungrouped + 1] = item
+    else
+      if not buckets[path] then
+        buckets[path] = {}
+        path_order[#path_order + 1] = { path = path, rank = order[sid] or math.huge }
+      end
+      local b = buckets[path]
+      b[#b + 1] = item
+    end
+  end
+
+  table.sort(path_order, function(a, b)
+    if a.rank ~= b.rank then return a.rank < b.rank end
+    return a.path < b.path
+  end)
+
+  local groups = {}
+  for _, entry in ipairs(path_order) do
+    groups[#groups + 1] = { path = entry.path, sets = buckets[entry.path] }
+  end
+  groups[#groups + 1] = { path = nil, sets = ungrouped }
+  return groups
+end
+
+-- Annotate each album in `cache` with its collection path, in place, from a
+-- collection tree (`roots`, the parse_collections_tree shape). Builds the index,
+-- sets `item.collection_path` to the album's path (or nil when the album is in no
+-- collection / the tree is empty), and returns the index so a caller can reuse
+-- it. This is what makes collection names searchable in the picker (matches_query
+-- / match_score consult collection_path) without the main module holding any
+-- collection state of its own — the annotation rides on the cache items.
+function M.annotate_with_collections(cache, roots)
+  local index = M.collection_index(roots)
+  local paths = index.path or {}
+  for _, item in ipairs(cache or {}) do
+    local id = tostring(item and item.id or "")
+    if item then item.collection_path = (id ~= "" and paths[id]) or nil end
+  end
+  return index
+end
+
+-- Group an already-annotated album `cache` by each item's `collection_path`,
+-- without needing the original tree/index. Returns the same shape as
+-- group_by_collection — an ordered list of { path, sets } groups with a trailing
+-- { path = nil, sets = {...} } for un-annotated albums — but orders the
+-- collection groups alphabetically by path (the pre-order rank is not available
+-- from annotations alone). Within a group, albums keep cache order. Used by the
+-- panel's browse view so the main module can render the hierarchy from the cache
+-- it already holds.
+function M.group_cache_by_path(cache)
+  cache = cache or {}
+  local buckets, paths, ungrouped = {}, {}, {}
+  for _, item in ipairs(cache) do
+    local path = item and item.collection_path
+    if path == nil or path == "" then
+      ungrouped[#ungrouped + 1] = item
+    else
+      if not buckets[path] then
+        buckets[path] = {}
+        paths[#paths + 1] = path
+      end
+      local b = buckets[path]
+      b[#b + 1] = item
+    end
+  end
+  table.sort(paths)
+  local groups = {}
+  for _, path in ipairs(paths) do
+    groups[#groups + 1] = { path = path, sets = buckets[path] }
+  end
+  groups[#groups + 1] = { path = nil, sets = ungrouped }
+  return groups
+end
+
+-- Render a browse listing (group_by_collection result) into a flat list of plain
+-- text lines for the panel/status display, e.g.:
+--   "Travel > Europe"
+--   "  Paris 2024 (#123) - 12 photo(s)"
+-- Collection headers are emitted only for non-empty groups; the trailing
+-- ungrouped group is given a header from `ungrouped_label` (default "(no
+-- collection)") only when other collections exist AND it is non-empty — if there
+-- are no collections at all the albums are listed bare. `translate` is an
+-- optional gettext-style fn. Returns a list of strings (the panel joins them).
+function M.format_collection_browse(groups, opts)
+  opts = opts or {}
+  local t = opts.translate or function(s) return s end
+  local ungrouped_label = opts.ungrouped_label or t("(no collection)")
+  local indent = opts.indent or "  "
+  groups = groups or {}
+
+  local has_collection = false
+  for _, g in ipairs(groups) do
+    if g.path ~= nil and g.sets and #g.sets > 0 then has_collection = true break end
+  end
+
+  local lines = {}
+  for _, g in ipairs(groups) do
+    local sets = g.sets or {}
+    if #sets > 0 then
+      if g.path ~= nil then
+        lines[#lines + 1] = g.path
+      elseif has_collection then
+        lines[#lines + 1] = ungrouped_label
+      end
+      local prefix = (g.path ~= nil or has_collection) and indent or ""
+      for _, item in ipairs(sets) do
+        lines[#lines + 1] = prefix .. M.label(item)
+      end
+    end
+  end
+  return lines
 end
 
 return M
@@ -9192,6 +9482,7 @@ __dtrmflickr_queue = require("dtrmflickr.queue").new {
     ["flickr.photos.getPerms"] = 250,
     ["flickr.photos.search"] = 250,
     ["flickr.photosets.getList"] = 250,
+    ["flickr.collections.getTree"] = 250,
   },
 }
 
@@ -9743,9 +10034,29 @@ local function update_album_match_widget(widget, query)
   clear_widget_items(widget)
   query = trim(query)
   if query == "" then
+    -- Empty query: if read-only collections are loaded (issue #33), browse the
+    -- library grouped by collection — collection-path headers plus indented album
+    -- labels. album_widget.changed_callback trims the leading indent, so picking
+    -- an album line still resolves by its exact label; a header line resolves to
+    -- nothing and is harmless. Capped (mirrors the search cap, issue #29) so a
+    -- large library stays manageable. With no collections, the combobox is left
+    -- empty exactly as before.
+    local any_collection = false
+    for _, item in ipairs(album_cache) do
+      if item.collection_path and item.collection_path ~= "" then any_collection = true break end
+    end
+    local shown = 0
+    if any_collection then
+      for _, line in ipairs(albums.format_collection_browse(albums.group_cache_by_path(album_cache),
+        { indent = "    " })) do
+        if shown >= 200 then break end
+        shown = shown + 1
+        widget[shown] = line
+      end
+    end
     widget.selected = 0
     widget.value = nil
-    return #album_cache, 0
+    return #album_cache, shown
   end
   -- Rank matches by relevance (exact > title-prefix > word-prefix > other
   -- substring) and cap to ALBUM_MATCH_LIMIT, so on large libraries the album the
@@ -9869,7 +10180,23 @@ local function refresh_album_list()
     return nil, err
   end
   set_album_cache(sets, account)
-  album_status_label.label = string.format(_("%d album(s) loaded"), #sets)
+  -- Collections (issue #33) are read-only; fetch the tree and annotate the cache
+  -- so collection names become searchable and the picker can group by collection.
+  -- Non-fatal: a failed/empty tree just leaves albums un-collected.
+  local roots = __dtrmflickr_call("flickr.collections.getTree", function()
+    return rest.collections_get_tree(api_key, api_secret, account)
+  end)
+  if roots then albums.annotate_with_collections(album_cache, roots) end
+  local in_collections = 0
+  for _, item in ipairs(album_cache) do
+    if item.collection_path and item.collection_path ~= "" then in_collections = in_collections + 1 end
+  end
+  if in_collections > 0 then
+    album_status_label.label = string.format(
+      _("%d album(s) loaded; %d in collections (type a collection name to browse)"), #sets, in_collections)
+  else
+    album_status_label.label = string.format(_("%d album(s) loaded"), #sets)
+  end
   dt.print(string.format(_("Flickr: loaded %d album(s)"), #sets))
   return sets
 end
@@ -9887,6 +10214,12 @@ local function refresh_album_cache_for_export(api_key, api_secret, account, opts
   end)
   if not sets then return nil, err end
   set_album_cache(sets, account)
+  -- Annotate with read-only collection paths too (issue #33), so an export-time
+  -- album refresh enables collection-name search just like the panel refresh.
+  local roots = __dtrmflickr_call("flickr.collections.getTree", function()
+    return rest.collections_get_tree(api_key, api_secret, account)
+  end)
+  if roots then albums.annotate_with_collections(album_cache, roots) end
   album_status_label.label = string.format(_("%d album(s) loaded"), #sets)
   return sets
 end
