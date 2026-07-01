@@ -7693,6 +7693,220 @@ end
 return M
 end
 
+package.preload["dtrmflickr.sync_surface"] = function(...)
+-- sync_surface.lua — pure model for the unified sync surface (issue #87).
+--
+-- The panel used to scatter "sync" across several tabs/buttons: sync
+-- title/description, sync keywords, sync GPS/date, compare-with-Flickr, push
+-- metadata to selected. This module folds all of that into ONE diff-driven
+-- model: given the per-field baseline/local/remote fingerprints for a single
+-- published photo, it classifies every syncable field into one of
+--   in_sync / local (darktable newer) / remote (Flickr newer) / conflict
+-- and derives, per field, whether to offer a push and/or a pull button, plus a
+-- single "push all changed" set (the safe local-newer fields only). The panel
+-- renders this model as rows; the individual push/pull actions stay wired to the
+-- existing verified code paths underneath.
+--
+-- This composes existing verified logic rather than reinventing it:
+--   * remote_pull.classify_change — the three-way baseline/local/remote verdict
+--     (#22 conflict-resolution compare).
+--   * state.reason_label / reason ordering — the friendly per-field labels (#69).
+--   * the push paths (#18/#70 metadata-only / batch push) are what "push all
+--     changed" drives.
+--
+-- Pure / offline-testable: no darktable, no network. The only optional dependency
+-- is remote_pull (for classify_change); when it is not injectable the module
+-- falls back to an inline copy of the same three-way rule so the tests and the
+-- bundle both work.
+
+local M = {}
+
+local ok_remote, remote_pull = pcall(require, "dtrmflickr.remote_pull")
+if not ok_remote then remote_pull = nil end
+
+local function norm(v)
+  return tostring(v == nil and "" or v)
+end
+
+-- Three-way classification, delegated to remote_pull when available so there is a
+-- single source of truth; the inline fallback mirrors it exactly.
+local function classify_change(stored_fp, local_fp, remote_fp)
+  if remote_pull and remote_pull.classify_change then
+    return remote_pull.classify_change(stored_fp, local_fp, remote_fp)
+  end
+  local lf, rf = norm(local_fp), norm(remote_fp)
+  if lf == rf then return "in_sync" end
+  local base = stored_fp ~= nil and tostring(stored_fp) or ""
+  if base == "" then return "conflict" end
+  local local_changed = lf ~= base
+  local remote_changed = rf ~= base
+  if local_changed and remote_changed then return "conflict" end
+  if local_changed then return "local" end
+  if remote_changed then return "remote" end
+  return "conflict"
+end
+
+-- Fixed display order so the surface reads the same way every refresh. Mirrors
+-- state.lua's reason_order (pixels are handled separately and never appear here).
+local FIELD_ORDER = {
+  "title_description", "keywords", "gps", "date_taken",
+  "visibility", "safety", "content_type", "license", "permissions",
+}
+local FIELD_RANK = {}
+for i, key in ipairs(FIELD_ORDER) do FIELD_RANK[key] = i end
+M.FIELD_ORDER = FIELD_ORDER
+
+-- Which fields can be *pulled* from Flickr back into darktable. Only
+-- title/description and keywords have a working pull path today; the rest are
+-- export-driven settings that are push-only. Callers may override per field
+-- (can_pull) but this is the default.
+local PULLABLE = {
+  title_description = true,
+  keywords = true,
+}
+M.PULLABLE = PULLABLE
+
+-- Human-friendly one-word status + the plain-language hint the panel shows next
+-- to each row. Kept here (not in state.lua) because it is surface-specific
+-- phrasing; the field *labels* still come from state.reason_label (#69).
+local STATUS_TEXT = {
+  in_sync  = { label = "in sync",       hint = "matches Flickr" },
+  ["local"] = { label = "local newer",  hint = "darktable has newer changes - push to Flickr" },
+  remote   = { label = "Flickr newer",  hint = "Flickr has newer changes - pull into darktable" },
+  conflict = { label = "conflict",      hint = "both sides changed - choose push or pull" },
+  unknown  = { label = "not compared",  hint = "compare with Flickr to see differences" },
+}
+M.STATUS_TEXT = STATUS_TEXT
+
+local VALID_STATUS = {
+  in_sync = true, ["local"] = true, remote = true, conflict = true, unknown = true,
+}
+
+-- classify_field(f): verdict for one field descriptor.
+--   f.stored_fp / f.local_fp / f.remote_fp — opaque fingerprint strings (or nil).
+--   f.remote_known — true when remote_fp reflects an actual Flickr read. When
+--     false (remote not fetched, e.g. a push-only field or before a compare) we
+--     fall back to the two-way local-vs-baseline test the "needs sync" reasons
+--     already use: differs => "local", else "in_sync". This keeps the surface
+--     honest — it never invents a "remote"/"conflict" verdict without a real
+--     remote value to back it.
+-- Returns "in_sync" / "local" / "remote" / "conflict" / "unknown".
+function M.classify_field(f)
+  f = f or {}
+  if f.remote_known then
+    return classify_change(f.stored_fp, f.local_fp, f.remote_fp)
+  end
+  -- No remote value: two-way baseline comparison only.
+  if f.stored_fp == nil then
+    -- Never published this field and no remote to compare: undetermined.
+    return norm(f.local_fp) == "" and "in_sync" or "unknown"
+  end
+  return norm(f.local_fp) == norm(f.stored_fp) and "in_sync" or "local"
+end
+
+local function label_for(key, override)
+  if override ~= nil and override ~= "" then return tostring(override) end
+  local ok_state, state = pcall(require, "dtrmflickr.state")
+  if ok_state and state and state.reason_label then return state.reason_label(key) end
+  return tostring(key)
+end
+
+-- build_model(fields): the full unified-surface model for one photo.
+--   fields — array of descriptors { key, label?, stored_fp, local_fp, remote_fp,
+--            enabled? (default true), can_pull? (default PULLABLE[key]),
+--            remote_known? (default true when remote_fp ~= nil) }.
+--            Disabled fields (a master sync toggle is off) are dropped from the
+--            surface entirely — the user manages them locally, so showing a diff
+--            would be misleading.
+-- Returns:
+--   { rows = { {key,label,status,status_label,hint,can_push,can_pull,
+--               offer_push,offer_pull,order} ... } (in FIELD_ORDER),
+--     counts = { in_sync,local,remote,conflict,unknown,total,changed },
+--     push_all = { key ... },   -- safe local-newer fields, in order
+--     any_changed = bool,        -- something is out of sync (push or pull)
+--     headline = string }        -- one-line plain summary
+-- Pure/offline-testable.
+function M.build_model(fields)
+  local rows = {}
+  local counts = { in_sync = 0, ["local"] = 0, remote = 0, conflict = 0, unknown = 0, total = 0, changed = 0 }
+  local push_all = {}
+  for _, f in ipairs(fields or {}) do
+    if f.enabled ~= false then
+      local key = tostring(f.key or "")
+      local remote_known = f.remote_known
+      if remote_known == nil then remote_known = f.remote_fp ~= nil end
+      local can_pull = f.can_pull
+      if can_pull == nil then can_pull = PULLABLE[key] == true end
+      -- A caller may supply a precomputed status when a plain fingerprint compare
+      -- is the wrong tool (e.g. keywords are a *set* — the tag reconciler's
+      -- local-only/remote-only diff classifies membership more honestly than
+      -- hashing two differently-encoded tag strings). Otherwise classify from the
+      -- fingerprints.
+      local status = f.status
+      if status == nil then
+        status = M.classify_field({
+          stored_fp = f.stored_fp, local_fp = f.local_fp, remote_fp = f.remote_fp,
+          remote_known = remote_known,
+        })
+      elseif not VALID_STATUS[status] then
+        status = "unknown"
+      end
+      local offer_push = (status == "local" or status == "conflict")
+      local offer_pull = can_pull and (status == "remote" or status == "conflict")
+      local text = STATUS_TEXT[status] or STATUS_TEXT.unknown
+      rows[#rows + 1] = {
+        key = key,
+        label = label_for(key, f.label),
+        status = status,
+        status_label = text.label,
+        hint = text.hint,
+        can_push = true,           -- every syncable field can be pushed
+        can_pull = can_pull,
+        offer_push = offer_push,
+        offer_pull = offer_pull,
+        order = FIELD_RANK[key] or (100 + #rows),
+      }
+      counts[status] = (counts[status] or 0) + 1
+      counts.total = counts.total + 1
+      if status ~= "in_sync" and status ~= "unknown" then counts.changed = counts.changed + 1 end
+      if status == "local" then push_all[#push_all + 1] = key end
+    end
+  end
+  table.sort(rows, function(a, b) return a.order < b.order end)
+  -- Keep push_all in field order too.
+  table.sort(push_all, function(a, b) return (FIELD_RANK[a] or 100) < (FIELD_RANK[b] or 100) end)
+
+  local any_changed = counts.changed > 0
+  local headline
+  if counts.total == 0 then
+    headline = "No syncable fields."
+  elseif not any_changed and counts.unknown == 0 then
+    headline = "Everything is in sync with Flickr."
+  else
+    local parts = {}
+    if counts["local"] > 0 then parts[#parts + 1] = string.format("%d to push", counts["local"]) end
+    if counts.remote > 0 then parts[#parts + 1] = string.format("%d to pull", counts.remote) end
+    if counts.conflict > 0 then parts[#parts + 1] = string.format("%d in conflict", counts.conflict) end
+    if counts.unknown > 0 then parts[#parts + 1] = string.format("%d not compared", counts.unknown) end
+    if #parts == 0 then
+      headline = "Everything is in sync with Flickr."
+    else
+      headline = table.concat(parts, ", ") .. "."
+    end
+  end
+
+  return {
+    rows = rows,
+    counts = counts,
+    push_all = push_all,
+    any_changed = any_changed,
+    headline = headline,
+  }
+end
+
+return M
+end
+
 package.preload["dtrmflickr.panel_helpers"] = function(...)
 -- panel_helpers.lua — pure parsing/control helpers for the lighttable Flickr panel.
 --
@@ -9603,6 +9817,13 @@ for i = 1, panel_sets.queue_jobs_limit do
   panel_sets.queue_jobs_rows[i] = dt.new_widget("label") { label = "" }
 end
 panel_sets.queue_uncertain_label = dt.new_widget("label") { label = "" }
+-- Unified sync surface (issue #87): one diff-driven summary of every syncable
+-- field's state (in sync / local newer / Flickr newer / conflict) for the
+-- selected published photo, plus a "push all changed" button. Composes the
+-- already-verified per-field push/pull paths; the pure model lives in
+-- dtrmflickr.sync_surface. Kept on panel_sets (table field) to respect Lua's
+-- per-function main-chunk local limit (see CLAUDE.md).
+panel_sets.sync_surface_label = dt.new_widget("label") { label = "" }
 -- Per-action confirm gate for the destructive "delete from Flickr" button
 -- (issue #19): the button refuses unless this is checked, and it is reset after
 -- every attempt so each deletion requires a deliberate re-check.
@@ -9944,6 +10165,8 @@ local function panel_reset_remote(message)
   panel_remote_label.label = message or ""
   panel_tags_label.label = ""
   panel_stats_label.label = ""
+  if panel_sets.sync_surface_label then panel_sets.sync_surface_label.label = "" end
+  panel_sets.sync_model = nil
   if panel_reconcile.reset then panel_reconcile.reset() end
   panel_loading = true
   panel_privacy_widget.selected = 0
@@ -10761,6 +10984,9 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
     and string.format(_("Flickr tags: %s"), table.concat(remote_tags, ", "))
     or _("Flickr tags: none")
   if panel_reconcile.refresh then panel_reconcile.refresh(panel_current.image, remote_tags) end
+  -- Unified sync surface (#87): recompute the one-view diff summary from the same
+  -- getInfo body + the just-refreshed reconciler diff, no extra request.
+  if panel_sets.refresh_sync_surface then panel_sets.refresh_sync_surface(body) end
   panel_loading = false
   panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
   panel_privacy_widget.sensitive = acc ~= nil
@@ -11369,6 +11595,117 @@ function panel_sets.compare_remote_meta()
 
   panel_remote_label.label = remote_pull.conflict_summary(status, fields)
   dt.print(panel_remote_label.label)
+end
+
+-- Unified sync surface (issue #87): fold the scattered per-field sync/compare/push
+-- controls into one diff-driven summary for the selected published photo. Reuses
+-- the getInfo body the panel already fetched on load (`body`) so it costs no extra
+-- request. Classifies each syncable field:
+--   * title/description — three-way (baseline/local/remote) via the SAME
+--     fingerprints compare_remote_meta uses (#22 conflict detection).
+--   * keywords          — set diff via the tag reconciler (#3): local-only ->
+--     push, remote-only -> pull, both -> conflict, neither -> in sync. A set diff
+--     is more honest than hashing two differently-encoded tag strings.
+--   * GPS / date taken  — push-only two-way (local vs last-published baseline);
+--     these have no working pull path today.
+-- The pure aggregation/verdict lives in dtrmflickr.sync_surface (offline-tested).
+-- Renders into panel_sets.sync_surface_label and stashes the model so
+-- push_all_changed can act on it. Live-gated (panel paint needs in-app verify).
+function panel_sets.refresh_sync_surface(body)
+  local surface = require("dtrmflickr.sync_surface")
+  local acc, image = panel_current.account, panel_current.image
+  panel_sets.sync_model = nil
+  if not image or not acc then
+    panel_sets.sync_surface_label.label = ""
+    return
+  end
+  local sync = master_sync_fields()
+  local local_fps = effective_metadata_fingerprints(image, sync) or {}
+  local fields = {}
+
+  if sync.title or sync.description then
+    local remote = body and remote_pull.parse_info(body) or nil
+    local remote_fp = remote and metadata.fingerprints_from_values({
+      include_title_description = true,
+      title = sync.title and (remote.title or "") or nil,
+      description = sync.description and (remote.description or "") or nil,
+    }).title_description or nil
+    fields[#fields + 1] = {
+      key = "title_description",
+      stored_fp = state.get_fingerprint(image, acc.nsid, "title_description"),
+      local_fp = local_fps.title_description,
+      remote_fp = remote_fp,
+      remote_known = remote ~= nil,
+      can_pull = true,
+    }
+  end
+
+  if sync.tags then
+    -- The reconciler's diff was refreshed from the same getInfo body on load.
+    local d = panel_reconcile and panel_reconcile.diff or nil
+    local kw_status = "unknown"
+    if d then
+      local lo = #(d.local_only or {})
+      local ro = #(d.remote_only or {})
+      if lo == 0 and ro == 0 then kw_status = "in_sync"
+      elseif ro == 0 then kw_status = "local"
+      elseif lo == 0 then kw_status = "remote"
+      else kw_status = "conflict" end
+    end
+    fields[#fields + 1] = { key = "keywords", status = kw_status, can_pull = true }
+  end
+
+  if sync.gps then
+    fields[#fields + 1] = {
+      key = "gps",
+      stored_fp = state.get_fingerprint(image, acc.nsid, "gps"),
+      local_fp = local_fps.gps,
+      remote_known = false,
+    }
+  end
+  if sync.date_taken then
+    fields[#fields + 1] = {
+      key = "date_taken",
+      stored_fp = state.get_fingerprint(image, acc.nsid, "date_taken"),
+      local_fp = local_fps.date_taken,
+      remote_known = false,
+    }
+  end
+
+  local model = surface.build_model(fields)
+  panel_sets.sync_model = model
+  local lines = { model.headline }
+  for _, r in ipairs(model.rows) do
+    lines[#lines + 1] = string.format("  %s: %s", r.label, r.status_label)
+  end
+  panel_sets.sync_surface_label.label = table.concat(lines, "\n")
+end
+
+-- "Push all changed" (issue #87): push every field the unified surface classified
+-- as local-newer, driving the existing verified single-field push paths. Skips
+-- conflicts (they need an explicit user choice) and pull-only remote-newer fields.
+-- GPS and date-taken both route through sync_geo_date, so that path runs at most
+-- once. After pushing, the panel's normal remote reload recomputes the surface.
+function panel_sets.push_all_changed()
+  local model = panel_sets.sync_model
+  if not model or #(model.push_all or {}) == 0 then
+    dt.print(_("Flickr: nothing to push — everything is in sync (or needs a compare)."))
+    return
+  end
+  local did_geo = false
+  local pushed = {}
+  for _, key in ipairs(model.push_all) do
+    if key == "title_description" then
+      sync_panel_meta(); pushed[#pushed + 1] = _("title/description")
+    elseif key == "keywords" then
+      sync_panel_tags(); pushed[#pushed + 1] = _("keywords")
+    elseif (key == "gps" or key == "date_taken") and not did_geo then
+      did_geo = true; panel_sets.sync_geo_date(); pushed[#pushed + 1] = _("GPS/date taken")
+    end
+  end
+  if #pushed > 0 then
+    dt.print(string.format(_("Flickr: pushed %s"), table.concat(pushed, ", ")))
+  end
 end
 
 -- Single-image GPS / date-taken resend (issue #18). Mirrors sync_panel_meta /
@@ -12619,6 +12956,16 @@ local panel_tab_stack = dt.new_widget("stack") {
   dt.new_widget("box") {
     orientation = "vertical",
     panel_remote_label,
+    -- Unified sync surface (#87): lead the meta tab with one diff-driven summary of
+    -- every syncable field's state + a single "push all changed". The individual
+    -- push/pull/compare buttons stay available below for per-field control.
+    dt.new_widget("label") { label = _("sync status") },
+    panel_sets.sync_surface_label,
+    dt.new_widget("button") {
+      label = _("push all changed"),
+      tooltip = _("push every field the sync status shows as 'local newer' to Flickr in one click (title/description, keywords, GPS/date taken as applicable). Conflicts and Flickr-newer fields are left for you to resolve per-field below."),
+      clicked_callback = function() panel_sets.push_all_changed() end,
+    },
     panel_tags_label,
     panel_sets.batch_indicator_label,
     panel_privacy_widget,
