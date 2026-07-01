@@ -12525,8 +12525,8 @@ local panel_tab_stack = dt.new_widget("stack") {
     panel_comment_perm_widget,
     panel_addmeta_perm_widget,
     dt.new_widget("button") {
-      label = _("save"),
-      tooltip = _("apply the settings comboboxes to the published photo; with more than one image selected, save applies your changes to every selected published photo (two-click confirm)"),
+      label = _("save settings"),
+      tooltip = _("apply the Flickr settings comboboxes above (privacy, safety, content type, license, comment/metadata permissions) to the published photo; with more than one image selected, applies to every selected published photo (two-click confirm). Other tabs' actions apply immediately on click and need no save."),
       clicked_callback = function()
         -- Dispatch by selection size (issue #49): one image keeps the verified
         -- single-image path untouched; >1 routes to the batch applier with
@@ -12553,10 +12553,6 @@ local panel_tab_stack = dt.new_widget("stack") {
       clicked_callback = function() panel_sets.compare_remote_meta() end,
     },
     dt.new_widget("button") {
-      label = _("sync keywords"),
-      clicked_callback = function() sync_panel_tags() end,
-    },
-    dt.new_widget("button") {
       label = _("sync GPS/date taken"),
       tooltip = _("push darktable GPS location and date taken to the linked Flickr photo without re-uploading"),
       clicked_callback = function() panel_sets.sync_geo_date() end,
@@ -12566,17 +12562,15 @@ local panel_tab_stack = dt.new_widget("stack") {
       tooltip = _("remove the geotag/location from the selected published photo(s) on Flickr (privacy); idempotent and does not re-upload"),
       clicked_callback = function() panel_sets.remove_geo_location() end,
     },
-    dt.new_widget("label") { label = _("people tags") },
-    panel_sets.people_entry,
-    dt.new_widget("button") {
-      label = _("tag people"),
-      tooltip = _("add the listed Flickr members (usernames or emails) to the selected published photo without re-uploading"),
-      clicked_callback = function() panel_sets.tag_people() end,
-    },
   },
-  -- 2: tags — the tag reconciler (issue #3)
+  -- 2: keywords — sync darktable keywords + the tag reconciler (issue #3)
   dt.new_widget("box") {
     orientation = "vertical",
+    dt.new_widget("button") {
+      label = _("sync keywords"),
+      tooltip = _("push the local darktable keywords to the linked Flickr photo's tags"),
+      clicked_callback = function() sync_panel_tags() end,
+    },
     dt.new_widget("label") { label = _("tag reconciler") },
     panel_reconcile.diff_label,
     dt.new_widget("box") {
@@ -12607,7 +12601,18 @@ local panel_tab_stack = dt.new_widget("stack") {
       },
     },
   },
-  -- 3: albums — albums + groups/pools
+  -- 3: people — people tags (issue #24)
+  dt.new_widget("box") {
+    orientation = "vertical",
+    dt.new_widget("label") { label = _("people tags") },
+    panel_sets.people_entry,
+    dt.new_widget("button") {
+      label = _("tag people"),
+      tooltip = _("add the listed Flickr members (usernames or emails) to the selected published photo without re-uploading"),
+      clicked_callback = function() panel_sets.tag_people() end,
+    },
+  },
+  -- 4: albums — albums + groups/pools
   dt.new_widget("box") {
     orientation = "vertical",
     panel_sets_label,
@@ -12703,7 +12708,7 @@ local panel_tab_stack = dt.new_widget("stack") {
     panel_pools.match_widget,
     panel_pools.status_label,
   },
-  -- 4: link — the linked photo's URL, plus photo link / claim / batch claim
+  -- 5: link — the linked photo's URL, plus photo link / claim / batch claim
   dt.new_widget("box") {
     orientation = "vertical",
     panel_sets.url_label,
@@ -12737,7 +12742,7 @@ local panel_tab_stack = dt.new_widget("stack") {
       clicked_callback = function() panel_sets.batch_claim_from_list() end,
     },
   },
-  -- 5: publish — publish-state actions + destructive delete
+  -- 6: publish — publish-state actions + destructive delete
   dt.new_widget("box") {
     orientation = "vertical",
     dt.new_widget("box") {
@@ -12765,10 +12770,6 @@ local panel_tab_stack = dt.new_widget("stack") {
       tooltip = _("resend only the changed, sync-enabled metadata (title/description, keywords, GPS, date taken) for every selected published photo, without re-uploading pixels"),
       clicked_callback = function() panel_sets.push_selected_metadata() end,
     },
-    dt.new_widget("button") {
-      label = _("refresh"),
-      clicked_callback = function() refresh_panel(true, true) end,
-    },
     -- Destructive delete section (issue #19): the confirm checkbox gates the
     -- button, which permanently removes the photo from Flickr and forgets the
     -- local link. Needs a delete-scope login (Lua options > 'request delete
@@ -12780,7 +12781,7 @@ local panel_tab_stack = dt.new_widget("stack") {
       clicked_callback = function() panel_sets.delete_selected() end,
     },
   },
-  -- 6: jobs — the live queue job-lifecycle grid (issue #56)
+  -- 7: jobs — the live queue job-lifecycle grid (issue #56)
   dt.new_widget("box") {
     orientation = "vertical",
     panel_sets.queue_label,
@@ -12805,40 +12806,55 @@ local panel_widget = dt.new_widget("box") {
     orientation = "horizontal",
     dt.new_widget("button") {
       label = _("meta"),
-      tooltip = _("Flickr settings + title/description/keyword/GPS sync + people tags"),
+      tooltip = _("Flickr settings (privacy/safety/license/…) + title/description sync + GPS/date"),
       clicked_callback = function() panel_tab_stack.active = 1; panel_tab_label.label = _("section: meta") end,
     },
     dt.new_widget("button") {
-      label = _("tags"),
-      tooltip = _("tag reconciler: local keywords vs Flickr tags"),
-      clicked_callback = function() panel_tab_stack.active = 2; panel_tab_label.label = _("section: tags") end,
+      label = _("keywords"),
+      tooltip = _("sync keywords + tag reconciler: local keywords vs Flickr tags"),
+      clicked_callback = function() panel_tab_stack.active = 2; panel_tab_label.label = _("section: keywords") end,
+    },
+    dt.new_widget("button") {
+      label = _("people"),
+      tooltip = _("people tags: add Flickr members to the photo"),
+      clicked_callback = function() panel_tab_stack.active = 3; panel_tab_label.label = _("section: people") end,
     },
     dt.new_widget("button") {
       label = _("albums"),
       tooltip = _("albums and groups/pools"),
-      clicked_callback = function() panel_tab_stack.active = 3; panel_tab_label.label = _("section: albums") end,
+      clicked_callback = function() panel_tab_stack.active = 4; panel_tab_label.label = _("section: albums") end,
     },
   },
   dt.new_widget("box") {
     orientation = "horizontal",
     dt.new_widget("button") {
       label = _("link"),
-      tooltip = _("link/claim this image to an existing Flickr photo"),
-      clicked_callback = function() panel_tab_stack.active = 4; panel_tab_label.label = _("section: link") end,
+      tooltip = _("the linked photo's URL + link/claim this image to an existing Flickr photo"),
+      clicked_callback = function() panel_tab_stack.active = 5; panel_tab_label.label = _("section: link") end,
     },
     dt.new_widget("button") {
       label = _("publish"),
-      tooltip = _("publish-state actions, push metadata, refresh, delete"),
-      clicked_callback = function() panel_tab_stack.active = 5; panel_tab_label.label = _("section: publish") end,
+      tooltip = _("publish-state actions, push metadata, delete"),
+      clicked_callback = function() panel_tab_stack.active = 6; panel_tab_label.label = _("section: publish") end,
     },
     dt.new_widget("button") {
       label = _("jobs"),
       tooltip = _("live upload/queue job tracker"),
-      clicked_callback = function() panel_tab_stack.active = 6; panel_tab_label.label = _("section: jobs") end,
+      clicked_callback = function() panel_tab_stack.active = 7; panel_tab_label.label = _("section: jobs") end,
     },
   },
   panel_tab_label,
   panel_tab_stack,
+  -- Persistent footer (issue #82): common actions that apply regardless of the
+  -- active tab live below the stack so they're always reachable. "refresh"
+  -- reloads the panel for the current selection. (Unlike "save settings", which
+  -- is meta-specific because only that tab holds the settings comboboxes; every
+  -- other tab's actions apply immediately on click.)
+  dt.new_widget("button") {
+    label = _("refresh"),
+    tooltip = _("reload the panel for the current selection — available on every tab"),
+    clicked_callback = function() refresh_panel(true, true) end,
+  },
 }
 -- Open on the meta tab by default.
 panel_tab_stack.active = 1
