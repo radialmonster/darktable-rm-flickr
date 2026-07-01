@@ -7936,6 +7936,28 @@ local function publish_dashboard(entries, opts)
 end
 M.publish_dashboard = publish_dashboard
 
+-- Selection summary for the panel header (issue #85). For a single (or empty)
+-- selection there is nothing to summarize, so return the plain "selected" that
+-- the single-image path has always shown. For a multi-selection, report how many
+-- of the selected images are published vs not, so the user sees the batch shape
+-- before invoking a batch action. `resolve_photo_id(img)` returns the stored
+-- Flickr photo id for an image (or nil/"" if not published); it is injected so
+-- this helper stays pure and unit-testable.
+local function selection_summary(selection, resolve_photo_id, translate)
+  local tr = translate or function(s) return s end
+  local total = selection and #selection or 0
+  if total <= 1 then return tr("selected") end
+  local published = 0
+  for i = 1, total do
+    local pid = resolve_photo_id and resolve_photo_id(selection[i]) or nil
+    if pid and pid ~= "" then published = published + 1 end
+  end
+  -- middot separator matches the stats line style elsewhere in the panel.
+  return string.format(tr("%d selected · %d published, %d not"),
+    total, published, total - published)
+end
+M.selection_summary = selection_summary
+
 return M
 end
 
@@ -12204,8 +12226,15 @@ function refresh_panel(force, fetch_remote)
   end
 
   local acc = load_token()
-  local count_suffix = #selection > 1 and string.format(_(" (+%d more selected)"), #selection - 1) or ""
-  panel_status_label.label = _("selected") .. count_suffix
+  -- Header selection summary (issue #85): for >1 selected show how many are
+  -- published vs not, so the batch shape is visible before a batch action. The
+  -- resolver reads the stored photo id for the active account (or any account
+  -- when logged out) so the count matches what a batch action would touch.
+  panel_status_label.label = panel_helpers.selection_summary(selection, function(img)
+    if acc then return state.get_photo_id(img, acc.nsid) end
+    local _nsid, pid = state.get_any_photo_id(img)
+    return pid
+  end, _)
   panel_file_label.label = string.format(_("file: %s"), image.filename or "?")
 
   if not acc then
@@ -12516,7 +12545,6 @@ local panel_tab_stack = dt.new_widget("stack") {
     orientation = "vertical",
     panel_remote_label,
     panel_tags_label,
-    panel_stats_label,
     panel_sets.batch_indicator_label,
     panel_privacy_widget,
     panel_safety_widget,
@@ -12804,6 +12832,10 @@ local panel_widget = dt.new_widget("box") {
   panel_photo_label,
   panel_sets.publish_label,
   panel_sets.dashboard_label,
+  -- Remote stats (views/faves/comments/upload date, #9) live in the always-visible
+  -- header so a Flickr user sees them regardless of the active tab (#85, "lead
+  -- with state"). Populated on remote load; blank until then.
+  panel_stats_label,
   -- Tab bar (issue #82): two rows of buttons switch panel_tab_stack. Two rows
   -- keep the short labels readable in a narrow lighttable panel.
   dt.new_widget("box") {
