@@ -12502,8 +12502,291 @@ do
   panel_sets.queue_jobs_box = dt.new_widget("box")(children)
 end
 
+-- Tabbed panel layout (issue #82). darktable's Lua widget API has no GtkNotebook
+-- (that is C-only, via dt_ui_notebook_new), so "tabs" are a `stack` (shows one
+-- child at a time) switched by a row of tab buttons. Each stack page is a
+-- vertical box of the sections that used to be stacked flat; only layout changed,
+-- every widget/callback is the same object as before. Pages are built inline so
+-- they cost no main-chunk locals (only the stack + its status label are named).
+local panel_tab_label = dt.new_widget("label") { label = _("section: meta") }
+
+local panel_tab_stack = dt.new_widget("stack") {
+  -- 1: meta — Flickr settings + title/description/keyword/GPS sync + people tags
+  dt.new_widget("box") {
+    orientation = "vertical",
+    panel_remote_label,
+    panel_tags_label,
+    panel_stats_label,
+    panel_sets.batch_indicator_label,
+    panel_privacy_widget,
+    panel_safety_widget,
+    panel_content_type_widget,
+    panel_license_widget,
+    panel_comment_perm_widget,
+    panel_addmeta_perm_widget,
+    dt.new_widget("button") {
+      label = _("save"),
+      tooltip = _("apply the settings comboboxes to the published photo; with more than one image selected, save applies your changes to every selected published photo (two-click confirm)"),
+      clicked_callback = function()
+        -- Dispatch by selection size (issue #49): one image keeps the verified
+        -- single-image path untouched; >1 routes to the batch applier with
+        -- two-click confirmation.
+        if (panel_current.selection_count or 0) > 1 then
+          panel_sets.apply_settings_to_selection()
+        else
+          save_panel_settings()
+        end
+      end,
+    },
+    dt.new_widget("button") {
+      label = _("sync title/description"),
+      clicked_callback = function() sync_panel_meta() end,
+    },
+    dt.new_widget("button") {
+      label = _("pull title/description from Flickr"),
+      tooltip = _("overwrite the local title/description with the linked Flickr photo's current values (only fields whose sync toggle is on; tags use the reconciler)"),
+      clicked_callback = function() panel_sets.pull_remote_meta() end,
+    },
+    dt.new_widget("button") {
+      label = _("compare title/description with Flickr"),
+      tooltip = _("show local vs Flickr title/description side by side and advise whether to push (sync), pull, or leave as-is; detects edit conflicts where both sides changed since the last publish. Read-only — changes nothing."),
+      clicked_callback = function() panel_sets.compare_remote_meta() end,
+    },
+    dt.new_widget("button") {
+      label = _("sync keywords"),
+      clicked_callback = function() sync_panel_tags() end,
+    },
+    dt.new_widget("button") {
+      label = _("sync GPS/date taken"),
+      tooltip = _("push darktable GPS location and date taken to the linked Flickr photo without re-uploading"),
+      clicked_callback = function() panel_sets.sync_geo_date() end,
+    },
+    dt.new_widget("button") {
+      label = _("remove Flickr location"),
+      tooltip = _("remove the geotag/location from the selected published photo(s) on Flickr (privacy); idempotent and does not re-upload"),
+      clicked_callback = function() panel_sets.remove_geo_location() end,
+    },
+    dt.new_widget("label") { label = _("people tags") },
+    panel_sets.people_entry,
+    dt.new_widget("button") {
+      label = _("tag people"),
+      tooltip = _("add the listed Flickr members (usernames or emails) to the selected published photo without re-uploading"),
+      clicked_callback = function() panel_sets.tag_people() end,
+    },
+  },
+  -- 2: tags — the tag reconciler (issue #3)
+  dt.new_widget("box") {
+    orientation = "vertical",
+    dt.new_widget("label") { label = _("tag reconciler") },
+    panel_reconcile.diff_label,
+    dt.new_widget("box") {
+      orientation = "horizontal",
+      dt.new_widget("button") {
+        label = _("add local-only to Flickr"),
+        tooltip = _("add darktable keywords that are not yet on Flickr, keeping existing Flickr tags"),
+        clicked_callback = function() panel_reconcile.add_local_only() end,
+      },
+      dt.new_widget("button") {
+        label = _("pull Flickr-only to darktable"),
+        tooltip = _("attach Flickr tags that are not yet local as darktable keywords"),
+        clicked_callback = function() panel_reconcile.pull_remote_only() end,
+      },
+    },
+    panel_reconcile.remove_widget,
+    dt.new_widget("box") {
+      orientation = "horizontal",
+      dt.new_widget("button") {
+        label = _("remove tag"),
+        tooltip = _("delete the chosen Flickr tag from this photo"),
+        clicked_callback = function() panel_reconcile.remove_selected() end,
+      },
+      dt.new_widget("button") {
+        label = _("replace Flickr tags from local"),
+        tooltip = _("replace ALL Flickr tags with the current local keyword set"),
+        clicked_callback = function() panel_reconcile.replace_from_local() end,
+      },
+    },
+  },
+  -- 3: albums — albums + groups/pools
+  dt.new_widget("box") {
+    orientation = "vertical",
+    panel_sets_label,
+    dt.new_widget("label") { label = _("albums") },
+    dt.new_widget("box") {
+      orientation = "horizontal",
+      dt.new_widget("button") {
+        label = _("refresh albums"),
+        clicked_callback = function() panel_sets.refresh_list() end,
+      },
+      dt.new_widget("button") {
+        label = _("sync memberships"),
+        clicked_callback = function() panel_sets.refresh_memberships() end,
+      },
+    },
+    dt.new_widget("label") { label = _("add existing album") },
+    panel_sets.entry,
+    dt.new_widget("box") {
+      orientation = "horizontal",
+      dt.new_widget("button") {
+        label = _("search albums"),
+        clicked_callback = function() panel_sets.search() end,
+      },
+      dt.new_widget("button") {
+        label = _("add existing album"),
+        tooltip = _("add the typed album(s) to the published photo; with more than one image selected, files every selected published photo into them (idempotent)"),
+        clicked_callback = function()
+          -- Dispatch by selection size (issue #49): one image keeps the single
+          -- add() path; >1 files the whole selection into the album(s).
+          if (panel_current.selection_count or 0) > 1 then
+            panel_sets.add_to_selection()
+          else
+            panel_sets.add()
+          end
+        end,
+      },
+    },
+    panel_sets.match_widget,
+    panel_sets.membership_label,
+    panel_sets.current_widget,
+    dt.new_widget("box") {
+      orientation = "horizontal",
+      dt.new_widget("button") {
+        label = _("set as cover"),
+        tooltip = _("set this photo as the cover (primary photo) of the chosen album"),
+        clicked_callback = function() panel_sets.set_cover() end,
+      },
+      dt.new_widget("button") {
+        label = _("move to front"),
+        tooltip = _("move this photo to the front of the chosen album; the album's other photos keep their order"),
+        clicked_callback = function() panel_sets.move_to_front() end,
+      },
+      dt.new_widget("button") {
+        label = _("remove selected album"),
+        clicked_callback = function() panel_sets.remove_selected() end,
+      },
+    },
+    dt.new_widget("label") { label = _("create new album") },
+    panel_sets.new_entry,
+    dt.new_widget("box") {
+      orientation = "horizontal",
+      dt.new_widget("button") {
+        label = _("create album"),
+        tooltip = _("create a new album containing the current published photo"),
+        clicked_callback = function() panel_sets.create() end,
+      },
+      dt.new_widget("button") {
+        label = _("create from selection"),
+        tooltip = _("create a new album from every published image in the current selection"),
+        clicked_callback = function() panel_sets.create_from_selection() end,
+      },
+    },
+    panel_sets.status_label,
+    dt.new_widget("label") { label = _("groups / pools") },
+    panel_pools.entry,
+    dt.new_widget("box") {
+      orientation = "horizontal",
+      dt.new_widget("button") {
+        label = _("refresh groups"),
+        tooltip = _("fetch the Flickr groups you can submit photos to"),
+        clicked_callback = function() panel_pools.refresh_list() end,
+      },
+      dt.new_widget("button") {
+        label = _("search groups"),
+        clicked_callback = function() panel_pools.search() end,
+      },
+      dt.new_widget("button") {
+        label = _("submit to group(s)"),
+        tooltip = _("submit the selected published photo to the typed/selected group pool(s)"),
+        clicked_callback = function() panel_pools.submit() end,
+      },
+    },
+    panel_pools.match_widget,
+    panel_pools.status_label,
+  },
+  -- 4: link — photo link / claim / batch claim
+  dt.new_widget("box") {
+    orientation = "vertical",
+    dt.new_widget("label") { label = _("photo link") },
+    panel_photo_id_entry,
+    dt.new_widget("box") {
+      orientation = "horizontal",
+      panel_sets.claim_existing_button,
+      panel_sets.set_link_button,
+      dt.new_widget("button") {
+        label = _("clear link"),
+        clicked_callback = function() clear_panel_photo_id_link() end,
+      },
+    },
+    panel_sets.candidate_widget,
+    dt.new_widget("button") {
+      label = _("link chosen candidate"),
+      tooltip = _("link the selected image to the candidate chosen above"),
+      clicked_callback = function() panel_sets.link_candidate() end,
+    },
+    dt.new_widget("label") { label = _("batch claim from list") },
+    panel_sets.batch_claim_entry,
+    dt.new_widget("button") {
+      label = _("batch claim from list"),
+      tooltip = _("link the selected images, in order, to the pasted Flickr photo IDs/URLs"),
+      clicked_callback = function() panel_sets.batch_claim_from_list() end,
+    },
+  },
+  -- 5: publish — publish-state actions + destructive delete
+  dt.new_widget("box") {
+    orientation = "vertical",
+    dt.new_widget("box") {
+      orientation = "horizontal",
+      dt.new_widget("button") {
+        label = _("mark needs sync"),
+        clicked_callback = function() panel_sets.mark_needs_republish() end,
+      },
+      dt.new_widget("button") {
+        label = _("clear needs sync"),
+        clicked_callback = function() panel_sets.clear_needs_republish() end,
+      },
+    },
+    dt.new_widget("button") {
+      label = _("mark as published"),
+      tooltip = _("re-mark the linked photo(s) as published/current without re-uploading; reconciles drifted state"),
+      clicked_callback = function() panel_sets.mark_published_selection() end,
+    },
+    dt.new_widget("button") {
+      label = _("scan selected"),
+      clicked_callback = function() panel_sets.scan_selected_publish_state() end,
+    },
+    dt.new_widget("button") {
+      label = _("push metadata to selected"),
+      tooltip = _("resend only the changed, sync-enabled metadata (title/description, keywords, GPS, date taken) for every selected published photo, without re-uploading pixels"),
+      clicked_callback = function() panel_sets.push_selected_metadata() end,
+    },
+    dt.new_widget("button") {
+      label = _("refresh"),
+      clicked_callback = function() refresh_panel(true, true) end,
+    },
+    -- Destructive delete section (issue #19): the confirm checkbox gates the
+    -- button, which permanently removes the photo from Flickr and forgets the
+    -- local link. Needs a delete-scope login (Lua options > 'request delete
+    -- permission on next login').
+    panel_sets.delete_confirm,
+    dt.new_widget("button") {
+      label = _("delete from Flickr"),
+      tooltip = _("permanently delete the selected published photo from Flickr and clear its local link; requires a delete-permission login and the confirm checkbox above"),
+      clicked_callback = function() panel_sets.delete_selected() end,
+    },
+  },
+  -- 6: jobs — the live queue job-lifecycle grid (issue #56)
+  dt.new_widget("box") {
+    orientation = "vertical",
+    panel_sets.queue_label,
+    panel_sets.queue_detail_label,
+    panel_sets.queue_jobs_box,
+  },
+}
+
 local panel_widget = dt.new_widget("box") {
   orientation = "vertical",
+  -- Always-visible header: what is selected + its publish/sync state, so the
+  -- context stays put no matter which tab is showing.
   panel_status_label,
   panel_file_label,
   panel_account_label,
@@ -12516,253 +12799,49 @@ local panel_widget = dt.new_widget("box") {
   },
   panel_sets.publish_label,
   panel_sets.dashboard_label,
-  panel_sets.queue_label,
-  panel_sets.queue_detail_label,
-  panel_sets.queue_jobs_box,
-  panel_sets_label,
-  dt.new_widget("label") { label = _("albums") },
+  -- Tab bar (issue #82): two rows of buttons switch panel_tab_stack. Two rows
+  -- keep the short labels readable in a narrow lighttable panel.
   dt.new_widget("box") {
     orientation = "horizontal",
     dt.new_widget("button") {
-      label = _("refresh albums"),
-      clicked_callback = function() panel_sets.refresh_list() end,
+      label = _("meta"),
+      tooltip = _("Flickr settings + title/description/keyword/GPS sync + people tags"),
+      clicked_callback = function() panel_tab_stack.active = 1; panel_tab_label.label = _("section: meta") end,
     },
     dt.new_widget("button") {
-      label = _("sync memberships"),
-      clicked_callback = function() panel_sets.refresh_memberships() end,
-    },
-  },
-  dt.new_widget("label") { label = _("add existing album") },
-  panel_sets.entry,
-  dt.new_widget("box") {
-    orientation = "horizontal",
-    dt.new_widget("button") {
-      label = _("search albums"),
-      clicked_callback = function() panel_sets.search() end,
+      label = _("tags"),
+      tooltip = _("tag reconciler: local keywords vs Flickr tags"),
+      clicked_callback = function() panel_tab_stack.active = 2; panel_tab_label.label = _("section: tags") end,
     },
     dt.new_widget("button") {
-      label = _("add existing album"),
-      tooltip = _("add the typed album(s) to the published photo; with more than one image selected, files every selected published photo into them (idempotent)"),
-      clicked_callback = function()
-        -- Dispatch by selection size (issue #49): one image keeps the single
-        -- add() path; >1 files the whole selection into the album(s).
-        if (panel_current.selection_count or 0) > 1 then
-          panel_sets.add_to_selection()
-        else
-          panel_sets.add()
-        end
-      end,
-    },
-  },
-  panel_sets.match_widget,
-  panel_sets.membership_label,
-  panel_sets.current_widget,
-  dt.new_widget("box") {
-    orientation = "horizontal",
-    dt.new_widget("button") {
-      label = _("set as cover"),
-      tooltip = _("set this photo as the cover (primary photo) of the chosen album"),
-      clicked_callback = function() panel_sets.set_cover() end,
-    },
-    dt.new_widget("button") {
-      label = _("move to front"),
-      tooltip = _("move this photo to the front of the chosen album; the album's other photos keep their order"),
-      clicked_callback = function() panel_sets.move_to_front() end,
-    },
-    dt.new_widget("button") {
-      label = _("remove selected album"),
-      clicked_callback = function() panel_sets.remove_selected() end,
-    },
-  },
-  dt.new_widget("label") { label = _("create new album") },
-  panel_sets.new_entry,
-  dt.new_widget("box") {
-    orientation = "horizontal",
-    dt.new_widget("button") {
-      label = _("create album"),
-      tooltip = _("create a new album containing the current published photo"),
-      clicked_callback = function() panel_sets.create() end,
-    },
-    dt.new_widget("button") {
-      label = _("create from selection"),
-      tooltip = _("create a new album from every published image in the current selection"),
-      clicked_callback = function() panel_sets.create_from_selection() end,
-    },
-  },
-  panel_sets.status_label,
-  dt.new_widget("label") { label = _("groups / pools") },
-  panel_pools.entry,
-  dt.new_widget("box") {
-    orientation = "horizontal",
-    dt.new_widget("button") {
-      label = _("refresh groups"),
-      tooltip = _("fetch the Flickr groups you can submit photos to"),
-      clicked_callback = function() panel_pools.refresh_list() end,
-    },
-    dt.new_widget("button") {
-      label = _("search groups"),
-      clicked_callback = function() panel_pools.search() end,
-    },
-    dt.new_widget("button") {
-      label = _("submit to group(s)"),
-      tooltip = _("submit the selected published photo to the typed/selected group pool(s)"),
-      clicked_callback = function() panel_pools.submit() end,
-    },
-  },
-  panel_pools.match_widget,
-  panel_pools.status_label,
-  dt.new_widget("label") { label = _("photo link") },
-  panel_photo_id_entry,
-  dt.new_widget("box") {
-    orientation = "horizontal",
-    panel_sets.claim_existing_button,
-    panel_sets.set_link_button,
-    dt.new_widget("button") {
-      label = _("clear link"),
-      clicked_callback = function() clear_panel_photo_id_link() end,
-    },
-  },
-  panel_sets.candidate_widget,
-  dt.new_widget("button") {
-    label = _("link chosen candidate"),
-    tooltip = _("link the selected image to the candidate chosen above"),
-    clicked_callback = function() panel_sets.link_candidate() end,
-  },
-  dt.new_widget("label") { label = _("batch claim from list") },
-  panel_sets.batch_claim_entry,
-  dt.new_widget("button") {
-    label = _("batch claim from list"),
-    tooltip = _("link the selected images, in order, to the pasted Flickr photo IDs/URLs"),
-    clicked_callback = function() panel_sets.batch_claim_from_list() end,
-  },
-  panel_remote_label,
-  panel_tags_label,
-  panel_stats_label,
-  panel_sets.batch_indicator_label,
-  panel_privacy_widget,
-  panel_safety_widget,
-  panel_content_type_widget,
-  panel_license_widget,
-  panel_comment_perm_widget,
-  panel_addmeta_perm_widget,
-  dt.new_widget("button") {
-    label = _("save"),
-    tooltip = _("apply the settings comboboxes to the published photo; with more than one image selected, save applies your changes to every selected published photo (two-click confirm)"),
-    clicked_callback = function()
-      -- Dispatch by selection size (issue #49): one image keeps the verified
-      -- single-image path untouched; >1 routes to the batch applier with
-      -- two-click confirmation.
-      if (panel_current.selection_count or 0) > 1 then
-        panel_sets.apply_settings_to_selection()
-      else
-        save_panel_settings()
-      end
-    end,
-  },
-  dt.new_widget("button") {
-    label = _("sync title/description"),
-    clicked_callback = function() sync_panel_meta() end,
-  },
-  dt.new_widget("button") {
-    label = _("pull title/description from Flickr"),
-    tooltip = _("overwrite the local title/description with the linked Flickr photo's current values (only fields whose sync toggle is on; tags use the reconciler)"),
-    clicked_callback = function() panel_sets.pull_remote_meta() end,
-  },
-  dt.new_widget("button") {
-    label = _("compare title/description with Flickr"),
-    tooltip = _("show local vs Flickr title/description side by side and advise whether to push (sync), pull, or leave as-is; detects edit conflicts where both sides changed since the last publish. Read-only — changes nothing."),
-    clicked_callback = function() panel_sets.compare_remote_meta() end,
-  },
-  dt.new_widget("button") {
-    label = _("sync keywords"),
-    clicked_callback = function() sync_panel_tags() end,
-  },
-  dt.new_widget("button") {
-    label = _("sync GPS/date taken"),
-    tooltip = _("push darktable GPS location and date taken to the linked Flickr photo without re-uploading"),
-    clicked_callback = function() panel_sets.sync_geo_date() end,
-  },
-  dt.new_widget("button") {
-    label = _("remove Flickr location"),
-    tooltip = _("remove the geotag/location from the selected published photo(s) on Flickr (privacy); idempotent and does not re-upload"),
-    clicked_callback = function() panel_sets.remove_geo_location() end,
-  },
-  dt.new_widget("label") { label = _("people tags") },
-  panel_sets.people_entry,
-  dt.new_widget("button") {
-    label = _("tag people"),
-    tooltip = _("add the listed Flickr members (usernames or emails) to the selected published photo without re-uploading"),
-    clicked_callback = function() panel_sets.tag_people() end,
-  },
-  dt.new_widget("label") { label = _("tag reconciler") },
-  panel_reconcile.diff_label,
-  dt.new_widget("box") {
-    orientation = "horizontal",
-    dt.new_widget("button") {
-      label = _("add local-only to Flickr"),
-      tooltip = _("add darktable keywords that are not yet on Flickr, keeping existing Flickr tags"),
-      clicked_callback = function() panel_reconcile.add_local_only() end,
-    },
-    dt.new_widget("button") {
-      label = _("pull Flickr-only to darktable"),
-      tooltip = _("attach Flickr tags that are not yet local as darktable keywords"),
-      clicked_callback = function() panel_reconcile.pull_remote_only() end,
-    },
-  },
-  panel_reconcile.remove_widget,
-  dt.new_widget("box") {
-    orientation = "horizontal",
-    dt.new_widget("button") {
-      label = _("remove tag"),
-      tooltip = _("delete the chosen Flickr tag from this photo"),
-      clicked_callback = function() panel_reconcile.remove_selected() end,
-    },
-    dt.new_widget("button") {
-      label = _("replace Flickr tags from local"),
-      tooltip = _("replace ALL Flickr tags with the current local keyword set"),
-      clicked_callback = function() panel_reconcile.replace_from_local() end,
+      label = _("albums"),
+      tooltip = _("albums and groups/pools"),
+      clicked_callback = function() panel_tab_stack.active = 3; panel_tab_label.label = _("section: albums") end,
     },
   },
   dt.new_widget("box") {
     orientation = "horizontal",
     dt.new_widget("button") {
-      label = _("mark needs sync"),
-      clicked_callback = function() panel_sets.mark_needs_republish() end,
+      label = _("link"),
+      tooltip = _("link/claim this image to an existing Flickr photo"),
+      clicked_callback = function() panel_tab_stack.active = 4; panel_tab_label.label = _("section: link") end,
     },
     dt.new_widget("button") {
-      label = _("clear needs sync"),
-      clicked_callback = function() panel_sets.clear_needs_republish() end,
+      label = _("publish"),
+      tooltip = _("publish-state actions, push metadata, refresh, delete"),
+      clicked_callback = function() panel_tab_stack.active = 5; panel_tab_label.label = _("section: publish") end,
+    },
+    dt.new_widget("button") {
+      label = _("jobs"),
+      tooltip = _("live upload/queue job tracker"),
+      clicked_callback = function() panel_tab_stack.active = 6; panel_tab_label.label = _("section: jobs") end,
     },
   },
-  dt.new_widget("button") {
-    label = _("mark as published"),
-    tooltip = _("re-mark the linked photo(s) as published/current without re-uploading; reconciles drifted state"),
-    clicked_callback = function() panel_sets.mark_published_selection() end,
-  },
-  dt.new_widget("button") {
-    label = _("scan selected"),
-    clicked_callback = function() panel_sets.scan_selected_publish_state() end,
-  },
-  dt.new_widget("button") {
-    label = _("push metadata to selected"),
-    tooltip = _("resend only the changed, sync-enabled metadata (title/description, keywords, GPS, date taken) for every selected published photo, without re-uploading pixels"),
-    clicked_callback = function() panel_sets.push_selected_metadata() end,
-  },
-  dt.new_widget("button") {
-    label = _("refresh"),
-    clicked_callback = function() refresh_panel(true, true) end,
-  },
-  -- Destructive delete section (issue #19): the confirm checkbox gates the
-  -- button, which permanently removes the photo from Flickr and forgets the
-  -- local link. Needs a delete-scope login (Lua options > 'request delete
-  -- permission on next login').
-  panel_sets.delete_confirm,
-  dt.new_widget("button") {
-    label = _("delete from Flickr"),
-    tooltip = _("permanently delete the selected published photo from Flickr and clear its local link; requires a delete-permission login and the confirm checkbox above"),
-    clicked_callback = function() panel_sets.delete_selected() end,
-  },
+  panel_tab_label,
+  panel_tab_stack,
 }
+-- Open on the meta tab by default.
+panel_tab_stack.active = 1
 
 ----------------------------------------------------------------------
 -- Storage callbacks.
