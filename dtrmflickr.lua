@@ -1272,10 +1272,32 @@ function M.photosets_set_primary_photo(api_key, api_secret, account, photoset_id
   return true
 end
 
+-- Read a photoset's photos in their current stored order (issue #31). Returns an
+-- ordered list of photo-id strings, or (nil, err). Used to build a FULL reorder
+-- list for move-to-front, since a partial reorderPhotos list is unreliable
+-- against real Flickr (see albums.move_to_front / reorder_csv notes).
+function M.photosets_get_photos(api_key, api_secret, account, photoset_id, opts)
+  if not photoset_id or photoset_id == "" then return nil, "missing photoset id" end
+  local params = { photoset_id = photoset_id, media = "photos" }
+  if opts and opts.user_id then params.user_id = opts.user_id end
+  local body, err = M.call(api_key, api_secret, account, "flickr.photosets.getPhotos", params)
+  if not body then return nil, err end
+  local ids = {}
+  -- match each <photo ... id="123" ...> in document order; the leading space
+  -- after `photo` avoids matching <photoset ...>.
+  for id in tostring(body):gmatch('<photo%s[^>]-id="(%d+)"') do
+    ids[#ids + 1] = id
+  end
+  return ids
+end
+
 -- Reorder a photoset. `photo_ids` is the ordered, comma-delimited list of photo
--- ids; photos not named keep their original relative order (so passing a single
--- id moves just that photo to the front). Accepts a list (joined here) or a
--- pre-built string. Returns true on success, or (nil, err) (issue #31).
+-- ids. Accepts a list (joined here) or a pre-built string. Returns true on
+-- success, or (nil, err) (issue #31).
+--
+-- Reliability note: pass the COMPLETE ordered list. A partial list does not
+-- dependably move the named photos to the front against real Flickr (issue #31
+-- live tests); build the full order with albums.move_to_front instead.
 function M.photosets_reorder_photos(api_key, api_secret, account, photoset_id, photo_ids)
   if not photoset_id or photoset_id == "" then return nil, "missing photoset id" end
   if type(photo_ids) == "table" then photo_ids = table.concat(photo_ids, ",") end
@@ -6958,11 +6980,40 @@ end
 -- flickr.photosets.reorderPhotos (issue #31). `ids` is a list of photo ids in the
 -- desired order; entries are stringified, trimmed, empties dropped, and duplicates
 -- collapsed (first occurrence wins). Returns the comma-joined string ("" when no
--- usable id remains). Flickr keeps any photos NOT named here in their original
--- relative order, so a single-id result moves just that photo to the front.
+-- usable id remains).
+--
+-- NOTE: a *partial* list (fewer ids than the set holds) is NOT reliable against
+-- real Flickr. Live tests (issue #31) showed a single-id list does not dependably
+-- move that photo to the front — on a fresh set `[A,B,C]` a partial `[C]` landed
+-- `[A,C,B]` (C second, behind the cover), while a *full* ordered list is exact and
+-- reliable. Prefer M.move_to_front (which submits the complete order) for the
+-- panel's move-to-front action; reorder_csv remains for building an explicit full
+-- order.
 function M.reorder_csv(ids)
   local out, seen = {}, {}
   for _, id in ipairs(ids or {}) do
+    local s = trim(id)
+    if s ~= "" and not seen[s] then
+      seen[s] = true
+      out[#out + 1] = s
+    end
+  end
+  return table.concat(out, ",")
+end
+
+-- Build the FULL ordered photo-id list that moves `photo_id` to the front of a
+-- set while keeping every other photo in its current relative order (issue #31).
+-- `order_ids` is the set's current photo order (as returned by getPhotos). The
+-- result is a complete list (the chosen photo first, then the rest in their
+-- existing order), deduped and trimmed, suitable for reorderPhotos — which is
+-- exact/reliable only with a full list. `photo_id` is included at the front even
+-- if it is not present in `order_ids` (defensive; normally it is a member).
+-- Returns the comma-joined string ("" when no usable id remains).
+function M.move_to_front(order_ids, photo_id)
+  local first = trim(photo_id)
+  local out, seen = {}, {}
+  if first ~= "" then out[#out + 1] = first; seen[first] = true end
+  for _, id in ipairs(order_ids or {}) do
     local s = trim(id)
     if s ~= "" and not seen[s] then
       seen[s] = true
@@ -10836,9 +10887,12 @@ function panel_sets.set_cover()
 end
 
 -- Move the selected published photo to the front of the album chosen in the
--- "album for cover/order/remove" combobox (issue #31). Uses reorderPhotos with a
--- single-id ordered list: Flickr keeps the album's other photos in their existing
--- relative order, so this only promotes the chosen photo to first.
+-- "album for cover/order/remove" combobox (issue #31). Fetches the album's
+-- current photo order and submits the COMPLETE reordered list (chosen photo
+-- first, the rest in their existing relative order). A single-id *partial*
+-- reorderPhotos list is unreliable against real Flickr — it does not dependably
+-- move the photo to the front (live-verified in #31) — so the full order is
+-- required for a dependable move-to-front.
 function panel_sets.move_to_front()
   local image, acc, photo_id, api_key, api_secret = panel_sets.api_context(_("reordering an album"))
   if not image then return end
@@ -10849,7 +10903,16 @@ function panel_sets.move_to_front()
     return
   end
 
-  local photo_ids = albums.reorder_csv({ photo_id })
+  local current, gerr = __dtrmflickr_call("flickr.photosets.getPhotos", function()
+    return rest.photosets_get_photos(api_key, api_secret, acc, set_id, { user_id = acc and acc.nsid or nil })
+  end)
+  if not current then
+    panel_sets.status_label.label = _("reorder failed")
+    dt.print(string.format(_("Flickr: could not read album order: %s"), tostring(gerr)))
+    return
+  end
+
+  local photo_ids = albums.move_to_front(current, photo_id)
   local ok, err = __dtrmflickr_call("flickr.photosets.reorderPhotos", function()
     return rest.photosets_reorder_photos(api_key, api_secret, acc, set_id, photo_ids)
   end)
