@@ -3060,10 +3060,15 @@ function M.metadata_resend_plan(sync, reasons)
     send_date = (sync.date_taken == true) and flagged.date_taken == true,
     -- Privacy-first: "strip GPS on resend" suppresses the metadata-only GPS push so
     -- a batch resend never re-sends coordinates the user asked to strip (issue #23).
-    -- Explicit removal is the dedicated "remove Flickr location" panel action.
     send_gps  = (sync.gps == true) and flagged.gps == true and (sync.strip_gps ~= true),
+    -- ...but when strip is on and the photo's GPS drifted, the batch resend must
+    -- actively REMOVE the Flickr location rather than leave it stuck on
+    -- needs-republish/gps forever (issue #23). This is the batch analog of the
+    -- panel's dedicated "remove Flickr location" action; send_gps and strip_gps are
+    -- mutually exclusive by construction (the strip_gps flag flips which one fires).
+    strip_gps = (sync.gps == true) and flagged.gps == true and (sync.strip_gps == true),
   }
-  plan.any = plan.send_meta or plan.send_tags or plan.send_date or plan.send_gps
+  plan.any = plan.send_meta or plan.send_tags or plan.send_date or plan.send_gps or plan.strip_gps
   return plan
 end
 
@@ -5150,7 +5155,13 @@ function M.resend_image(image, acc, deps)
   end
 
   if plan.send_meta then
-    local title = sync.title and (image.title or "") or nil
+    -- Filename-fallback title, consistent with every other push path
+    -- (metadata.image_title; see the panel/batch/replace paths and
+    -- effective_metadata_fingerprints). An image uploaded with no explicit title
+    -- got a filename-derived title on Flickr, so sending a raw "" here would wipe
+    -- it AND then match the filename-based stored fingerprint forever (silent loss,
+    -- no re-flag). Use the same fallback so the resume converges to what was pushed.
+    local title = sync.title and meta.image_title(image, image and image.filename or "") or nil
     local description = sync.description and (image.description or "") or nil
     local ok, err = push("title_description", "flickr.photos.setMeta", function()
       return rest.photos_set_meta(deps.api_key, deps.api_secret, acc, photo_id, title, description)
@@ -12558,6 +12569,10 @@ function panel_sets.sync_geo_date()
       state.clear_reason(image, acc.nsid, "gps")
       if geo_action == "send" then
         store_metadata_fingerprints(image, acc.nsid, fingerprints, { "gps" })
+      else
+        -- Removed the location on Flickr: drop any stale gps fingerprint so the
+        -- stored baseline matches Flickr's now-empty location (issue #23).
+        state.clear_fingerprint(image, acc.nsid, "gps")
       end
       done[#done + 1] = friendly
     else
@@ -13151,6 +13166,27 @@ function panel_sets.push_selected_metadata()
             "flickr.photos.geo.setLocation", function()
               return rest.photos_geo_set_location(api_key, api_secret, acc, photo_id, lat, lon, 16)
             end)
+        end
+        if plan.strip_gps then
+          -- Privacy-first (issue #23): GPS drifted but "strip on resend" is on, so
+          -- REMOVE the Flickr location instead of sending coords, and clear both the
+          -- gps reason and its stored fingerprint so the baseline matches Flickr's
+          -- now-empty location (never re-flags, never a stored "Flickr has coords"
+          -- lie). removeLocation is idempotent (Flickr err 2 "no location" == ok).
+          local ok, err = __dtrmflickr_call("flickr.photos.geo.removeLocation", function()
+            return rest.photos_geo_remove_location(api_key, api_secret, acc, photo_id)
+          end)
+          if ok then
+            state.clear_reason(image, acc.nsid, "gps")
+            state.clear_fingerprint(image, acc.nsid, "gps")
+            field_tally["gps"] = (field_tally["gps"] or 0) + 1
+            photo_ok = true
+          else
+            state.mark_reason(image, acc.nsid, "gps")
+            photo_failed = true
+            fail_notes[#fail_notes + 1] = string.format("%s/%s: %s",
+              tostring(photo_id), _("GPS location (stripped)"), tostring(err))
+          end
         end
 
         if photo_ok then
@@ -14686,6 +14722,21 @@ local function store(storage, image, format, filename, number, total, high_quali
       forced = forced,
       skip_keyword_overrides = true,
     })
+    -- Privacy-first (issue #23): when location was stripped/omitted on Flickr, the
+    -- stored gps fingerprint must not claim Flickr holds the image's coordinates.
+    -- effective_metadata_fingerprints computed a gps hash from the image's coords,
+    -- but Flickr now has no location — so drop that hash (and clear any stale one)
+    -- rather than persisting a baseline that lies. Mirror sync_geo_date, which only
+    -- keeps the gps fingerprint on a real "send".
+    if geo_action ~= "send" then
+      upload_fingerprints.gps = nil
+      -- Only drop the stored gps hash once the removal actually succeeded; a failed
+      -- removal leaves Flickr's coords in place and its marked gps reason governs
+      -- the needs-republish state (and drives the retry).
+      if geo_action == "remove" and not failed_metadata_fields.gps then
+        state.clear_fingerprint(image, extra_data.account.nsid, "gps")
+      end
+    end
     if post_failed then
       local published_fields = {}
       for _, field in ipairs(state.metadata_reasons()) do
