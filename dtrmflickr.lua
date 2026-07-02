@@ -2104,6 +2104,29 @@ local function assert_component(kind, value)
   assert(valid_component(value), "invalid Flickr " .. kind)
 end
 
+-- Fingerprint field used to snapshot the pixel (develop-history) baseline. See
+-- M.pixel_fingerprint / evaluate_publish_state for why change_timestamp is
+-- compared by equality rather than ordering.
+local PIXEL_FIELD = "pixels"
+
+-- darktable exposes image.change_timestamp as a locale-formatted "%a %x %X"
+-- string (src/lua/image.c change_timestamp_member -> dt_datetime_gdatetime_to_local
+-- with tz=TRUE -> g_date_time_format(..., "%a %x %X")), e.g. "Sun 06/28/2026
+-- 12:30:00 PM" in en_US, "dim. 28/06/2026 12:30:00" in fr_FR. That is NOT an
+-- orderable timestamp and cannot be reliably parsed (locale-dependent, ambiguous
+-- MM/DD vs DD/MM), so we never compare it with stamp ordering. Instead we treat
+-- the raw string as an opaque EQUALITY fingerprint of the pixel state: it is
+-- stable on a given install and changes exactly when the develop pipeline does.
+-- Returns nil when the image has never been developed (empty change_timestamp).
+function M.pixel_fingerprint(image)
+  local value = image and image.change_timestamp or nil
+  value = value and tostring(value):match("^%s*(.-)%s*$") or nil
+  if not value or value == "" then return nil end
+  value = value:gsub("|", "/")  -- '|' is the tag-component separator; never store it raw
+  if value == "" then return nil end
+  return value
+end
+
 local function is_reserved_account_component(value)
   return value == "set" or value == "published" or value == "needs-republish"
     or value == "reason" or value == "uploaded"
@@ -2308,6 +2331,15 @@ end
 function M.set_image_published_at(image, account_nsid, stamp)
   local result = set_published_kind_at(image, account_nsid, "image", stamp)
   M.clear_reason(image, account_nsid, "image")
+  -- Snapshot the pixel baseline so a later develop-history edit is detectable by
+  -- equality (see evaluate_publish_state). change_timestamp is empty until the
+  -- image's first develop edit; store nothing then and drop any stale baseline.
+  local fp = M.pixel_fingerprint(image)
+  if fp then
+    M.set_fingerprint(image, account_nsid, PIXEL_FIELD, fp)
+  else
+    M.clear_fingerprint(image, account_nsid, PIXEL_FIELD)
+  end
   return result
 end
 
@@ -2606,17 +2638,31 @@ function M.evaluate_publish_state(image, account_nsid, opts)
     return "unknown", published_at, photo_id, reasons
   end
 
-  local changed_at = image and image.change_timestamp or nil
-  local newest_handled_at = image_published_at
-  if metadata_published_at and (not newest_handled_at or stamp_is_newer(metadata_published_at, newest_handled_at)) then
-    newest_handled_at = metadata_published_at
+  -- Metadata fingerprints (keywords/title/GPS/etc.) are compared unconditionally,
+  -- NOT gated behind image.change_timestamp: darktable's C core only bumps that
+  -- field from the develop-history pixel pipeline (src/common/history.c,
+  -- image.c's flip handler, develop.c) — tags.c and metadata.c never touch it.
+  -- Gating the fingerprint check behind "change_timestamp is newer" meant a
+  -- keyword-only or metadata-only edit could never be detected: change_timestamp
+  -- never advances for that edit, so the branch was skipped and needs-republish
+  -- was actively cleared underneath it.
+  local metadata_requeue = M.metadata_fingerprint_reasons(image, account_nsid, opts.metadata_fingerprints)
+  if #metadata_requeue > 0 then
+    for _, reason in ipairs(metadata_requeue) do M.mark_reason(image, account_nsid, reason) end
+    return "needs-republish", published_at, photo_id, M.get_reasons(image, account_nsid)
   end
-  if changed_at and newest_handled_at and stamp_is_newer(changed_at, newest_handled_at) then
-    local metadata_requeue = M.metadata_fingerprint_reasons(image, account_nsid, opts.metadata_fingerprints)
-    if #metadata_requeue > 0 then
-      for _, reason in ipairs(metadata_requeue) do M.mark_reason(image, account_nsid, reason) end
-      return "needs-republish", published_at, photo_id, M.get_reasons(image, account_nsid)
-    end
+
+  -- Pixel (develop-history) changes. image.change_timestamp is a locale-formatted
+  -- "%a %x %X" string, NOT an orderable stamp (see M.pixel_fingerprint), so it is
+  -- compared as an opaque EQUALITY fingerprint against the baseline snapshotted
+  -- the last time pixels were published (set_image_published_at). A metadata-only
+  -- publish deliberately does NOT refresh that baseline, so a develop edit made
+  -- after a metadata sync is still caught here. When there is no stored baseline
+  -- (photo published before this snapshotting existed) we cannot compare, so we
+  -- leave it "current" rather than flag every legacy photo.
+  local current_pixels = M.pixel_fingerprint(image)
+  local baseline_pixels = M.get_fingerprint(image, account_nsid, PIXEL_FIELD)
+  if current_pixels and baseline_pixels and current_pixels ~= baseline_pixels then
     M.mark_needs_republish(image, account_nsid)
     return "needs-republish", published_at, photo_id, M.get_reasons(image, account_nsid)
   end
@@ -2646,6 +2692,7 @@ function M.clear_photo_id(image, account_nsid)
   M.clear_uploaded_at(image, account_nsid)
   M.clear_needs_republish(image, account_nsid)
   for _, reason in ipairs(known_metadata_reasons()) do M.clear_fingerprint(image, account_nsid, reason) end
+  M.clear_fingerprint(image, account_nsid, PIXEL_FIELD)
   return true
 end
 
@@ -2698,6 +2745,7 @@ function M.clear_account(image, account_nsid)
   for _, field in ipairs(known_metadata_reasons()) do
     removed = removed + M.clear_fingerprint(image, account_nsid, field)
   end
+  removed = removed + M.clear_fingerprint(image, account_nsid, PIXEL_FIELD)
   if M.clear_needs_republish(image, account_nsid) then removed = removed + 1 end
   if M.clear_photo_id(image, account_nsid) then removed = removed + 1 end
   return removed
@@ -9322,6 +9370,121 @@ end
 return M
 end
 
+package.preload["dtrmflickr.auto_scan"] = function(...)
+-- auto_scan.lua — flag drifted (needs-sync) images without requiring an
+-- explicit "scan selected" click.
+--
+-- darktable's Lua API has NO event for "a tag/metadata field changed on an
+-- image" — the only events it exposes are selection-changed, view-changed,
+-- collection-changed, exit, and a handful of darkroom/import/export hooks (see
+-- docs/lua-api-manual/events/*.md, cross-checked against
+-- docs/darktable-src/src/lua/events.c). So this approximates "flag on edit"
+-- with two mechanisms, DELIBERATELY scoped to never cost more than the
+-- current selection — a full-library sweep does not scale to an account with
+-- 100k+ Flickr-linked photos:
+--
+--   1. Navigate-away flush: right before the darktable selection changes,
+--      re-evaluate (and persist, via state.evaluate_publish_state's side
+--      effect of writing the reason tag) whichever images were selected
+--      a moment ago. Tag image A, select image B -> A gets flagged
+--      immediately. Cost is proportional to what you had selected, never
+--      your whole library.
+--   2. Selection-scoped poll: a background loop (dt.control.dispatch/sleep —
+--      the same mechanism the async queue pump (#54) already uses) that
+--      re-checks only the CURRENT selection every few seconds, so staying on
+--      one image without ever reselecting still gets flagged. Also bounded
+--      by selection size, not library size.
+--
+-- Pure/testable: every darktable dependency (evaluate/fingerprint/photo-id
+-- lookups, sleep/dispatch/should-stop, selection/account getters) is injected,
+-- never required here, so this stays unit-testable without a darktable
+-- runtime and costs no main-chunk locals in the main module.
+
+local Scan = {}
+Scan.__index = Scan
+
+function Scan.new(opts)
+  opts = opts or {}
+  return setmetatable({
+    evaluate = opts.evaluate,         -- function(image, nsid, {metadata_fingerprints=...})
+    fingerprints = opts.fingerprints, -- function(image) -> table
+    photo_id = opts.photo_id,         -- function(image, nsid) -> id or nil
+    last_selection = {},
+  }, Scan)
+end
+
+-- Re-evaluate (and persist) drift for every Flickr-linked image in `images`,
+-- for the given account. No-op if not logged in, no images, or an image has no
+-- stored photo id for this account (nothing to keep in sync). Returns how many
+-- images were actually evaluated.
+function Scan:flag(images, account)
+  if not account or not images then return 0 end
+  local flagged = 0
+  for _, image in ipairs(images) do
+    if self.photo_id(image, account.nsid) then
+      self.evaluate(image, account.nsid, { metadata_fingerprints = self.fingerprints(image) })
+      flagged = flagged + 1
+    end
+  end
+  return flagged
+end
+
+-- Call on every selection-changed. Flags the OUTGOING selection (the images
+-- being navigated away from) using the account active BEFORE the switch, then
+-- remembers the new selection for next time.
+function Scan:on_selection_changed(new_selection, account)
+  self:flag(self.last_selection, account)
+  self.last_selection = new_selection or {}
+end
+
+-- Flush whatever is currently remembered as "last selected" without changing
+-- it. Call on view-changed (leaving lighttable) and exit (quitting darktable)
+-- so the last image(s) touched aren't lost for want of a subsequent selection
+-- change.
+function Scan:flush(account)
+  self:flag(self.last_selection, account)
+end
+
+-- One tick of the background poll: flags the CURRENT selection (not
+-- last_selection) — this is what catches "stayed on the same image, never
+-- navigated away".
+function Scan:poll_tick(current_selection, account)
+  self:flag(current_selection, account)
+end
+
+-- Spawn the background poll loop via the injected darktable control hooks.
+-- get_selection()/get_account() are called fresh each tick so the poll always
+-- sees the live selection/login state. Stops when should_stop() is true
+-- (darktable shutting down).
+function Scan:start_poll(opts)
+  opts = opts or {}
+  local interval_ms = opts.interval_ms or 3000
+  local spawn, sleep = opts.spawn, opts.sleep
+  local should_stop = opts.should_stop
+  local get_selection, get_account = opts.get_selection, opts.get_account
+  local on_error = opts.on_error
+  if not (spawn and sleep and get_selection and get_account) then return false end
+  spawn(function()
+    while not (should_stop and should_stop()) do
+      sleep(interval_ms)
+      if not (should_stop and should_stop()) then
+        -- A single bad tick (a transient nil/field error from whatever
+        -- get_selection/get_account/evaluate touch) must not kill this loop
+        -- forever -- dt.control.dispatch does not restart a dispatched
+        -- function that errors out, so an unprotected tick body would go
+        -- silent permanently with no visible symptom beyond "it stopped
+        -- working". Isolate each tick instead.
+        local ok, tick_err = pcall(function() self:poll_tick(get_selection(), get_account()) end)
+        if not ok and on_error then on_error(tick_err) end
+      end
+    end
+  end)
+  return true
+end
+
+return Scan
+end
+
 package.preload["dtrmflickr.dtrmflickr"] = function(...)
 --[[ dtrmflickr — Flickr export/storage for darktable
 
@@ -11946,7 +12109,12 @@ local function sync_panel_meta()
   end
 
   local sync = master_sync_fields()
-  local title = sync.title and (image and image.title or "") or nil
+  -- Use the filename-fallback title (metadata.image_title), matching the upload
+  -- (line ~4988), replace (line ~5065) and fingerprint (effective_metadata_fingerprints)
+  -- paths. Sending the raw image.title would push "" when the image has no title,
+  -- wiping the filename-derived title Flickr got at upload -- and disagreeing with
+  -- the stored fingerprint, so a later compare would falsely flag drift.
+  local title = sync.title and metadata.image_title(image, image and image.filename or "") or nil
   local description = sync.description and (image and image.description or "") or nil
   if not sync.title and not sync.description then
     dt.print(_("Flickr: title/description sync disabled in Lua Options."))
@@ -12795,7 +12963,15 @@ function panel_sets.clear_needs_republish()
     dt.print(_("Flickr: log in from Lua Options before clearing sync state."))
     return
   end
-  state.set_published_at(image, acc.nsid, image.change_timestamp or nil)
+  -- The publish stamp records WHEN we reconciled, so use now (set_published_at
+  -- defaults to now) -- never image.change_timestamp, which is a locale "%a %x %X"
+  -- string that compact_stamp cannot parse (it would assert). set_published_at
+  -- snapshots the pixel baseline; snapshot the metadata fingerprints too so a
+  -- later evaluate compares edits against a real baseline instead of flipping
+  -- straight back to needs-sync for want of a stored fingerprint.
+  state.set_published_at(image, acc.nsid)
+  store_metadata_fingerprints(image, acc.nsid,
+    effective_metadata_fingerprints(image, master_sync_fields()))
   panel_sets.refresh_publish_state_label(image, acc, photo_id)
   dt.print(_("Flickr: cleared selected photo's needs-sync marker."))
 end
@@ -12822,7 +12998,10 @@ function panel_sets.mark_published_selection()
   for _, image in ipairs(selection) do
     local fingerprints = effective_metadata_fingerprints
       and effective_metadata_fingerprints(image, sync) or nil
-    if state.mark_published(image, acc.nsid, image.change_timestamp or nil, fingerprints) then
+    -- Publish stamp = now (nil defaults to now inside mark_published); never
+    -- image.change_timestamp (unparseable locale string -> compact_stamp assert).
+    -- The pixel baseline is snapshotted from change_timestamp by set_image_published_at.
+    if state.mark_published(image, acc.nsid, nil, fingerprints) then
       marked = marked + 1
     else
       skipped = skipped + 1
@@ -12943,7 +13122,9 @@ function panel_sets.push_selected_metadata()
         end
 
         if plan.send_meta then
-          local title = sync.title and (image.title or "") or nil
+          -- Filename-fallback title, consistent with the fingerprint/upload/replace
+          -- paths (see sync_panel_meta) so an empty title never wipes Flickr's.
+          local title = sync.title and metadata.image_title(image, image.filename) or nil
           local description = sync.description and (image.description or "") or nil
           push("title_description", "title_description", _("title/description"),
             "flickr.photos.setMeta", function()
@@ -14121,6 +14302,9 @@ function effective_metadata_fingerprints(image, sync, opts)
       forced.privacy = true
     end
   end
+  -- MUST use the same tag computation (rules.image_keyword_tags, which applies the
+  -- max_tags=75 truncation) that every push path uses, or the stored fingerprint
+  -- would disagree with what is actually sent and drift would be mis-detected.
   local tags = sync.tags and (opts.tags ~= nil and opts.tags or rules.image_keyword_tags(image, tag_names)) or nil
   local lat, lon = nil, nil
   if sync.gps then lat, lon = metadata.image_location(image) end
@@ -14761,7 +14945,12 @@ function script_data.destroy()
   -- quit mid-pump leaves a resumable blob for the next start to classify.
   if __dtrmflickr_resume then __dtrmflickr_resume.persist() end
   dt.destroy_storage(STORAGE)
-  if dt.destroy_event then dt.destroy_event(PLUGIN .. "_selection_changed", "selection-changed") end
+  if dt.destroy_event then
+    dt.destroy_event(PLUGIN .. "_selection_changed", "selection-changed")
+    dt.destroy_event(PLUGIN .. "_view_changed", "view-changed")
+    dt.destroy_event(PLUGIN .. "_exit", "exit")
+  end
+  if __dtrmflickr_autoscan then __dtrmflickr_autoscan:flush(load_token()) end
   if dt.gui.libs and dt.gui.libs[PANEL] then dt.gui.libs[PANEL].visible = false end
 end
 function script_data.restart()
@@ -14841,9 +15030,62 @@ dt.register_lib(
   function() refresh_panel(true, false) end,
   nil
 )
+-- Auto-flag drift without requiring an explicit "scan selected" click.
+-- darktable's Lua API has no tag/metadata-changed event (see auto_scan.lua for
+-- the full rationale and the events actually available), so this approximates
+-- "flag on edit" via navigate-away flushing (selection-changed/view-changed/
+-- exit) plus a background poll scoped to only the CURRENT selection -- never a
+-- full-library sweep, which would not scale to a 100k-photo Flickr account. A
+-- global, not a main-chunk local, so it costs nothing against the local limit.
+__dtrmflickr_autoscan = require("dtrmflickr.auto_scan").new {
+  evaluate = function(image, nsid, opts)
+    local status, published_at, photo_id, reasons = state.evaluate_publish_state(image, nsid, opts)
+    -- Repaint the on-screen label the instant the poll or navigate-away flush
+    -- detects drift on the image CURRENTLY shown in the panel. Without this,
+    -- the underlying reason tag is written correctly but the visible text
+    -- stays stale until the next full refresh_panel() (e.g. a click off and
+    -- back) -- exactly the gap that made the fix look like it wasn't working.
+    if panel_current and panel_current.image == image and panel_current.selection_count == 1
+      and panel_current.account and panel_current.account.nsid == nsid then
+      panel_sets.refresh_publish_state_label(image, panel_current.account, photo_id)
+    end
+    return status, published_at, photo_id, reasons
+  end,
+  fingerprints = function(image) return effective_metadata_fingerprints(image, master_sync_fields()) end,
+  photo_id = state.get_photo_id,
+}
+
 dt.register_event(PLUGIN .. "_selection_changed", "selection-changed", function()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  __dtrmflickr_autoscan:on_selection_changed(selection, load_token())
   refresh_panel(false, http.quiet_rest_available())
 end)
+dt.register_event(PLUGIN .. "_view_changed", "view-changed", function()
+  __dtrmflickr_autoscan:flush(load_token())
+end)
+dt.register_event(PLUGIN .. "_exit", "exit", function()
+  __dtrmflickr_autoscan:flush(load_token())
+end)
+-- The poll body is an intentionally infinite loop (runs until darktable
+-- shuts down), so unlike the queue's spawn hook it must NEVER fall back to
+-- running synchronously when dt.control.dispatch is unavailable (an offline
+-- test mock, or any host lacking real async dispatch) -- that would hang
+-- whatever called it forever. Only start the poll when true async dispatch
+-- exists; skip it silently otherwise (real darktable and darktable-cli both
+-- provide dt.control.dispatch, so production behavior is unaffected).
+if dt.control and dt.control.dispatch then
+__dtrmflickr_autoscan:start_poll {
+  interval_ms = 3000,
+  spawn = dt.control.dispatch,
+  sleep = function(ms)
+    if dt.control.sleep then dt.control.sleep(math.floor(tonumber(ms) or 0)) end
+  end,
+  should_stop = function() return dt.control.ending == true end,
+  get_selection = function() return dt.gui.selection and dt.gui.selection() or {} end,
+  get_account = load_token,
+  on_error = function(err) dt.print_log("[dtrmflickr] auto-scan poll tick error: " .. tostring(err)) end,
+}
+end
 
 account.refresh_status()
 refresh_panel(false, http.quiet_rest_available())
