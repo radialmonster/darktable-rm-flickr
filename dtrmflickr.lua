@@ -8717,6 +8717,133 @@ end
 return M
 end
 
+package.preload["dtrmflickr.missing_scan"] = function(...)
+-- missing_scan.lua — opt-in remote-existence scan (issue #81).
+--
+-- The published-state dashboard (panel_helpers.publish_dashboard /
+-- publish_state_label) has always known how to render a "missing on Flickr"
+-- category (a photo we still have a local link for, but which is gone from
+-- Flickr), yet no producer ever emitted one: the offline evaluate_publish_state
+-- verdict only knows LOCAL state, so it can never discover that a linked photo
+-- was deleted/removed on Flickr. This module is that producer.
+--
+-- It is deliberately explicit / opt-in: the panel spends one
+-- flickr.photos.getInfo round-trip per linked selected image, so it runs only
+-- when the user clicks "scan missing on Flickr", never on every selection change.
+--
+-- Like source_check.lua / panel_helpers.lua this is pure computation with every
+-- darktable/Flickr access injected by the caller, so it stays offline-testable
+-- and off the main module's tight main-chunk local budget (see CLAUDE.md). The
+-- panel does the actual getInfo call and per-image local evaluate; this module
+-- only classifies each result and folds a "missing" verdict into the dashboard
+-- entry list.
+
+local M = {}
+
+-- classify_existence(body, err, classify_error): does a flickr.photos.getInfo
+-- result mean the photo still exists on Flickr?
+--   "present" — a non-empty getInfo body came back: the photo is live.
+--   "missing" — Flickr error 1 ("Photo not found"): the id is invalid or the
+--               photo was deleted/removed on Flickr. THIS is the only verdict
+--               that flags the dashboard's "missing" category.
+--   "error"   — any other failure (permission, transient, auth, network):
+--               existence is UNKNOWN, so we must NOT report it as missing. A
+--               flaky network or a permission hiccup must never mass-flag live
+--               photos as gone (see the acceptance: "live photos are
+--               unaffected").
+-- `classify_error` is injected (remote_pull.classify_error, which already maps
+-- Flickr error 1 -> "deleted") so this module needs no Flickr knowledge of its
+-- own and stays pure. A nil/erroring classify_error degrades to "error", never
+-- "missing".
+function M.classify_existence(body, err, classify_error)
+  if body ~= nil and tostring(body) ~= "" then return "present" end
+  local kind = "other"
+  if classify_error then
+    local ok, k = pcall(classify_error, err)
+    if ok and k ~= nil then kind = k end
+  end
+  if kind == "deleted" then return "missing" end
+  return "error"
+end
+
+-- merge_entry(local_entry, existence): produce the dashboard entry for one image.
+-- When the remote-existence scan found the photo gone ("missing"), override the
+-- entry's status to "missing" (keeping any published_at/uploaded_at context for
+-- the label); for every other verdict ("present"/"error"/nil = not scanned) the
+-- local publish verdict passes through unchanged, so a transient error never
+-- disturbs the image's real local state. Returns a fresh table when overriding
+-- (never mutates the caller's local_entry).
+function M.merge_entry(local_entry, existence)
+  local_entry = local_entry or { status = "unknown" }
+  if existence ~= "missing" then return local_entry end
+  local merged = {}
+  for k, v in pairs(local_entry) do merged[k] = v end
+  merged.status = "missing"
+  return merged
+end
+
+-- build(items): fold a list of per-image scan items into dashboard entries plus a
+-- summary. Each item is a table:
+--   { photo_id   = <string or nil>,          -- nil/"" = not linked (not scanned)
+--     existence  = "present"|"missing"|"error"|nil,  -- from classify_existence
+--     local_entry = { status=..., reasons=..., published_at=..., uploaded_at=... } }
+-- An item with existence == "missing" becomes a "missing" entry; every other item
+-- passes its local_entry through. Unlinked items (no photo_id) are still emitted
+-- (as their local "unpublished" entry) so the dashboard keeps counting the whole
+-- selection, but they are not counted as scanned. Returns
+--   { entries = { <dashboard entries, selection order> },
+--     summary = { scanned, missing, present, error, unlinked } }.
+function M.build(items)
+  items = items or {}
+  local entries = {}
+  local summary = { scanned = 0, missing = 0, present = 0, error = 0, unlinked = 0 }
+  for _, item in ipairs(items) do
+    item = item or {}
+    local pid = item.photo_id
+    if pid == nil or tostring(pid) == "" then
+      summary.unlinked = summary.unlinked + 1
+    else
+      local existence = item.existence
+      if existence == "missing" then
+        summary.scanned = summary.scanned + 1
+        summary.missing = summary.missing + 1
+      elseif existence == "present" then
+        summary.scanned = summary.scanned + 1
+        summary.present = summary.present + 1
+      else
+        -- "error" or an unexpected/absent verdict for a linked photo: scanned but
+        -- of unknown existence, so it is not reported as missing.
+        summary.scanned = summary.scanned + 1
+        summary.error = summary.error + 1
+      end
+    end
+    entries[#entries + 1] = M.merge_entry(item.local_entry, item.existence)
+  end
+  return { entries = entries, summary = summary }
+end
+
+-- summary_text(summary, translate): a compact one-line toast for the scan result.
+-- `translate` is an optional gettext-style wrapper (defaults to identity) so the
+-- module stays pure/offline-testable while the caller localizes.
+function M.summary_text(summary, translate)
+  local tr = translate
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  summary = summary or {}
+  local scanned = summary.scanned or 0
+  local missing = summary.missing or 0
+  local errored = summary.error or 0
+  local line = string.format(
+    tr("Flickr: scanned %d linked photo(s): %d missing on Flickr, %d present"),
+    scanned, missing, summary.present or 0)
+  if errored > 0 then
+    line = line .. string.format(tr(", %d could not be checked"), errored)
+  end
+  return line
+end
+
+return M
+end
+
 package.preload["dtrmflickr.link_baseline"] = function(...)
 -- link_baseline.lua — establish a metadata sync baseline for a linked/claimed
 -- Flickr photo (issue #99).
@@ -14811,6 +14938,64 @@ function panel_sets.scan_selected_publish_state()
   end
 end
 
+-- Opt-in remote-existence scan (issue #81): for each selected LINKED image, spend
+-- one flickr.photos.getInfo round-trip to discover whether the photo still exists
+-- on Flickr. Flickr error 1 ("Photo not found") means it was deleted/removed there
+-- while we still hold a local link, so it is folded into the dashboard as the
+-- "missing on Flickr" category (panel_helpers.publish_dashboard's `missing` count);
+-- every OTHER failure (permission/transient/network) leaves the image's local
+-- verdict untouched so a flaky check never mass-flags live photos as gone. Explicit
+-- / opt-in because it costs one REST call per photo -- never run on selection
+-- change. The pure classification + entry folding lives in dtrmflickr.missing_scan
+-- (offline-tested); this handler only supplies the getInfo call and per-image local
+-- verdict. Dashboard label is set AFTER refresh_panel so the missing roll-up is the
+-- final paint (refresh_panel's refresh_publish_state_label would otherwise overwrite
+-- it with the local-only verdict).
+function panel_sets.scan_missing_on_flickr()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection == 0 then
+    dt.print(_("Flickr: select one or more images before scanning for missing photos."))
+    return
+  end
+  local acc = load_token()
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before scanning for missing photos."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+  local missing_scan = require("dtrmflickr.missing_scan")
+  local sync = master_sync_fields()
+  local items = {}
+  for _, image in ipairs(selection) do
+    local photo_id = state.get_photo_id(image, acc.nsid)
+    local status, published_at, _pid, reasons = state.evaluate_publish_state(image, acc.nsid, {
+      metadata_fingerprints = effective_metadata_fingerprints and effective_metadata_fingerprints(image, sync) or nil,
+    })
+    local local_entry = {
+      status = status, reasons = reasons, published_at = published_at,
+      uploaded_at = state.get_uploaded_at(image, acc.nsid),
+    }
+    local existence = nil
+    if photo_id then
+      local body, err = __dtrmflickr_call("flickr.photos.getInfo", function()
+        return rest.call(api_key, api_secret, acc, "flickr.photos.getInfo", { photo_id = photo_id })
+      end)
+      existence = missing_scan.classify_existence(body, err, remote_pull.classify_error)
+    end
+    items[#items + 1] = { photo_id = photo_id, existence = existence, local_entry = local_entry }
+  end
+  local result = missing_scan.build(items)
+  refresh_panel(true, false)
+  if panel_sets.dashboard_label then
+    panel_sets.dashboard_label.label = panel_helpers.publish_dashboard(result.entries, { translate = _ }).text
+  end
+  dt.print(missing_scan.summary_text(result.summary, _))
+end
+
 -- Batch / multi-select metadata-only push (issue #18, scope folded in from #11).
 -- For each selected published photo this resends only the metadata fields that
 -- BOTH drifted (a needs-sync reason is present) AND are enabled by the master
@@ -15831,6 +16016,11 @@ local panel_tab_stack = dt.new_widget("stack") {
       label = _("scan selected"),
       tooltip = _("re-evaluate publish state for the selection now; auto-scan already does this on selection change, so this is a manual fallback"),
       clicked_callback = function() panel_sets.scan_selected_publish_state() end,
+    },
+    dt.new_widget("button") {
+      label = _("scan missing on Flickr"),
+      tooltip = _("check each linked selected photo against Flickr (one request per photo) and flag any that were deleted/removed on Flickr as 'missing on Flickr' in the dashboard"),
+      clicked_callback = function() panel_sets.scan_missing_on_flickr() end,
     },
     -- Upload jobs (issue #56): the live job-lifecycle grid. The one-line counts
     -- summary (queue_label) lives in the always-visible header (#85) so queue
