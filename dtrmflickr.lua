@@ -11786,11 +11786,13 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
     and string.format(_("Flickr tags: %s"), table.concat(remote_tags, ", "))
     or _("Flickr tags: none")
   if panel_reconcile.refresh then panel_reconcile.refresh(panel_current.image, remote_tags) end
-  -- Unified sync surface (#87): recompute the one-view diff summary from the same
-  -- getInfo body + the just-refreshed reconciler diff, no extra request.
-  if panel_sets.refresh_sync_surface then panel_sets.refresh_sync_surface(body) end
   panel_loading = false
   panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
+  -- Enable the settings comboboxes BEFORE the sync-surface rebuild below: this
+  -- is the core, long-verified remote-load behavior and must never be gated on
+  -- the newer (#87 live-refresh) composition code that follows. A bug in that
+  -- composition previously left every comboxbox permanently disabled because it
+  -- ran first and, on error, aborted the function before these lines executed.
   panel_privacy_widget.sensitive = acc ~= nil
   panel_safety_widget.sensitive = acc ~= nil
   panel_content_type_widget.sensitive = acc ~= nil
@@ -11798,6 +11800,17 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   panel_comment_perm_widget.sensitive = acc ~= nil and not perms_unavailable
   panel_addmeta_perm_widget.sensitive = acc ~= nil and not perms_unavailable
   panel_current.remote_loaded = true
+  -- Unified sync surface (#87): recompute the one-view diff summary from the same
+  -- getInfo body + the just-refreshed reconciler diff, no extra request. pcall-
+  -- guarded so any error in this composition (over several modules) can never
+  -- take down the rest of the panel refresh — worst case the sync tab's rows
+  -- go stale, not the whole panel.
+  if panel_sets.refresh_sync_surface then
+    local ok_sync, sync_err = pcall(panel_sets.refresh_sync_surface, body)
+    if not ok_sync then
+      dt.print_log("[dtrmflickr] refresh_sync_surface failed: " .. tostring(sync_err))
+    end
+  end
   -- Remember exactly which (image, photo_id, account) we just pulled so a
   -- repeated/duplicate selection of the SAME published photo doesn't re-issue
   -- the getInfo/getPerms/getContentType trio (3 queue jobs per click). Any
@@ -15199,7 +15212,16 @@ __dtrmflickr_autoscan = require("dtrmflickr.auto_scan").new {
       -- count) so the landing tab is live, not just the header. Local-only
       -- rebuild: no network — the cached getInfo body keeps the remote
       -- verdicts, and identical text skips the label write entirely.
-      panel_sets.refresh_sync_surface(nil)
+      -- pcall-guarded: this evaluate wrapper runs from the UNGUARDED
+      -- navigate-away flush (selection-changed) and view-changed/exit flush —
+      -- unlike the poll tick, which auto_scan.lua already isolates per-tick —
+      -- so an error here must not abort the caller (on_selection_changed runs
+      -- BEFORE refresh_panel() in the same event handler; an uncaught error
+      -- would skip refresh_panel entirely, leaving the whole panel stale).
+      local ok_sync, sync_err = pcall(panel_sets.refresh_sync_surface, nil)
+      if not ok_sync then
+        dt.print_log("[dtrmflickr] refresh_sync_surface (auto-scan) failed: " .. tostring(sync_err))
+      end
     end
     return status, published_at, photo_id, reasons
   end,
