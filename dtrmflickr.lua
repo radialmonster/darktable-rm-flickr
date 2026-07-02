@@ -10809,12 +10809,13 @@ function panel_sets.clear_current_choices()
   panel_sets.current_ids = {}
   clear_widget_items(panel_sets.current_widget)  -- not a cached for-loop; see clear_widget_items
   panel_sets.current_widget[1] = _("Select one of this photo's albums")
-  -- Guarded: one cold-start GUI smoke run showed `selected = 1` raising
-  -- "Invalid index for combo box : 1" — the bauhaus combobox reported length 0
-  -- right after the append while the panel was still being assembled
-  -- (register_lib view callback racing widget realization). Selecting is
-  -- cosmetic here, so skip it rather than let the error abort refresh_panel.
-  if #panel_sets.current_widget > 0 then panel_sets.current_widget.selected = 1 end
+  -- pcall-guarded: cold-start GUI smoke runs showed `selected = 1` raising
+  -- "Invalid index for combo box : 1" — during panel construction the bauhaus
+  -- combobox's reported length is inconsistent right after an append (a
+  -- `#widget > 0` pre-check passed and the setter STILL saw length 0), so no
+  -- length guard can win. Selecting the placeholder is cosmetic; swallow the
+  -- transient error rather than let it abort refresh_panel mid-startup.
+  pcall(function() panel_sets.current_widget.selected = 1 end)
 end
 
 function panel_sets.update_current_choices(image, account_nsid)
@@ -12468,16 +12469,29 @@ function panel_sets.refresh_sync_surface(body)
     local d = (panel_reconcile and panel_reconcile.diff)
       and tag_reconcile.diff(rules.image_keyword_names(image) or {}, panel_reconcile.remote_tags or {})
       or nil
-    local kw_status = "unknown"
     if d then
       local lo = #(d.local_only or {})
       local ro = #(d.remote_only or {})
+      local kw_status
       if lo == 0 and ro == 0 then kw_status = "in_sync"
       elseif ro == 0 then kw_status = "local"
       elseif lo == 0 then kw_status = "remote"
       else kw_status = "conflict" end
+      fields[#fields + 1] = { key = "keywords", status = kw_status, can_pull = true }
+    else
+      -- Remote tags not loaded (yet): fall back to the same two-way
+      -- baseline-vs-local fingerprint verdict GPS/date use, so keywords read
+      -- "in sync"/"edited in darktable" against the last push instead of a
+      -- blanket "not yet compared". Only a photo with no keyword baseline at
+      -- all (never keyword-pushed by the plugin) stays "not yet compared".
+      fields[#fields + 1] = {
+        key = "keywords",
+        stored_fp = state.get_fingerprint(image, acc.nsid, "keywords"),
+        local_fp = local_fps.keywords,
+        remote_known = false,
+        can_pull = true,
+      }
     end
-    fields[#fields + 1] = { key = "keywords", status = kw_status, can_pull = true }
   end
 
   if sync.gps then
