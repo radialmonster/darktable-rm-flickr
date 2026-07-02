@@ -12491,6 +12491,14 @@ end
 -- GPS and date-taken both route through sync_geo_date, so that path runs at most
 -- once. After pushing, the panel's normal remote reload recomputes the surface.
 function panel_sets.push_all_changed()
+  -- Multi-select dispatch (#49, mirroring "save settings"): with more than one
+  -- image selected the single-image sync model doesn't apply, so route to the
+  -- batch metadata push (changed, sync-enabled fields of every selected
+  -- published photo). This replaced the separate "push metadata to selected"
+  -- button — one intent, one button, selection size picks the path.
+  if (panel_current.selection_count or 0) > 1 then
+    return panel_sets.push_selected_metadata()
+  end
   local model = panel_sets.sync_model
   if not model or #(model.push_all or {}) == 0 then
     dt.print(_("Flickr: nothing to push — everything is in sync (or needs a compare)."))
@@ -13824,7 +13832,7 @@ local panel_tab_stack = dt.new_widget("stack") {
     panel_sets.sync_surface_label,
     dt.new_widget("button") {
       label = _("push all changed"),
-      tooltip = _("push every field the sync status shows as 'edited in darktable' to Flickr in one click (title/description, keywords, GPS/date taken as applicable). Fields edited on Flickr or on both sides are left for you to resolve per-field below."),
+      tooltip = _("push every field the sync status shows as 'edited in darktable' to Flickr in one click (title/description, keywords, GPS/date taken as applicable). Fields edited on Flickr or on both sides are left for you to resolve per-field below. With more than one image selected, pushes the changed, sync-enabled metadata of every selected published photo."),
       clicked_callback = function() panel_sets.push_all_changed() end,
     },
     dt.new_widget("button") {
@@ -13842,20 +13850,14 @@ local panel_tab_stack = dt.new_widget("stack") {
       tooltip = _("show local vs Flickr title/description side by side and advise whether to push, pull, or leave as-is; detects edit conflicts where both sides changed since the last publish. Read-only — changes nothing."),
       clicked_callback = function() panel_sets.compare_remote_meta() end,
     },
-    dt.new_widget("button") {
-      label = _("push keywords to Flickr"),
-      tooltip = _("push the local darktable keywords to the linked Flickr photo's tags; the tags tab has the fine-grained reconciler"),
-      clicked_callback = function() sync_panel_tags() end,
-    },
+    -- No standalone "push keywords" button here: "push all changed" drives the
+    -- same sync_panel_tags path when keywords drift, and the tags tab owns the
+    -- explicit tag operations (its "replace Flickr tags from local" is the same
+    -- full replace). One field, one explicit home — no duplicates across tabs.
     dt.new_widget("button") {
       label = _("push GPS/date taken to Flickr"),
       tooltip = _("push darktable GPS location and date taken to the linked Flickr photo without re-uploading"),
       clicked_callback = function() panel_sets.sync_geo_date() end,
-    },
-    dt.new_widget("button") {
-      label = _("push metadata to selected"),
-      tooltip = _("resend only the changed, sync-enabled metadata (title/description, keywords, GPS, date taken) for every selected published photo, without re-uploading pixels"),
-      clicked_callback = function() panel_sets.push_selected_metadata() end,
     },
   },
   -- 2: tags — remote tags + the tag reconciler (issue #3) + people tags (#24)
@@ -15095,6 +15097,9 @@ script_data.__test = {
   queue_panel = queue_panel,
   flickr_call = __dtrmflickr_call,
   format_queue_status = format_queue_status,
+  -- Keyword push kept test-reachable after its standalone sync-tab button was
+  -- deduplicated away ("push all changed" and the tags tab cover the UI paths).
+  sync_panel_tags = sync_panel_tags,
   privacy_values = settings.privacy_values,
   safety_values = settings.safety_values,
   content_type_values = settings.content_type_values,
