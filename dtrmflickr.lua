@@ -2802,8 +2802,12 @@ function M.image_title(image, filename)
   return tostring(filename or ""):match("[^/\\]+$") or tostring(filename or "")
 end
 
-function M.image_date_taken(image)
-  local value = image and image.exif_datetime_taken or nil
+-- Normalize a taken-date string (darktable EXIF "YYYY:MM:DD HH:MM:SS" or Flickr's
+-- getInfo "YYYY-MM-DD HH:MM:SS") to canonical MySQL datetime syntax. Returns nil
+-- for an empty/garbage value. Shared by image_date_taken (local) and the
+-- link-baseline path (remote), so a linked photo's remote date fingerprints the
+-- same way the local one does (issue #99). Pure.
+function M.normalize_date_taken(value)
   value = value and tostring(value):match("^%s*(.-)%s*$") or nil
   if not value or value == "" then return nil end
   local y, mo, d, h, mi, s = value:match("^(%d%d%d%d)[:%-](%d%d)[:%-](%d%d)%s+(%d%d):(%d%d):(%d%d)")
@@ -2811,6 +2815,10 @@ function M.image_date_taken(image)
   -- Flickr date_taken is a timezone-less taken-local-time field. Do not convert
   -- from darktable's EXIF taken time; just normalize to MySQL datetime syntax.
   return string.format("%s-%s-%s %s:%s:%s", y, mo, d, h, mi, s)
+end
+
+function M.image_date_taken(image)
+  return M.normalize_date_taken(image and image.exif_datetime_taken or nil)
 end
 
 -- Format a decimal-degree coordinate to 6 fractional digits WITHOUT going
@@ -2836,6 +2844,13 @@ local function flickr_coordinate(value, min_value, max_value)
   if not n or n ~= n or n < min_value or n > max_value then return nil end
   return format_coord6(n)
 end
+
+-- Canonicalize a latitude / longitude to the same locale-safe 6-decimal string
+-- form image_location emits, so a linked photo's remote GPS (from getInfo) can be
+-- fingerprinted the same way the local coordinates are (issue #99). Returns nil
+-- for an out-of-range/garbage value. Pure.
+function M.normalize_lat(value) return flickr_coordinate(value, -90, 90) end
+function M.normalize_lon(value) return flickr_coordinate(value, -180, 180) end
 
 function M.image_location(image)
   local lat = flickr_coordinate(image and image.latitude or nil, -90, 90)
@@ -2997,9 +3012,22 @@ end
 
 function M.image_keyword_tags(image, excluded_filters, tag_names, opts)
   local tags, truncated = M.image_keyword_names(image, excluded_filters, tag_names, opts)
+  return M.encode_flickr_tags(tags), truncated
+end
+
+-- Encode a list of tag names into the same space-delimited, quote-when-spaced,
+-- case-insensitively-sorted Flickr `tags` string image_keyword_tags produces, so
+-- a linked photo's remote tags (from getInfo) fingerprint identically to the
+-- local keyword set when they actually match (issue #99). Returns nil for an
+-- empty list. Pure — does not apply the publish filters (the caller supplies an
+-- already-publishable name list, or the raw remote tags which carry no hierarchy).
+function M.encode_flickr_tags(names)
+  local sorted = {}
+  for _, name in ipairs(names or {}) do sorted[#sorted + 1] = tostring(name) end
+  table.sort(sorted, function(a, b) return a:lower() < b:lower() end)
   local encoded = {}
-  for _, tag in ipairs(tags) do encoded[#encoded + 1] = flickr_quote_tag(tag) end
-  return #encoded > 0 and table.concat(encoded, " ") or nil, truncated
+  for _, tag in ipairs(sorted) do encoded[#encoded + 1] = flickr_quote_tag(tag) end
+  return #encoded > 0 and table.concat(encoded, " ") or nil
 end
 
 local function fingerprint_hash(value)
@@ -8115,6 +8143,142 @@ end
 return M
 end
 
+package.preload["dtrmflickr.link_baseline"] = function(...)
+-- link_baseline.lua — establish a metadata sync baseline for a linked/claimed
+-- Flickr photo (issue #99).
+--
+-- When a photo is linked/claimed (an out-of-band upload the plugin never
+-- published), darktable records its *identity* (photo_id) but not its *state*:
+-- there are no per-field metadata fingerprints — the baseline that
+-- state.evaluate_publish_state / the unified sync surface compare the local
+-- values against. So immediately after linking the sync tab reads "not checked"
+-- for title / description / keywords / date-taken / GPS.
+--
+-- This module turns a flickr.photos.getInfo body into the *remote-value*
+-- fingerprints, so the caller can snapshot them as the baseline. With the remote
+-- value as the baseline, the sync surface renders a concrete per-field verdict:
+-- "in sync" when the local value already matches Flickr, or a specific diff
+-- (darktable-newer) otherwise — never "not checked". It performs NO local
+-- metadata mutation (the richer "pull remote -> darktable" behaviour, with its
+-- clobber policy, stays deferred to #20 / #22).
+--
+-- The fields are fingerprinted with the SAME normalization the local side uses
+-- (metadata.fingerprints_from_values + the canonical date/coord/tag encoders), so
+-- a genuinely-in-sync photo reads "in sync", not a false drift.
+--
+-- Pure / injected-deps for offline testing.
+local M = {}
+
+local function attr(body, name)
+  body = tostring(body or "")
+  return body:match(name .. '="(.-)"') or body:match(name .. "='(.-)'") or nil
+end
+
+-- parse_extra(body): the taken-date and lat/lon out of a getInfo body.
+-- remote_pull.parse_info already covers title/description/tags; getInfo also
+-- carries `<dates ... taken="YYYY-MM-DD HH:MM:SS" .../>` and, when geotagged,
+-- `<location latitude="..." longitude="..." .../>`. Returns raw strings (nil when
+-- the element/attribute is absent). Pure.
+function M.parse_extra(body)
+  body = tostring(body or "")
+  local dates = body:match("<dates%s+([^>]-)/?>")
+  local taken = dates and attr(dates, "taken") or nil
+  local loc = body:match("<location%s+([^>]-)/?>")
+  local lat = loc and attr(loc, "latitude") or nil
+  local lon = loc and attr(loc, "longitude") or nil
+  return { date_taken = taken, lat = lat, lon = lon }
+end
+
+-- remote_values(body, sync, deps): a `values` table (for
+-- metadata.fingerprints_from_values) built from the photo's CURRENT Flickr state,
+-- restricted to the enabled `sync` fields. Mirrors exactly how the sync surface
+-- computes its "remote" column (title_description) and how the local side encodes
+-- keywords / date / gps, so equal values fingerprint equal.
+--   sync — { title, description, tags, date_taken, gps } booleans (master toggles)
+--   deps — { parse_info, parse_extra?, normalize_date_taken, normalize_lat,
+--            normalize_lon, encode_flickr_tags }
+function M.remote_values(body, sync, deps)
+  sync = sync or {}
+  deps = deps or {}
+  local remote = deps.parse_info and deps.parse_info(body) or nil
+  if not remote then return nil end
+  local extra = (deps.parse_extra or M.parse_extra)(body)
+  local values = {}
+
+  if sync.title or sync.description then
+    values.include_title_description = true
+    -- Match refresh_sync_surface's remote_fp: only the ENABLED half contributes.
+    values.title = sync.title and (remote.title or "") or nil
+    values.description = sync.description and (remote.description or "") or nil
+  end
+
+  if sync.tags then
+    values.include_keywords = true
+    values.tags = deps.encode_flickr_tags(remote.tags or {})
+  end
+
+  if sync.date_taken then
+    values.include_date_taken = true
+    values.date_taken = deps.normalize_date_taken(extra.date_taken)
+  end
+
+  if sync.gps then
+    values.include_gps = true
+    -- Both must parse or neither: a half-present coordinate is not a location.
+    local lat = deps.normalize_lat(extra.lat)
+    local lon = deps.normalize_lon(extra.lon)
+    if lat ~= nil and lon ~= nil then
+      values.lat = lat
+      values.lon = lon
+    else
+      values.lat = nil
+      values.lon = nil
+    end
+  end
+
+  return values
+end
+
+-- remote_fingerprints(body, sync, deps): the per-field baseline fingerprints for
+-- the linked photo's current Flickr state. deps additionally needs
+-- fingerprints_from_values. Returns {} when the body is unparseable.
+function M.remote_fingerprints(body, sync, deps)
+  deps = deps or {}
+  local values = M.remote_values(body, sync, deps)
+  if not values then return {} end
+  return deps.fingerprints_from_values(values) or {}
+end
+
+-- The metadata fields the unified sync surface renders and that this baseline
+-- fills. Kept explicit (not every field fingerprints_from_values can emit) so we
+-- never accidentally baseline a push-only setting (privacy/safety/license/...).
+M.BASELINE_FIELDS = { "title_description", "keywords", "date_taken", "gps" }
+
+-- updates_to_establish(remote_fps, existing_fps): the subset of remote_fps to
+-- actually write — only fields that have NO baseline yet. This is the
+-- idempotent, never-clobber guarantee: a photo the plugin already published (or
+-- one whose baseline we established on a previous panel load) keeps its existing
+-- fingerprints; only the gaps a freshly-linked photo left are filled. Pure.
+--   remote_fps   — { field = fp } from remote_fingerprints
+--   existing_fps — { field = stored_fp_or_nil } read from state
+function M.updates_to_establish(remote_fps, existing_fps)
+  remote_fps = remote_fps or {}
+  existing_fps = existing_fps or {}
+  local updates = {}
+  local any = false
+  for _, field in ipairs(M.BASELINE_FIELDS) do
+    if remote_fps[field] ~= nil and existing_fps[field] == nil then
+      updates[field] = remote_fps[field]
+      any = true
+    end
+  end
+  if not any then return nil end
+  return updates
+end
+
+return M
+end
+
 package.preload["dtrmflickr.sync_surface"] = function(...)
 -- sync_surface.lua — pure model for the unified sync surface (issue #87).
 --
@@ -12505,6 +12669,37 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
   panel_comment_perm_widget.sensitive = acc ~= nil and not perms_unavailable
   panel_addmeta_perm_widget.sensitive = acc ~= nil and not perms_unavailable
   panel_current.remote_loaded = true
+  -- Establish the metadata sync baseline for a linked/claimed photo (#99). A
+  -- photo linked from an out-of-band Flickr upload has an identity but no
+  -- per-field fingerprints, so the sync surface below would read "not checked".
+  -- Snapshot the CURRENT remote values (from this same getInfo body) as the
+  -- baseline — but only for fields with no baseline yet, so we never clobber a
+  -- real publish/push baseline. No local metadata is mutated. pcall-guarded: a
+  -- baseline gap is cosmetic, never worth aborting the refresh.
+  if acc and panel_current.image then
+    local ok_bl, bl_err = pcall(function()
+      local link_baseline = require("dtrmflickr.link_baseline")
+      local image, nsid = panel_current.image, acc.nsid
+      local sync = master_sync_fields()
+      local remote_fps = link_baseline.remote_fingerprints(body, sync, {
+        parse_info = remote_pull.parse_info,
+        fingerprints_from_values = metadata.fingerprints_from_values,
+        normalize_date_taken = metadata.normalize_date_taken,
+        normalize_lat = metadata.normalize_lat,
+        normalize_lon = metadata.normalize_lon,
+        encode_flickr_tags = metadata.encode_flickr_tags,
+      })
+      local existing = {}
+      for _, field in ipairs(link_baseline.BASELINE_FIELDS) do
+        existing[field] = state.get_fingerprint(image, nsid, field)
+      end
+      local updates = link_baseline.updates_to_establish(remote_fps, existing)
+      if updates then state.set_fingerprints(image, nsid, updates) end
+    end)
+    if not ok_bl then
+      dt.print_log("[dtrmflickr] link baseline establish failed: " .. tostring(bl_err))
+    end
+  end
   -- Unified sync surface (#87): recompute the one-view diff summary from the same
   -- getInfo body + the just-refreshed reconciler diff, no extra request. pcall-
   -- guarded so any error in this composition (over several modules) can never
