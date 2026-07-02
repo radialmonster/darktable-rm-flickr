@@ -1949,6 +1949,29 @@ function M.photos_geo_set_perms(api_key, api_secret, account, photo_id, is_publi
   return true
 end
 
+-- Read who may view a photo's geo data (flickr.photos.geo.getPerms). Returns a
+-- table { is_public, is_contact, is_friend, is_family } of 0/1 numbers, or nil,err.
+-- Companion to photos_geo_set_perms for read-back / future geo-perm state tracking
+-- (issue #72). Flickr's response is a single <perms .../> element with ispublic /
+-- iscontact / isfriend / isfamily attributes.
+function M.photos_geo_get_perms(api_key, api_secret, account, photo_id)
+  if not photo_id or photo_id == "" then return nil, "missing photo id" end
+  local body, err = M.call(api_key, api_secret, account, "flickr.photos.geo.getPerms", {
+    photo_id = photo_id,
+  })
+  if not body then return nil, err end
+  local function flag(name)
+    local v = body:match(name .. '="(%d+)"') or body:match(name .. "='(%d+)'")
+    return tonumber(v) or 0
+  end
+  return {
+    is_public  = flag("ispublic"),
+    is_contact = flag("iscontact"),
+    is_friend  = flag("isfriend"),
+    is_family  = flag("isfamily"),
+  }
+end
+
 -- Parse a flickr.photos.upload.checkTickets response into a map keyed by ticket
 -- id. Each entry: { id, complete = 0|1|2|nil, photo_id = "..."|nil, invalid }.
 -- Flickr's status attribute is historically named `complete` (0 = processing,
@@ -6056,6 +6079,20 @@ M.license_values = {
   { key = "cc_by_nc_nd_4_0",     pref = "CC BY-NC-ND 4.0",     flickr_value = 16 },
 }
 
+-- Geo-privacy override (issue #72): who may view a photo's location on Flickr,
+-- applied via flickr.photos.geo.setPerms *after* the coordinates are (re)sent.
+-- "keep current" is the default no-op — the plugin leaves whatever geo perms Flickr
+-- assigned. The four audience flags map directly onto geo.setPerms parameters; the
+-- `pref` strings must stay in sync with the enum preference values registered in
+-- dtrmflickr.lua. See docs/design-notes.md ("Geo-privacy override").
+M.geo_perm_values = {
+  { key = "keep",           pref = "keep current",     apply = false },
+  { key = "public",         pref = "public",           is_public = 1, is_contact = 0, is_friend = 0, is_family = 0 },
+  { key = "contacts",       pref = "your contacts",    is_public = 0, is_contact = 1, is_friend = 0, is_family = 0 },
+  { key = "friends_family", pref = "friends & family", is_public = 0, is_contact = 0, is_friend = 1, is_family = 1 },
+  { key = "only_you",       pref = "only you",         is_public = 0, is_contact = 0, is_friend = 0, is_family = 0 },
+}
+
 M.default_setting_specs = {
   { name = "default_privacy", label = "privacy", values = M.privacy_values, default = "private" },
   { name = "default_safety", label = "safety", values = M.safety_values, default = "safe" },
@@ -6112,6 +6149,26 @@ end
 
 function M.permission_index_from_pref(value)
   return M.index_from_pref(M.permission_values, value, 4)
+end
+
+function M.geo_perm_index_from_pref(value)
+  return M.index_from_pref(M.geo_perm_values, value, 1)
+end
+
+-- geo_perms_for_pref(pref): return the four flickr.photos.geo.setPerms audience
+-- flags for the chosen geo-privacy preference, or nil when the choice is "keep
+-- current" (leave Flickr's default untouched) or unrecognized. Callers apply the
+-- result only after a photo's coordinates have been (re)sent, so nil == "do not
+-- touch the location's visibility". Pure/offline-testable (issue #72).
+function M.geo_perms_for_pref(pref)
+  local spec = M.geo_perm_values[M.geo_perm_index_from_pref(pref)]
+  if not spec or spec.apply == false then return nil end
+  return {
+    is_public  = spec.is_public,
+    is_contact = spec.is_contact,
+    is_friend  = spec.is_friend,
+    is_family  = spec.is_family,
+  }
 end
 
 return M
@@ -11231,12 +11288,42 @@ dt.preferences.register(PLUGIN, "sync_safety", "bool",
   _("Flickr: sync safety"), _("allow Flickr safety level updates"), true)
 dt.preferences.register(PLUGIN, "sync_privacy", "bool",
   _("Flickr: sync privacy"), _("allow Flickr visibility updates"), true)
+-- Geo-privacy override (issue #72): keep the location on Flickr but restrict who
+-- may view it, instead of stripping it (the "strip GPS on resend" toggle). Applied
+-- via geo.setPerms only after coordinates are (re)sent; "strip GPS on resend" wins
+-- (it removes the location entirely, so there is nothing to restrict).
+dt.preferences.register(PLUGIN, "default_geo_perm", "enum",
+  _("Flickr: who can see location"),
+  _("when a photo's GPS location is sent to Flickr, restrict who may view that location. 'keep current' leaves Flickr's default untouched. Ignored when 'strip GPS on resend' is on (that removes the location entirely)"),
+  "keep current",
+  "keep current", "public", "your contacts", "friends & family", "only you")
 dt.preferences.register(PLUGIN, "settings_help", "lua",
   _("Flickr: settings guide"),
   _("how these Lua options relate to the Export and lighttable Flickr widgets"),
   "info",
   settings_help_widget,
   keep_label_pref)
+
+-- issue #72: restrict who may view a photo's location after its coordinates are
+-- (re)sent to Flickr, via flickr.photos.geo.setPerms. Reads the "who can see
+-- location" enum preference; unless it is "keep current" it applies the chosen
+-- audience. Shared by every setLocation success site (store/upload, the single
+-- GPS/date resend #63, the batch metadata push #70) so the geo-privacy override is
+-- consistent across all of them. Defined as a global (not a main-chunk local) to
+-- avoid the per-function local-limit and to be reachable from those later sites.
+-- Best-effort: a no-op override ("keep current") returns true without a call; a
+-- real setPerms failure returns nil,err so the caller can surface it, but it is
+-- non-fatal — the photo and its location are already correct, only the audience
+-- restriction is pending. setPerms is idempotent (a full re-set of the same flags),
+-- so a retry never corrupts state.
+function __dtrmflickr_apply_geo_perms(api_key, api_secret, acc, photo_id)
+  local gp = settings.geo_perms_for_pref(dt.preferences.read(PLUGIN, "default_geo_perm", "enum"))
+  if not gp then return true end
+  return __dtrmflickr_call("flickr.photos.geo.setPerms", function()
+    return rest.photos_geo_set_perms(api_key, api_secret, acc, photo_id,
+      gp.is_public, gp.is_contact, gp.is_friend, gp.is_family)
+  end)
+end
 
 ----------------------------------------------------------------------
 -- Export-panel storage widget.
@@ -14022,6 +14109,12 @@ function panel_sets.sync_geo_date()
       state.clear_reason(image, acc.nsid, "gps")
       if geo_action == "send" then
         store_metadata_fingerprints(image, acc.nsid, fingerprints, { "gps" })
+        -- issue #72: now that coordinates are on Flickr, restrict who may view them
+        -- if the user chose a geo-privacy audience (no-op when "keep current").
+        local perms_ok, perms_err = __dtrmflickr_apply_geo_perms(api_key, api_secret, acc, photo_id)
+        if not perms_ok then
+          failed[#failed + 1] = _("GPS visibility") .. ": " .. tostring(perms_err)
+        end
       else
         -- Removed the location on Flickr: drop any stale gps fingerprint so the
         -- stored baseline matches Flickr's now-empty location (issue #23).
@@ -14615,10 +14708,21 @@ function panel_sets.push_selected_metadata()
         end
         if plan.send_gps then
           local lat, lon = metadata.image_location(image)
+          local gps_before = field_tally["gps"] or 0
           push("gps", "gps", _("GPS location"),
             "flickr.photos.geo.setLocation", function()
               return rest.photos_geo_set_location(api_key, api_secret, acc, photo_id, lat, lon, 16)
             end)
+          if (field_tally["gps"] or 0) > gps_before then
+            -- issue #72: coordinates just landed on Flickr; restrict who may view
+            -- them per the geo-privacy audience (no-op when "keep current").
+            local perms_ok, perms_err = __dtrmflickr_apply_geo_perms(api_key, api_secret, acc, photo_id)
+            if not perms_ok then
+              photo_failed = true
+              fail_notes[#fail_notes + 1] = string.format("%s/%s: %s",
+                tostring(photo_id), _("GPS visibility"), tostring(perms_err))
+            end
+          end
         end
         if plan.strip_gps then
           -- Privacy-first (issue #23): GPS drifted but "strip on resend" is on, so
@@ -16233,6 +16337,19 @@ local function store(storage, image, format, filename, number, total, high_quali
           geo_action == "remove" and "strip location" or "location", geo_err)
       else
         state.clear_reason(image, extra_data.account.nsid, "gps")
+        if geo_action == "send" then
+          -- issue #72: coordinates just landed on Flickr; restrict who may view
+          -- them per the geo-privacy audience (no-op when "keep current").
+          local perms_ok, perms_err = __dtrmflickr_apply_geo_perms(extra_data.api_key,
+            extra_data.api_secret, extra_data.account, photo_id)
+          image_attempts = math.max(image_attempts, __dtrmflickr_queue:last_attempts())
+          if not perms_ok then
+            post_failed = true
+            failed_metadata_fields.gps = true
+            state.mark_reason(image, extra_data.account.nsid, "gps")
+            record_post_error(extra_data, image, photo_id, "location visibility", perms_err)
+          end
+        end
       end
     end
     local upload_fingerprints = effective_metadata_fingerprints(image, sync, {
