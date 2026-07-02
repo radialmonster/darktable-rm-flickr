@@ -6082,6 +6082,17 @@ local M = {}
 -- How many filenames to list before collapsing the rest into "(+N more)".
 local DEFAULT_MAX_NAMES = 8
 
+-- True when `image` is a darktable image (or a test stub) carrying a usable
+-- basename. A REAL darktable image is *userdata*, not a table — offline tests
+-- pass a plain-table stub — so both types must be accepted, otherwise the
+-- image's real `.filename` is never read and callers fall back to the export
+-- temp path (issue #37: the toast showed .../Temp/... instead of IMG_1234.cr2).
+local function has_filename(image)
+  local t = type(image)
+  return (t == "table" or t == "userdata") and image.filename ~= nil and image.filename ~= ""
+end
+M.has_filename = has_filename
+
 -- A result entry can carry an explicit `filename` (store records one on every
 -- failed/skipped row) and/or an `image` with a `.filename` (post-upload error
 -- rows carry the image, not a separate filename). Prefer the explicit filename,
@@ -6089,10 +6100,7 @@ local DEFAULT_MAX_NAMES = 8
 local function name_of(entry)
   if type(entry) ~= "table" then return "?" end
   if entry.filename and entry.filename ~= "" then return entry.filename end
-  local image = entry.image
-  if type(image) == "table" and image.filename and image.filename ~= "" then
-    return image.filename
-  end
+  if has_filename(entry.image) then return entry.image.filename end
   return "?"
 end
 M.name_of = name_of
@@ -6116,7 +6124,7 @@ end
 local function display_name(entry)
   if type(entry) ~= "table" then return "?" end
   local image = entry.image
-  if type(image) == "table" and image.filename and image.filename ~= "" then
+  if has_filename(image) then
     return join_path(image.path, image.filename)
   end
   return name_of(entry)
@@ -6440,9 +6448,8 @@ function M.uploaded_links(extra_data, owner)
   for _, up in ipairs((extra_data and extra_data.uploaded) or {}) do
     local url = urls.photo_url(owner, up.photo_id)
     if url then
-      local img = type(up) == "table" and up.image
-      local name = (type(img) == "table" and img.filename and img.filename ~= "")
-        and img.filename or name_of(up)
+      local img = type(up) == "table" and up.image or nil
+      local name = has_filename(img) and img.filename or name_of(up)
       links[#links + 1] = { name = name, url = url }
     end
   end
