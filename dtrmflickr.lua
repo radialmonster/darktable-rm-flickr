@@ -2749,6 +2749,12 @@ end
 function M.clear_account(image, account_nsid)
   local removed = M.clear_sets(image, account_nsid)
   removed = removed + M.clear_published_at(image, account_nsid)
+  -- Drop the Flickr upload-date tag (issue #21) unconditionally here rather than
+  -- relying on clear_photo_id below: clear_account is a "tear down everything for
+  -- this nsid" operation (unlink / delete-from-Flickr / account-switch via
+  -- clear_other_accounts), but clear_photo_id short-circuits when no photo_id tag
+  -- is present, which would strand an `uploaded` tag that outlived its photo id.
+  removed = removed + M.clear_uploaded_at(image, account_nsid)
   removed = removed + M.clear_metadata_reasons(image, account_nsid)
   if M.clear_reason(image, account_nsid, "image") then removed = removed + 1 end
   for _, field in ipairs(known_metadata_reasons()) do
