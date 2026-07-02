@@ -6014,6 +6014,18 @@ local function clean(value)
   return s
 end
 
+-- display_owner(nsid, path_alias) -> the owner component to show in a *displayed*
+-- Flickr URL. When the account has a path_alias set, Flickr's canonical photopage
+-- is the alias form (https://www.flickr.com/photos/<alias>/<id>) and the NSID form
+-- merely redirects to it, so prefer the alias for a prettier displayed URL
+-- (issue #98). Falls back to the NSID when no alias is set (then the NSID form IS
+-- the canonical page). Pure and nil-safe: a blank/whitespace alias is treated as
+-- absent, and both blank yields nil so the URL builders still fail closed. Callers
+-- pass the result straight into photo_url/photoset_url/selection_links as `owner`.
+function M.display_owner(nsid, path_alias)
+  return clean(path_alias) or clean(nsid)
+end
+
 -- Public photo page URL, or nil if either component is missing.
 function M.photo_url(owner, photo_id)
   local o, p = clean(owner), clean(photo_id)
@@ -9677,6 +9689,10 @@ function M.parse_people_info(body)
   nsid = xml_unescape(nsid)
   local iconserver = attr_of(body, "person", "iconserver")
   local iconfarm = attr_of(body, "person", "iconfarm")
+  -- path_alias: the pretty username Flickr puts in the canonical photopage URL
+  -- (.../photos/<path_alias>/...); absent when the account never set one (#98).
+  local path_alias = attr_of(body, "person", "path_alias")
+  path_alias = (path_alias and path_alias ~= "") and xml_unescape(path_alias) or nil
   -- <photos><count>N</count></photos>
   local photos_block = body:match("<photos%s*>(.-)</photos>") or body:match("<photos>(.-)</photos>")
   local count = photos_block and tonumber((photos_block:match("<count%s*>(.-)</count>")
@@ -9692,6 +9708,7 @@ function M.parse_people_info(body)
     photosurl = child_text(body, "photosurl"),
     profileurl = child_text(body, "profileurl"),
     photos_count = count,
+    path_alias = path_alias,
   }
   info.avatar_url = M.buddyicon_url(nsid, iconserver, iconfarm)
   return info
@@ -10073,6 +10090,14 @@ function M.build(deps)
         dt.print_log("[dtrmflickr] access_token error: " .. tostring(err))
         return
       end
+      -- #98: enrich the account with its path_alias (from flickr.people.getInfo)
+      -- so displayed URLs use Flickr's prettier canonical .../photos/<alias>/...
+      -- form. Best-effort — a getInfo failure just leaves the NSID form (which is
+      -- then the canonical page anyway); it never blocks the login itself.
+      local pinfo = info_mod.fetch_identity(rest_mod, key, secret, acc)
+      if pinfo and pinfo.path_alias and pinfo.path_alias ~= "" then
+        acc.path_alias = pinfo.path_alias
+      end
       local saved, save_err = save_token(acc)
       if not saved then
         last_error = save_err
@@ -10118,6 +10143,13 @@ function M.build(deps)
       if not status then
         if __dtrmflickr_note_auth_failure then __dtrmflickr_note_auth_failure(serr) end
         dt.print_log("[dtrmflickr] account upload status failed: " .. tostring(serr))
+      end
+      -- #98: opportunistically persist a newly-learned path_alias so an already
+      -- logged-in account (whose login predates this feature) gets prettier
+      -- displayed URLs without needing to re-login. Only re-saves when it changed.
+      if info.path_alias and info.path_alias ~= "" and info.path_alias ~= acc.path_alias then
+        acc.path_alias = info.path_alias
+        save_token(acc)
       end
       info_label.label = table.concat(info_mod.summary_lines(info, status), "\n")
       info_label.visible = true
@@ -10560,6 +10592,10 @@ local function save_token(acc)
   if __dtrmflickr_jobs then __dtrmflickr_jobs:cancel_for_account_change(acc.nsid) end
   dt.preferences.write(PLUGIN, "active_nsid", "string", acc.nsid)
   dt.preferences.write(PLUGIN, "active_username", "string", acc.username or acc.nsid)
+  -- path_alias (#98): the pretty owner for displayed URLs, enriched from
+  -- flickr.people.getInfo at login (or a later "refresh account info"). Blank
+  -- when unknown/unset, so display_owner falls back to the NSID form.
+  dt.preferences.write(PLUGIN, "active_path_alias", "string", acc.path_alias or "")
   if not ok then return nil, _("darktable password storage refused the OAuth token; login is session-only") end
   return true
 end
@@ -10574,9 +10610,11 @@ local function load_token()
   if not packed or packed == "" then return nil end
   local token, secret = unpack_token(packed)
   if not token then return nil end
+  local path_alias = dt.preferences.read(PLUGIN, "active_path_alias", "string")
   return {
     nsid = nsid, token = token, secret = secret,
     username = dt.preferences.read(PLUGIN, "active_username", "string"),
+    path_alias = (path_alias and path_alias ~= "") and path_alias or nil,
   }
 end
 
@@ -10594,6 +10632,7 @@ local function clear_token()
   if __dtrmflickr_jobs then __dtrmflickr_jobs:cancel_for_account_change(nil) end
   dt.preferences.write(PLUGIN, "active_nsid", "string", "")
   dt.preferences.write(PLUGIN, "active_username", "string", "")
+  dt.preferences.write(PLUGIN, "active_path_alias", "string", "")
 end
 
 ----------------------------------------------------------------------
@@ -14520,7 +14559,10 @@ function refresh_panel(force, fetch_remote)
   local sets = state.get_sets(image, acc.nsid)
   panel_current = { image = image, account = acc, photo_id = photo_id, selection_count = #selection, remote_loaded = false }
   panel_sets.update_photo_link_buttons(selection, acc, photo_id)
-  panel_sets.refresh_url_actions(selection, acc.nsid, acc.nsid)
+  -- Display the prettier canonical .../photos/<path_alias>/... URL when the
+  -- account has an alias, still keying per-image photo-id lookups on the NSID (#98).
+  panel_sets.refresh_url_actions(selection,
+    require("dtrmflickr.urls").display_owner(acc.nsid, acc.path_alias), acc.nsid)
   panel_account_label.label = string.format(_("account: %s"), acc.username or acc.nsid)
   panel_photo_label.label = photo_id
     and string.format(_("photo: %s"), photo_id)
@@ -15968,7 +16010,11 @@ local function finalize(storage, image_table, extra_data)
   -- Show where each upload landed: the public Flickr photo URL (issue #37).
   -- Capped to keep the transient toast readable; the full set is in the
   -- per-image result table logged below.
-  local report_owner = extra_data.account and extra_data.account.nsid
+  -- Prefer the account's path_alias so the reported URL is Flickr's prettier
+  -- canonical .../photos/<alias>/... page, falling back to the NSID form (#98).
+  local report_owner = extra_data.account
+    and require("dtrmflickr.urls").display_owner(extra_data.account.nsid, extra_data.account.path_alias)
+    or nil
   for _, line in ipairs(report.uploaded_url_lines(extra_data, { translate = _, owner = report_owner })) do
     dt.print(line)
   end
