@@ -6030,6 +6030,100 @@ function M.batch_indicator(count, translate)
     tr("%d photos selected — Save applies your setting changes to all of them"), tonumber(count))
 end
 
+-- ---------------------------------------------------------------------------
+-- Mixed-value consensus across a multi-selection (issue #80).
+--
+-- The batch Save (partition_fields/apply_settings_to_selection) overwrites the
+-- chosen fields on EVERY selected published photo with the focused photo's
+-- combobox values. Before confirming, the user wants to see which fields
+-- already DIFFER across the selection — the ones Save would flatten. The panel
+-- fetches each selected photo's current Flickr settings (opt-in, one round trip
+-- per photo) and maps them to the same combobox indices the comboboxes use;
+-- these pure helpers turn those per-photo index tables into a per-field
+-- "uniform vs ⟨mixed⟩" verdict and a summary line. Comparing combobox indices
+-- keeps it decidable and offline-testable — no Flickr calls live here.
+
+-- Consensus of one field's current value across the selection. `values` is the
+-- DENSE list of that field's value on each photo the caller could read
+-- (unreadable/unlinked photos are simply omitted by the caller — do not pass
+-- nils, ipairs stops at the first hole). Returns:
+--   { status = "unknown" }            -- nothing readable
+--   { status = "uniform", value = v } -- every readable photo agrees
+--   { status = "mixed" }              -- >1 distinct readable value
+-- Values are compared with ==, so pass normalized comparables (combobox
+-- indices are ideal — two photos "agree" iff they'd show the same combobox row).
+function M.field_consensus(values)
+  values = values or {}
+  local first, have, mixed = nil, false, false
+  for _, v in ipairs(values) do
+    if not have then first, have = v, true
+    elseif v ~= first then mixed = true end
+  end
+  if not have then return { status = "unknown", value = nil } end
+  if mixed then return { status = "mixed", value = nil } end
+  return { status = "uniform", value = first }
+end
+
+-- Per-field consensus map over FIELD_ORDER. `per_photo` is a list of tables,
+-- one per readable photo, each keyed by FIELD_ORDER `dirty_key`
+-- (privacy/safety/content_type/license/comment_perm/addmeta_perm) → the photo's
+-- current combobox index (nil = that field couldn't be read for that photo, so
+-- it just doesn't count toward its field's consensus). Returns a map
+-- dirty_key → field_consensus result for every FIELD_ORDER field.
+function M.consensus_map(per_photo)
+  per_photo = per_photo or {}
+  local out = {}
+  for _, f in ipairs(FIELD_ORDER) do
+    local vals = {}
+    for _, p in ipairs(per_photo) do
+      local v = p and p[f.dirty_key]
+      if v ~= nil then vals[#vals + 1] = v end
+    end
+    out[f.dirty_key] = M.field_consensus(vals)
+  end
+  return out
+end
+
+-- The FIELD_ORDER entries whose value differs across the selection, in
+-- FIELD_ORDER order. Drives the summary line and any per-field annotation.
+local function mixed_fields(cmap)
+  local out = {}
+  cmap = cmap or {}
+  for _, f in ipairs(FIELD_ORDER) do
+    local c = cmap[f.dirty_key]
+    if c and c.status == "mixed" then out[#out + 1] = f end
+  end
+  return out
+end
+M.mixed_fields = mixed_fields
+
+-- Per-field annotation string for one consensus result: "⟨mixed⟩" when the
+-- field differs across the selection, else "" (uniform or unknown paint blank).
+function M.mixed_indicator(result, translate)
+  local tr = type(translate) == "function" and translate or function(s) return s end
+  if result and result.status == "mixed" then return tr("⟨mixed⟩") end
+  return ""
+end
+
+-- One-line summary of a completed consensus scan, shown before the two-click
+-- confirm so the user sees exactly which fields Save would flatten. `count` is
+-- the number of photos actually scanned/read. Returns "" when there is nothing
+-- to say (no fields, count < 2). Names only the mixed fields; when none differ
+-- it reassures that Save changes nothing that isn't already uniform.
+function M.consensus_summary(cmap, count, translate)
+  local tr = type(translate) == "function" and translate or function(s) return s end
+  local n = tonumber(count) or 0
+  if not cmap or n < 2 then return "" end
+  local mixed = mixed_fields(cmap)
+  if #mixed == 0 then
+    return string.format(
+      tr("Flickr: all %d scanned photos share these settings — nothing to flatten."), n)
+  end
+  return string.format(
+    tr("Flickr: differs across the %d scanned — Save flattens all to the shown value: %s"),
+    n, friendly_list(mixed))
+end
+
 return M
 end
 
@@ -11991,6 +12085,12 @@ local panel_stats_label = dt.new_widget("label") { label = "" }
 -- Blank for a single (or empty) selection. Kept on panel_sets (not a new
 -- main-chunk local) to respect Lua's per-function local limit (see CLAUDE.md).
 panel_sets.batch_indicator_label = dt.new_widget("label") { label = "" }
+-- Mixed-value indicator (issue #80): result of the opt-in "check mixed values"
+-- scan across a multi-selection — names which settings fields already differ
+-- across the selected photos (the ones a batch Save would flatten). Blank until
+-- the user runs the scan. Kept on panel_sets (table field) to respect Lua's
+-- per-function local limit (see CLAUDE.md).
+panel_sets.mixed_label = dt.new_widget("label") { label = "" }
 -- Selection-aware guidance (issue #88): one contextual line telling the user what
 -- to do when the selection can't drive a control — "select an image", "log in to
 -- Flickr first", "not on Flickr yet — publish first" — computed by the pure
@@ -13582,6 +13682,95 @@ function panel_sets.apply_settings_to_selection()
   end
 end
 
+-- Read one photo's CURRENT Flickr settings and map them to the same combobox
+-- indices the settings comboboxes use, WITHOUT touching any widget (issue #80).
+-- Mirrors load_remote_settings's mapping exactly — getInfo -> privacy/safety/
+-- license, the content-type search, getPerms -> comment/addmeta — but returns a
+-- plain index table for consensus comparison. A field that can't be read is left
+-- nil (so it simply doesn't count toward that field's consensus; indices here
+-- are never 0, so nil is unambiguous). Returns nil only when the photo's getInfo
+-- itself fails (deleted/permission/transient) so the caller can tally it unread.
+function panel_sets.fetch_photo_setting_indices(api_key, api_secret, acc, photo_id)
+  local body = __dtrmflickr_call("flickr.photos.getInfo", function()
+    return rest.call(api_key, api_secret, acc, "flickr.photos.getInfo", { photo_id = photo_id })
+  end, { coalesce_key = "consensus-info:" .. tostring(photo_id) })
+  if not body then return nil end
+  local out = {}
+  local visibility = body:match("<visibility%s+([^>]-)/>") or body:match("<visibility%s+([^>]-)>")
+  out.privacy = panel_helpers.panel_privacy_index_from_flags(
+    visibility and panel_helpers.remote_attr(visibility, "ispublic"),
+    visibility and panel_helpers.remote_attr(visibility, "isfriend"),
+    visibility and panel_helpers.remote_attr(visibility, "isfamily"))
+  out.safety = panel_helpers.panel_safety_index_from_remote(panel_helpers.remote_attr(body, "safety_level"))
+  out.license = panel_helpers.panel_license_index_from_id(panel_helpers.remote_attr(body, "license"))
+  local dateuploaded = panel_helpers.remote_attr(body, "dateuploaded")
+  out.content_type = load_remote_content_type(api_key, api_secret, acc, photo_id, dateuploaded)
+  local perms_body = __dtrmflickr_call("flickr.photos.getPerms", function()
+    return rest.photos_get_perms(api_key, api_secret, acc, photo_id)
+  end, { coalesce_key = "consensus-perms:" .. tostring(photo_id) })
+  if perms_body then
+    out.comment_perm = panel_helpers.panel_permission_index_from_id(panel_helpers.remote_attr(perms_body, "permcomment"))
+    out.addmeta_perm = panel_helpers.panel_permission_index_from_id(panel_helpers.remote_attr(perms_body, "permaddmeta"))
+  end
+  return out
+end
+
+-- Opt-in mixed-value scan (issue #80): for a multi-selection, fetch each
+-- selected PUBLISHED photo's current Flickr settings (one getInfo/getPerms/
+-- content-type round trip per photo, throttled by the same __dtrmflickr_call
+-- queue the focused-photo load uses) and report which settings fields already
+-- differ across the selection — the fields a batch Save would flatten. Explicit
+-- (button-driven) precisely because it costs a round trip per photo; never run
+-- automatically on selection. Unlinked photos are skipped; a photo whose getInfo
+-- fails is counted as unread so the summary can be honest about coverage.
+function panel_sets.scan_selection_consensus()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection <= 1 then
+    panel_sets.mixed_label.label = _("Flickr: select more than one photo to compare settings.")
+    return
+  end
+  local acc = panel_current.account
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before comparing Flickr settings."))
+    return
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return
+  end
+  panel_sets.mixed_label.label = _("Flickr: comparing settings across the selection...")
+  local per_photo, scanned, unlinked, unread = {}, 0, 0, 0
+  for _, image in ipairs(selection) do
+    local photo_id = state.get_photo_id(image, acc.nsid)
+    if not photo_id then
+      unlinked = unlinked + 1
+    else
+      local indices = panel_sets.fetch_photo_setting_indices(api_key, api_secret, acc, photo_id)
+      if indices then
+        per_photo[#per_photo + 1] = indices
+        scanned = scanned + 1
+      else
+        unread = unread + 1
+      end
+    end
+  end
+  if scanned < 2 then
+    panel_sets.mixed_label.label = string.format(
+      _("Flickr: could only read %d of %d selected photos on Flickr — can't compare settings."),
+      scanned, #selection)
+    return
+  end
+  local cmap = batch_apply.consensus_map(per_photo)
+  local summary = batch_apply.consensus_summary(cmap, scanned, _)
+  if unlinked > 0 or unread > 0 then
+    summary = summary .. string.format(
+      _(" (%d not on Flickr, %d unreadable skipped)"), unlinked, unread)
+  end
+  panel_sets.mixed_label.label = summary
+  dt.print(summary)
+end
+
 local function sync_panel_meta()
   local acc, photo_id, image = panel_current.account, panel_current.photo_id, panel_current.image
   if (panel_current.selection_count or 0) ~= 1 then
@@ -15002,6 +15191,9 @@ function refresh_panel(force, fetch_remote)
   if panel_sets.batch_indicator_label then
     panel_sets.batch_indicator_label.label = batch_apply.batch_indicator(#selection, _)
   end
+  -- Clear a stale mixed-value scan result (issue #80): it was computed for the
+  -- previous selection, so the moment the selection changes it no longer applies.
+  if panel_sets.mixed_label then panel_sets.mixed_label.label = "" end
   panel_current = { image = image, account = nil, photo_id = nil, selection_count = #selection, remote_loaded = false }
   if not image then
     -- Nothing selected: still lead with the real account state so the guidance
@@ -15546,12 +15738,21 @@ local panel_tab_stack = dt.new_widget("stack") {
   dt.new_widget("box") {
     orientation = "vertical",
     panel_sets.batch_indicator_label,
+    panel_sets.mixed_label,
     panel_privacy_widget,
     panel_safety_widget,
     panel_content_type_widget,
     panel_license_widget,
     panel_comment_perm_widget,
     panel_addmeta_perm_widget,
+    -- Mixed-value scan (issue #80): before flattening every selected photo with a
+    -- batch Save, let the user see which fields already differ. Opt-in (one round
+    -- trip per selected photo), so it's a button, not automatic on selection.
+    dt.new_widget("button") {
+      label = _("check mixed values"),
+      tooltip = _("with more than one photo selected, fetch each selected published photo's current Flickr settings and show which fields differ across the selection (the ones a batch Save would overwrite). Costs one Flickr request per selected photo."),
+      clicked_callback = function() panel_sets.scan_selection_consensus() end,
+    },
     dt.new_widget("button") {
       label = _("save settings"),
       tooltip = _("apply the Flickr settings comboboxes above (privacy, safety, content type, license, comment/metadata permissions) to the published photo; with more than one image selected, applies to every selected published photo (two-click confirm). Other tabs' actions apply immediately on click and need no save."),
