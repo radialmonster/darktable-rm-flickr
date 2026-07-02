@@ -8648,6 +8648,108 @@ M.selection_summary = selection_summary
 return M
 end
 
+package.preload["dtrmflickr.source_check"] = function(...)
+-- source_check.lua — pure up-front "missing/offline source file" detector (issue #41).
+--
+-- darktable exports one image at a time, and if a selected image's source
+-- (original) file lives on an unmounted/offline drive or has been moved/deleted,
+-- its export fails partway through the batch. The per-image failure scrolls past
+-- in the toast area, so on a large selection the user only notices something went
+-- wrong at the end. This module lets the export `initialize` callback (which
+-- receives the whole selection up front, before any export runs) scan the
+-- selection and warn *before* the batch starts which images are likely to fail —
+-- rather than failing mid-batch.
+--
+-- Like preflight.lua / panel_helpers.lua this is pure computation with all
+-- darktable access injected, so it stays offline-testable and off the main
+-- module's tight main-chunk local budget. The caller provides:
+--   opts.exists(image) -> boolean   -- true when the source file is present
+--   opts.label(image)  -> string    -- display name (defaults to image.filename)
+-- Nothing here touches widgets, preferences, the filesystem, or the network.
+
+local M = {}
+
+-- Display label for one image: prefer an explicit label()/filename, fall back to
+-- a positional "#<index>" so a nameless image still shows up in the warning list.
+local function image_label(image, index, label_fn)
+  if label_fn then
+    local ok, name = pcall(label_fn, image)
+    if ok and name ~= nil and tostring(name) ~= "" then return tostring(name) end
+  end
+  if image ~= nil then
+    local name = image.filename
+    if name ~= nil and tostring(name) ~= "" then return tostring(name) end
+  end
+  return "#" .. tostring(index)
+end
+M.image_label = image_label
+
+-- Partition a list of images into present vs missing by calling opts.exists on
+-- each. A nil/erroring exists predicate is treated as "unknown" and does NOT flag
+-- the image (we never invent a false alarm when we cannot actually check). Returns
+--   { total, present_count, missing (list of labels), missing_count }
+-- `missing` preserves selection order so the warning list is stable.
+function M.scan(images, opts)
+  opts = opts or {}
+  images = images or {}
+  local exists_fn = opts.exists
+  local label_fn = opts.label
+  local missing = {}
+  local present_count = 0
+  for i, image in ipairs(images) do
+    local present = true            -- default: assume present (never a false alarm)
+    if type(exists_fn) == "function" then
+      local ok, result = pcall(exists_fn, image)
+      -- Only a definitive `false` counts as missing; nil/unknown/errors do not.
+      if ok and result == false then present = false end
+    end
+    if present then
+      present_count = present_count + 1
+    else
+      missing[#missing + 1] = image_label(image, i, label_fn)
+    end
+  end
+  return {
+    total = #images,
+    present_count = present_count,
+    missing = missing,
+    missing_count = #missing,
+  }
+end
+
+-- Cap a list of names for display, appending " (+N more)" past `limit`.
+local function join_capped(names, limit, tr)
+  limit = limit or 5
+  local shown = {}
+  for i = 1, math.min(#names, limit) do shown[i] = names[i] end
+  local text = table.concat(shown, ", ")
+  if #names > limit then
+    text = text .. string.format(tr(" (+%d more)"), #names - limit)
+  end
+  return text
+end
+
+-- Human warning string for a scan result, or nil when nothing is missing.
+-- `tr` is an optional gettext-style wrapper (defaults to identity). Singular and
+-- plural phrasings so the common single-file case reads naturally.
+function M.format_warning(result, tr)
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  result = result or {}
+  local missing = result.missing or {}
+  local n = #missing
+  if n == 0 then return nil end
+  local names = join_capped(missing, 5, tr)
+  if n == 1 then
+    return string.format(tr("Flickr: %s is missing its source file and may fail to export"), names)
+  end
+  return string.format(
+    tr("Flickr: %d of %d selected image(s) are missing their source file and may fail to export: %s"),
+    n, tonumber(result.total) or n, names)
+end
+
+return M
+end
+
 package.preload["dtrmflickr.preflight"] = function(...)
 -- preflight.lua — pure guided-preflight / dry-run planner (issue #13).
 --
@@ -15015,6 +15117,35 @@ local function initialize(storage, format, images, high_quality, extra_data)
   end
   dt.print_log(string.format("[dtrmflickr] initialize: %d image(s), transport=%s, %s",
     #images, TRANSPORT, extra_data.account and ("nsid=" .. tostring(extra_data.account.nsid)) or "NOT logged in"))
+  -- Up-front offline/missing-source detection (issue #41). darktable exports one
+  -- image at a time and a missing/offline original fails that image partway
+  -- through the batch; warn about the whole set here (before any export runs)
+  -- rather than letting per-image failures scroll past mid-batch. Purely
+  -- advisory: we still return nil (export everything) so darktable's own
+  -- per-image handling is unchanged — this only surfaces the problem early.
+  do
+    local source_check = require("dtrmflickr.source_check")
+    local scan = source_check.scan(images, {
+      exists = function(im)
+        if not im then return false end
+        local path = tostring(im.path or "")
+        local name = tostring(im.filename or "")
+        if path == "" or name == "" then return nil end   -- unknown, not a false alarm
+        local sep = path:sub(-1) == "/" or path:sub(-1) == "\\"
+        local full = sep and (path .. name) or (path .. "/" .. name)
+        local f = io.open(full, "rb")
+        if f then f:close(); return true end
+        return false
+      end,
+      label = function(im) return im and im.filename or nil end,
+    })
+    extra_data.missing_sources = scan
+    local warning = source_check.format_warning(scan, _)
+    if warning then
+      dt.print(warning)
+      dt.print_log("[dtrmflickr] initialize: " .. warning)
+    end
+  end
   return nil
 end
 
