@@ -2787,16 +2787,340 @@ end
 return M
 end
 
-package.preload["dtrmflickr.metadata"] = function(...)
-local dt = require "darktable"
-local state = require "dtrmflickr.state"
+package.preload["dtrmflickr.templating"] = function(...)
+-- templating.lua — pure title/caption template engine (issue #42).
+--
+-- Expands a user-authored template string against a set of variables extracted
+-- from a darktable image (camera, lens, ISO, aperture, date, GPS, dimensions,
+-- filename, …). Two constructs make templates degrade gracefully when a field is
+-- empty:
+--
+--   {token}            substitute the variable's value ("" when missing)
+--   {token|filter|…}   pipe the value through filters (upper/lower/title/trim/
+--                      round[:N]/int/default:X)
+--   [ ...text {t}... ] OPTIONAL GROUP — emitted only when every {token} inside it
+--                      resolves to a non-empty value; dropped whole otherwise, so
+--                      "[ISO {iso}]" simply disappears on a photo with no ISO.
+--
+-- Escapes: "\{" "\}" "\[" "\]" "\\" emit the literal character. Groups may nest.
+--
+-- Everything here is pure (no darktable calls beyond reading plain fields off the
+-- image table in build_vars, which works for both userdata images and stub
+-- tables — see the "dt objects are userdata" note: never gate a field read on
+-- type()). Fully offline-testable.
 
 local M = {}
 
+-- Locale-safe rounding to `dec` decimal places. C's printf "%f" honours
+-- LC_NUMERIC (comma-decimal locales would emit "2,8"), and darktable runs under
+-- the user's locale, so build the string from integer parts with a hardcoded "."
+-- exactly like metadata.format_coord6 does for GPS.
+local function round_str(n, dec)
+  dec = dec or 0
+  local neg = n < 0
+  n = math.abs(n)
+  local mult = 10 ^ dec
+  local scaled = math.floor(n * mult + 0.5)
+  if dec <= 0 then
+    return (neg and "-" or "") .. string.format("%d", scaled)
+  end
+  local int = math.floor(scaled / mult)
+  local frac = scaled - int * mult
+  return string.format("%s%d.%0" .. dec .. "d", neg and "-" or "", int, frac)
+end
+
+-- Format a number for display: integers lose their ".0"; non-integers show up to
+-- `maxdec` decimals (default 4) with trailing zeros stripped. Locale-safe.
+local function fmt_num(n, maxdec)
+  maxdec = maxdec or 4
+  if n == math.floor(n) then return string.format("%d", math.floor(n)) end
+  local s = round_str(n, maxdec)
+  s = s:gsub("(%.%d-)0+$", "%1"):gsub("%.$", "")
+  return s
+end
+M.fmt_num = fmt_num
+
+-- Title-case: first letter of each run of word characters upper, the rest lower.
+local function title_case(value)
+  return (value:gsub("(%a)([%w']*)", function(a, b) return a:upper() .. b:lower() end))
+end
+
+-- Apply a single "name" or "name:arg" filter to a string value. Unknown filters
+-- pass the value through unchanged (forgiving — a typo never blanks the field).
+local function apply_filter(value, filter)
+  local name, arg = filter:match("^%s*([%w_]+)%s*:?(.*)$")
+  name = (name or ""):lower()
+  arg = arg or ""
+  if name == "upper" then
+    return value:upper()
+  elseif name == "lower" then
+    return value:lower()
+  elseif name == "title" then
+    return title_case(value)
+  elseif name == "trim" then
+    return value:match("^%s*(.-)%s*$")
+  elseif name == "int" then
+    local num = tonumber(value)
+    if num then
+      local t = num < 0 and math.ceil(num) or math.floor(num) -- truncate toward zero
+      return string.format("%d", t)
+    end
+    return value
+  elseif name == "round" then
+    local num = tonumber(value)
+    if num then return round_str(num, tonumber(arg) or 0) end
+    return value
+  elseif name == "default" then
+    if value == "" then return arg end
+    return value
+  end
+  return value
+end
+
+-- Resolve a "name|filter|filter:arg" token spec against vars. Returns
+-- (text, present) where `present` is false when the final text is empty (so an
+-- enclosing optional group knows to drop). A `default:` filter that fills an
+-- empty value makes the token present, by design.
+local function resolve_token(spec, vars)
+  local parts = {}
+  for p in (spec .. "|"):gmatch("(.-)|") do parts[#parts + 1] = p end
+  local name = (parts[1] or ""):match("^%s*(.-)%s*$")
+  local raw = vars[name]
+  local value = raw == nil and "" or tostring(raw)
+  for i = 2, #parts do
+    value = apply_filter(value, parts[i])
+  end
+  return value, value ~= ""
+end
+
+-- Expand `s` (a template or the inner text of an optional group). Returns
+-- (text, any_missing) where any_missing is true when at least one {token} in this
+-- range resolved to empty — an optional group uses it to decide whether to emit.
+local function expand_range(s, vars)
+  local out = {}
+  local any_missing = false
+  local i, n = 1, #s
+  while i <= n do
+    local c = s:sub(i, i)
+    if c == "\\" then
+      out[#out + 1] = s:sub(i + 1, i + 1)
+      i = i + 2
+    elseif c == "{" then
+      local j = s:find("}", i + 1, true)
+      if not j then
+        out[#out + 1] = c
+        i = i + 1
+      else
+        local value, present = resolve_token(s:sub(i + 1, j - 1), vars)
+        out[#out + 1] = value
+        if not present then any_missing = true end
+        i = j + 1
+      end
+    elseif c == "[" then
+      -- find the matching "]" honouring nesting and "\]" escapes
+      local depth, j = 1, i + 1
+      while j <= n do
+        local cj = s:sub(j, j)
+        if cj == "\\" then
+          j = j + 2
+        elseif cj == "[" then
+          depth = depth + 1; j = j + 1
+        elseif cj == "]" then
+          depth = depth - 1
+          if depth == 0 then break end
+          j = j + 1
+        else
+          j = j + 1
+        end
+      end
+      if depth ~= 0 then
+        out[#out + 1] = c
+        i = i + 1
+      else
+        local text, inner_missing = expand_range(s:sub(i + 1, j - 1), vars)
+        if not inner_missing then out[#out + 1] = text end
+        i = j + 1
+      end
+    else
+      out[#out + 1] = c
+      i = i + 1
+    end
+  end
+  return table.concat(out), any_missing
+end
+
+-- Expand a template string against `vars`. Empty template -> "". Optional groups
+-- collapse when a referenced token is missing; unmatched braces/brackets are kept
+-- literally. Top-level missing tokens simply insert "" (graceful, not an error).
+function M.expand(template, vars)
+  template = tostring(template == nil and "" or template)
+  if template == "" then return "" end
+  local text = expand_range(template, vars or {})
+  return text
+end
+
+-- Trimmed convenience wrapper used by callers that want a clean single-line
+-- title/caption: expand, collapse internal runs of blank produced by dropped
+-- groups, and trim the ends. Returns "" when nothing survives.
+function M.expand_trimmed(template, vars)
+  local text = M.expand(template, vars)
+  text = text:gsub("%s+", " "):match("^%s*(.-)%s*$")
+  return text
+end
+
+local function s(v) return v == nil and "" or tostring(v) end
+
+-- Format a possibly-numeric image field. darktable numeric EXIF fields come back
+-- as floats (exif_iso 100.0, exif_focal_length 50.0); show them cleanly.
+local function num_field(v, maxdec)
+  local num = tonumber(v)
+  if num == nil or num ~= num then return "" end
+  return fmt_num(num, maxdec)
+end
+
+-- darktable exposes exif_exposure as a float in SECONDS (0.001 for 1/1000s), not a
+-- display string. Render it as a photographer-friendly shutter speed: "1/1000"
+-- for sub-second exposures, "2s" / "0.5s" for one second and longer. "" for
+-- missing/garbage. Locale-safe (fmt_num carries no locale decimal separator).
+local function shutter_field(v)
+  local num = tonumber(v)
+  if num == nil or num ~= num or num <= 0 then return "" end
+  if num >= 1 then return fmt_num(num, 1) .. "s" end
+  return "1/" .. string.format("%d", math.floor(1 / num + 0.5))
+end
+M.shutter_field = shutter_field
+
+-- Parse a darktable/EXIF "YYYY:MM:DD HH:MM:SS" (or "YYYY-MM-DD …") taken-date into
+-- its component strings. Returns a table of parts ("" when unparseable).
+local function date_parts(value)
+  value = s(value):match("^%s*(.-)%s*$")
+  local y, mo, d, h, mi, sec =
+    value:match("^(%d%d%d%d)[:%-](%d%d)[:%-](%d%d)%s+(%d%d):(%d%d):(%d%d)")
+  if not y then
+    y, mo, d = value:match("^(%d%d%d%d)[:%-](%d%d)[:%-](%d%d)")
+    h, mi, sec = "", "", ""
+  end
+  if not y then return { date = "", datetime = "", year = "", month = "", day = "",
+                         hour = "", minute = "", second = "", time = "" } end
+  local date = string.format("%s-%s-%s", y, mo, d)
+  local time = (h ~= "" and h ~= nil) and string.format("%s:%s:%s", h, mi, sec) or ""
+  return {
+    date = date,
+    datetime = (time ~= "") and (date .. " " .. time) or date,
+    year = y, month = mo, day = d,
+    hour = h or "", minute = mi or "", second = sec or "", time = time,
+  }
+end
+
+-- Build the token table for an image. Reads plain fields directly (works for both
+-- darktable userdata images and stub tables; never gate on type()). Missing
+-- fields become "" so templates and optional groups degrade gracefully.
+function M.build_vars(image)
+  image = image or {}
+  local filename = s(image.filename)
+  local basename = filename:gsub("%.[^.\\/]+$", "")
+  local ext = filename:match("%.([^.\\/]+)$") or ""
+  local dp = date_parts(image.exif_datetime_taken)
+
+  local vars = {
+    filename = filename,
+    basename = basename,
+    ext = ext,
+    title = s(image.title),
+    description = s(image.description),
+    creator = s(image.creator),
+    publisher = s(image.publisher),
+    rights = s(image.rights),
+
+    camera = s(image.exif_model),
+    model = s(image.exif_model),
+    make = s(image.exif_maker),
+    maker = s(image.exif_maker),
+    lens = s(image.exif_lens),
+
+    iso = num_field(image.exif_iso, 0),
+    aperture = num_field(image.exif_aperture, 2),
+    exposure = shutter_field(image.exif_exposure),
+    shutter = shutter_field(image.exif_exposure),
+    focal = num_field(image.exif_focal_length, 1),
+
+    date = dp.date,
+    datetime = dp.datetime,
+    year = dp.year,
+    month = dp.month,
+    day = dp.day,
+    hour = dp.hour,
+    minute = dp.minute,
+    second = dp.second,
+    time = dp.time,
+
+    lat = num_field(image.latitude, 6),
+    lon = num_field(image.longitude, 6),
+    elevation = num_field(image.elevation, 1),
+
+    width = num_field(image.width, 0),
+    height = num_field(image.height, 0),
+  }
+
+  local w, h = tonumber(image.width), tonumber(image.height)
+  if w and h and w > 0 and h > 0 then
+    vars.dimensions = string.format("%dx%d", math.floor(w), math.floor(h))
+    vars.mp = fmt_num((w * h) / 1000000, 1)
+  else
+    vars.dimensions = ""
+    vars.mp = ""
+  end
+
+  return vars
+end
+
+-- The set of tokens build_vars produces, for UI help / documentation. Sorted.
+function M.available_tokens()
+  local sample = M.build_vars({})
+  local names = {}
+  for k in pairs(sample) do names[#names + 1] = k end
+  table.sort(names)
+  return names
+end
+
+return M
+end
+
+package.preload["dtrmflickr.metadata"] = function(...)
+local dt = require "darktable"
+local state = require "dtrmflickr.state"
+local templating = require "dtrmflickr.templating"
+
+local M = {}
+
+local PLUGIN <const> = "dtrmflickr"
 local TAG_FLAG_CATEGORY <const> = 1
 local TAG_FLAG_PRIVATE <const> = 2
 
+-- Read the optional title template (issue #42). Empty/unset => no templating, so
+-- the historical filename-fallback behavior is preserved with zero regression.
+-- Guarded so a missing preferences API (bare test harness) never throws here.
+local function title_template()
+  local ok, value = pcall(function()
+    return dt.preferences and dt.preferences.read and dt.preferences.read(PLUGIN, "title_template", "string")
+  end)
+  if not ok then return "" end
+  return value and tostring(value):match("^%s*(.-)%s*$") or ""
+end
+
+-- The Flickr title for an image. When a non-empty title template is configured it
+-- is expanded against the image's metadata tokens (camera/lens/date/…); when the
+-- template yields nothing usable (all referenced fields empty), or no template is
+-- set, fall back to the image title, then its filename, then the export filename.
+-- This is the single shared chokepoint for the local title, so templating applies
+-- uniformly to the upload, metadata-sync push, and panel local-value paths (and
+-- their fingerprints stay coherent because they all read through here).
 function M.image_title(image, filename)
+  local template = title_template()
+  if template ~= "" then
+    local expanded = templating.expand_trimmed(template, templating.build_vars(image))
+    if expanded ~= "" then return expanded end
+  end
   if image and image.title and image.title ~= "" then return image.title end
   if image and image.filename and image.filename ~= "" then return image.filename end
   return tostring(filename or ""):match("[^/\\]+$") or tostring(filename or "")
@@ -10771,6 +11095,18 @@ dt.preferences.register(PLUGIN, "keyword_rules_help", "lua",
   _("how keyword-driven Flickr settings work"),
   "info",
   keyword_rules_help_widget,
+  keep_label_pref)
+dt.preferences.register(PLUGIN, "title_template", "string",
+  _("Flickr: title template"),
+  _("blank uses the image title (then filename). Otherwise expand tokens against the photo's metadata, e.g. {title} [ - {camera}] [ISO {iso}]. Tokens: title, filename, basename, camera, lens, iso, aperture, focal, exposure, date, year, month, day, lat, lon, dimensions, mp, creator. Filters: |upper |lower |title |trim |round:N |default:X. [ ... ] groups drop when a token inside is empty"),
+  "")
+dt.preferences.register(PLUGIN, "title_template_help", "lua",
+  _("Flickr: title template help"),
+  _("how the title template works"),
+  "info",
+  dt.new_widget("label") {
+    label = _("title template expands tokens from photo metadata\nleave blank to use the image title, then its filename\ntokens: {title} {camera} {lens} {iso} {aperture} {focal} {date} {year} {lat} {lon} {dimensions} {mp} {creator}\nfilters: {iso|round} {camera|upper} {title|title} {lens|default:unknown}\noptional groups: [ISO {iso}] disappears when the photo has no ISO"),
+  },
   keep_label_pref)
 dt.preferences.register(PLUGIN, "skip_upload_min_rating", "string",
   _("Flickr: minimum rating to upload"), _("blank disables; images rated below this 0-5 threshold are not uploaded to Flickr"), "")
