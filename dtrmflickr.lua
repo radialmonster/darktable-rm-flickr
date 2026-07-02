@@ -10916,6 +10916,8 @@ local function panel_reset_remote(message)
   panel_stats_label.label = ""
   if panel_sets.sync_surface_label then panel_sets.sync_surface_label.label = "" end
   panel_sets.sync_model = nil
+  panel_sets.sync_surface_remote = nil
+  if panel_sets.push_all_button then panel_sets.push_all_button.label = _("push all changed") end
   if panel_reconcile.reset then panel_reconcile.reset() end
   panel_loading = true
   panel_privacy_widget.selected = 0
@@ -12415,6 +12417,14 @@ end
 -- The pure aggregation/verdict lives in dtrmflickr.sync_surface (offline-tested).
 -- Renders into panel_sets.sync_surface_label and stashes the model so
 -- push_all_changed can act on it. Live-gated (panel paint needs in-app verify).
+--
+-- Callable with body == nil for a LOCAL-ONLY rebuild (the 3s auto-scan poll and
+-- the navigate-away flush do this when they detect drift on the on-screen
+-- image): the last getInfo body is cached per image (sync_surface_remote), so a
+-- poll-driven rebuild keeps the three-way remote verdicts instead of degrading
+-- them to two-way, and the keywords set-diff is recomputed from the cached
+-- remote tags + the CURRENT local keywords so a keyword edit goes live within a
+-- poll tick without touching the tags tab's widgets mid-interaction.
 function panel_sets.refresh_sync_surface(body)
   local surface = require("dtrmflickr.sync_surface")
   local acc, image = panel_current.account, panel_current.image
@@ -12422,6 +12432,11 @@ function panel_sets.refresh_sync_surface(body)
   if not image or not acc then
     panel_sets.sync_surface_label.label = ""
     return
+  end
+  if body ~= nil then
+    panel_sets.sync_surface_remote = { image = image, body = body }
+  elseif panel_sets.sync_surface_remote and panel_sets.sync_surface_remote.image == image then
+    body = panel_sets.sync_surface_remote.body
   end
   local sync = master_sync_fields()
   local local_fps = effective_metadata_fingerprints(image, sync) or {}
@@ -12445,8 +12460,14 @@ function panel_sets.refresh_sync_surface(body)
   end
 
   if sync.tags then
-    -- The reconciler's diff was refreshed from the same getInfo body on load.
-    local d = panel_reconcile and panel_reconcile.diff or nil
+    -- panel_reconcile.diff ~= nil means the remote tags were loaded for this
+    -- photo. Recompute the set diff here from the cached remote tags + the
+    -- CURRENT local keywords (rather than reusing the load-time diff) so a
+    -- local keyword edit flips this row live on the next poll tick. Purely a
+    -- read — the tags tab's own diff/labels repaint only on a real remote load.
+    local d = (panel_reconcile and panel_reconcile.diff)
+      and tag_reconcile.diff(rules.image_keyword_names(image) or {}, panel_reconcile.remote_tags or {})
+      or nil
     local kw_status = "unknown"
     if d then
       local lo = #(d.local_only or {})
@@ -12482,7 +12503,24 @@ function panel_sets.refresh_sync_surface(body)
   for _, r in ipairs(model.rows) do
     lines[#lines + 1] = string.format("  %s: %s", r.label, r.status_label)
   end
-  panel_sets.sync_surface_label.label = table.concat(lines, "\n")
+  local text = table.concat(lines, "\n")
+  -- The 3s poll calls this repeatedly while nothing changes; skip the GTK
+  -- label write (and the redraw it triggers) when the text is identical.
+  if panel_sets.sync_surface_label.label ~= text then
+    panel_sets.sync_surface_label.label = text
+  end
+  -- State-aware hero button (#85): the surface knows how many fields are
+  -- safely pushable, so say it on the button. Only meaningful for a single
+  -- selection (multi-select routes to the batch push and the model is per-image).
+  if panel_sets.push_all_button then
+    local n = #(model.push_all or {})
+    local label = (n > 0 and (panel_current.selection_count or 0) == 1)
+      and string.format(_("push %d changed field(s)"), n)
+      or _("push all changed")
+    if panel_sets.push_all_button.label ~= label then
+      panel_sets.push_all_button.label = label
+    end
+  end
 end
 
 -- "Push all changed" (issue #87): push every field the unified surface classified
@@ -13821,6 +13859,15 @@ end
 --   5 fix      link/claim plumbing, publish-state repair, job grid, delete
 -- Every widget/callback is the same object as before, only layout changed. Pages
 -- are built inline so they cost no main-chunk locals (only the stack is named).
+-- The "push all changed" hero button lives on panel_sets (not inline) so
+-- refresh_sync_surface can rewrite its label with the live pushable-field
+-- count ("push 2 changed field(s)") as the auto-scan poll detects drift.
+panel_sets.push_all_button = dt.new_widget("button") {
+  label = _("push all changed"),
+  tooltip = _("push every field the sync status shows as 'edited in darktable' to Flickr in one click (title/description, keywords, GPS/date taken as applicable). Fields edited on Flickr or on both sides are left for you to resolve per-field below. With more than one image selected, pushes the changed, sync-enabled metadata of every selected published photo."),
+  clicked_callback = function() panel_sets.push_all_changed() end,
+}
+
 local panel_tab_stack = dt.new_widget("stack") {
   -- 1: sync — the daily loop (#87): one diff-driven summary of every syncable
   -- field's divergence from the last-synced baseline, a single "push all
@@ -13830,11 +13877,7 @@ local panel_tab_stack = dt.new_widget("stack") {
     panel_remote_label,
     dt.new_widget("label") { label = _("sync status") },
     panel_sets.sync_surface_label,
-    dt.new_widget("button") {
-      label = _("push all changed"),
-      tooltip = _("push every field the sync status shows as 'edited in darktable' to Flickr in one click (title/description, keywords, GPS/date taken as applicable). Fields edited on Flickr or on both sides are left for you to resolve per-field below. With more than one image selected, pushes the changed, sync-enabled metadata of every selected published photo."),
-      clicked_callback = function() panel_sets.push_all_changed() end,
-    },
+    panel_sets.push_all_button,
     dt.new_widget("button") {
       label = _("push title/description to Flickr"),
       tooltip = _("push the local title/description to the linked Flickr photo (only fields whose sync toggle is on)"),
@@ -15100,6 +15143,9 @@ script_data.__test = {
   -- Keyword push kept test-reachable after its standalone sync-tab button was
   -- deduplicated away ("push all changed" and the tags tab cover the UI paths).
   sync_panel_tags = sync_panel_tags,
+  -- Sync-surface rebuild (poll-driven live refresh) test hooks.
+  refresh_sync_surface = panel_sets.refresh_sync_surface,
+  panel_sets = panel_sets,
   privacy_values = settings.privacy_values,
   safety_values = settings.safety_values,
   content_type_values = settings.content_type_values,
@@ -15135,6 +15181,11 @@ __dtrmflickr_autoscan = require("dtrmflickr.auto_scan").new {
     if panel_current and panel_current.image == image and panel_current.selection_count == 1
       and panel_current.account and panel_current.account.nsid == nsid then
       panel_sets.refresh_publish_state_label(image, panel_current.account, photo_id)
+      -- Also rebuild the sync tab's per-field rows (and the push-all button
+      -- count) so the landing tab is live, not just the header. Local-only
+      -- rebuild: no network — the cached getInfo body keeps the remote
+      -- verdicts, and identical text skips the label write entirely.
+      panel_sets.refresh_sync_surface(nil)
     end
     return status, published_at, photo_id, reasons
   end,
