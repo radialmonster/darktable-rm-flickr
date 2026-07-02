@@ -1185,6 +1185,24 @@ function M.is_token_expired(err)
   return kind == "expired"
 end
 
+-- Proactively validate the saved OAuth token (flickr.auth.oauth.checkToken,
+-- issue #53). A signed READ that returns the token's credentials on success, so
+-- it is safe to call before a batch commits. Returns the raw body on success, or
+-- (nil, err) on failure. An expired/revoked token surfaces as REST code 98 /
+-- HTTP 401 — classify the err with is_token_expired (see token_check.lua). The
+-- OAuth base params already carry oauth_token; it is passed explicitly too
+-- because the method documents it as required (same value, single param key).
+function M.check_token(api_key, api_secret, account)
+  if not account or not account.token or not account.secret then
+    return nil, "not logged in to Flickr"
+  end
+  local body, err = M.call(api_key, api_secret, account, "flickr.auth.oauth.checkToken", {
+    oauth_token = account.token,
+  })
+  if not body then return nil, err end
+  return body
+end
+
 function M.call(api_key, api_secret, account, method, args)
   if not account or not account.token or not account.secret then
     return nil, "not logged in to Flickr"
@@ -2053,6 +2071,75 @@ function M.upload_check_tickets(api_key, ticket_ids)
   })
   if not body then return nil, err end
   return M.parse_upload_tickets(body), body
+end
+
+return M
+end
+
+package.preload["dtrmflickr.token_check"] = function(...)
+-- token_check.lua — proactive OAuth token validation (issue #53).
+--
+-- Today a saved token's expiry/revocation is detected *reactively*: the first
+-- signed call of a batch fails with REST code 98 / HTTP 401 and
+-- __dtrmflickr_call flips the session to "needs re-login" via
+-- __dtrmflickr_note_auth_failure. That is correct but surfaces mid-operation,
+-- after darktable has already exported temp files that will all fail to upload.
+--
+-- This module lets a caller cheaply confirm the token BEFORE committing a batch,
+-- using flickr.auth.oauth.checkToken (a signed read). It is PURE and injected —
+-- the REST call is supplied through deps.rest so it is offline-testable by
+-- mocking the checkToken response (tests/test_token_check.lua).
+--
+-- Verdict contract (three states — the caller must fail OPEN):
+--   "valid"        checkToken returned stat="ok": the token still works.
+--   "expired"      a DEFINITIVE re-login signal — REST code 98 or HTTP 401 on
+--                  the signed call (classified by flickr_rest.is_token_expired).
+--                  Only this verdict should trigger a re-login prompt / abort.
+--   "inconclusive" any other failure (transport error, throttle, code 99
+--                  permission, service unavailable, …). MUST NOT block the batch:
+--                  a transient checkToken hiccup is not evidence the token is bad.
+--   "skipped"      nothing to validate (no saved token, or no API credentials).
+--
+-- The "expired" verdict deliberately reuses flickr_rest.is_token_expired so a
+-- proactive abort and the reactive note_auth_failure agree on exactly which
+-- failures mean "log in again" (code 98 / 401), never the ambiguous 99.
+
+local rest = require "dtrmflickr.flickr_rest"
+
+local M = {}
+
+-- classify(ok, err) -> "valid" | "expired" | "inconclusive"
+-- ok  truthy on a successful checkToken (the raw body), falsy on failure.
+-- err the failure string when ok is falsy.
+function M.classify(ok, err)
+  if ok then return "valid" end
+  if rest.is_token_expired(err) then return "expired" end
+  return "inconclusive"
+end
+
+-- check(deps) -> verdict, err
+--   deps.account     the saved account { token, secret, nsid, ... }
+--   deps.api_key     Flickr API key
+--   deps.api_secret  Flickr API secret
+--   deps.rest        REST module (defaults to flickr_rest); must expose
+--                    check_token(api_key, api_secret, account) -> body | nil, err
+-- Returns "skipped" (with no err) when there is nothing to validate, otherwise
+-- the classify() verdict for the checkToken result plus the raw err on failure.
+-- One signed read at most; never called when there is no saved token.
+function M.check(deps)
+  deps = deps or {}
+  local account = deps.account
+  if not (account and account.token ~= nil and account.token ~= ""
+    and account.secret ~= nil and account.secret ~= "") then
+    return "skipped"
+  end
+  local api_key, api_secret = deps.api_key, deps.api_secret
+  if not api_key or api_key == "" or not api_secret or api_secret == "" then
+    return "skipped"
+  end
+  local r = deps.rest or rest
+  local body, err = r.check_token(api_key, api_secret, account)
+  return M.classify(body, err), err
 end
 
 return M
@@ -15662,6 +15749,33 @@ local function initialize(storage, format, images, high_quality, extra_data)
   extra_data.skipped  = {}
   extra_data.account  = load_token()
   extra_data.api_key, extra_data.api_secret = get_credentials()
+  -- Proactive token validation (issue #53): before committing this batch, cheaply
+  -- confirm the saved OAuth token still works via flickr.auth.oauth.checkToken, so
+  -- we prompt re-login BEFORE darktable exports temp files that would every one
+  -- fail to upload. Skipped entirely when there is no saved token or no API
+  -- credentials (nothing to validate) — at most one extra signed read per batch.
+  -- Fail-OPEN: only a DEFINITIVE expired/revoked verdict (REST code 98 / HTTP 401,
+  -- the same signal the reactive __dtrmflickr_note_auth_failure path acts on)
+  -- aborts the batch; a transient or inconclusive checkToken result never blocks
+  -- the export (the reactive path still covers a token that dies mid-batch).
+  if extra_data.account then
+    local verdict, verr = require("dtrmflickr.token_check").check({
+      account = extra_data.account,
+      api_key = extra_data.api_key,
+      api_secret = extra_data.api_secret,
+      rest = rest,
+    })
+    if verdict == "expired" then
+      if __dtrmflickr_note_auth_failure then __dtrmflickr_note_auth_failure(verr) end
+      dt.print(_("Flickr login expired or was revoked — log in again before exporting. No images were uploaded."))
+      dt.print_log("[dtrmflickr] initialize: proactive checkToken says token expired/revoked; aborting batch: " .. tostring(verr))
+      return {}   -- export nothing; store/upload would only fail with 98/401
+    elseif verdict == "inconclusive" then
+      -- Not evidence the token is bad (transport/throttle/permission). Log and
+      -- continue; if the token really is dead, the reactive path will flip it.
+      dt.print_log("[dtrmflickr] initialize: proactive checkToken inconclusive, continuing: " .. tostring(verr))
+    end
+  end
   extra_data.privacy = current_privacy()
   extra_data.safety = current_safety()
   extra_data.content_type = current_content_type()
