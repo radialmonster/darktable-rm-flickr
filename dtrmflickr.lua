@@ -8169,12 +8169,16 @@ M.PULLABLE = PULLABLE
 -- Human-friendly one-word status + the plain-language hint the panel shows next
 -- to each row. Kept here (not in state.lua) because it is surface-specific
 -- phrasing; the field *labels* still come from state.reason_label (#69).
+-- Wording note: the verdicts come from a three-way compare against the
+-- last-synced baseline fingerprint, NOT timestamps — the plugin knows which
+-- side diverged since the last sync, never which edit is chronologically
+-- "newer". The labels say "edited …" to stay honest about that.
 local STATUS_TEXT = {
-  in_sync  = { label = "in sync",       hint = "matches Flickr" },
-  ["local"] = { label = "local newer",  hint = "darktable has newer changes - push to Flickr" },
-  remote   = { label = "Flickr newer",  hint = "Flickr has newer changes - pull into darktable" },
-  conflict = { label = "conflict",      hint = "both sides changed - choose push or pull" },
-  unknown  = { label = "not compared",  hint = "compare with Flickr to see differences" },
+  in_sync  = { label = "in sync",             hint = "matches Flickr" },
+  ["local"] = { label = "edited in darktable", hint = "changed here since the last sync - push to Flickr" },
+  remote   = { label = "edited on Flickr",    hint = "changed on Flickr since the last sync - pull into darktable" },
+  conflict = { label = "edited on both sides", hint = "both sides changed since the last sync (or no sync history) - choose push or pull" },
+  unknown  = { label = "not yet compared",    hint = "compare with Flickr to see differences" },
 }
 M.STATUS_TEXT = STATUS_TEXT
 
@@ -8287,7 +8291,7 @@ function M.build_model(fields)
     if counts["local"] > 0 then parts[#parts + 1] = string.format("%d to push", counts["local"]) end
     if counts.remote > 0 then parts[#parts + 1] = string.format("%d to pull", counts.remote) end
     if counts.conflict > 0 then parts[#parts + 1] = string.format("%d in conflict", counts.conflict) end
-    if counts.unknown > 0 then parts[#parts + 1] = string.format("%d not compared", counts.unknown) end
+    if counts.unknown > 0 then parts[#parts + 1] = string.format("%d not yet compared", counts.unknown) end
     if #parts == 0 then
       headline = "Everything is in sync with Flickr."
     else
@@ -10518,7 +10522,7 @@ panel_sets.dashboard_label = dt.new_widget("label") { label = "" }
 -- Linked Flickr URL surfaced in the always-visible header (issue #86): the photo
 -- URL for a single published selection, or a compact count for a multi-select.
 -- Populated by refresh_url_actions via urls.header_url_summary; blank when the
--- selection has nothing linked. The click-to-open/copy actions stay in the link
+-- selection has nothing linked. The click-to-open/copy actions stay in the fix
 -- tab (panel_sets.url_label); this is a read-only header echo so the linked page
 -- is visible regardless of the active tab.
 panel_sets.header_url_label = dt.new_widget("label") { label = "" }
@@ -10542,7 +10546,7 @@ for i = 1, panel_sets.queue_jobs_limit do
 end
 panel_sets.queue_uncertain_label = dt.new_widget("label") { label = "" }
 -- Unified sync surface (issue #87): one diff-driven summary of every syncable
--- field's state (in sync / local newer / Flickr newer / conflict) for the
+-- field's state (in sync / edited in darktable / edited on Flickr / conflict) for the
 -- selected published photo, plus a "push all changed" button. Composes the
 -- already-verified per-field push/pull paths; the pure model lives in
 -- dtrmflickr.sync_surface. Kept on panel_sets (table field) to respect Lua's
@@ -10723,6 +10727,15 @@ end
 -- Returns (label, detail).
 local function format_queue_status(summary, recent)
   if not summary then return "", "" end
+  -- All-zero scoreboard: nothing has run (or the export-start reset just
+  -- happened). The label now lives in the always-visible header (#85), so an
+  -- idle session shows nothing instead of a permanent "queue: 0 ok, ..." line.
+  if (summary.succeeded or 0) == 0 and (summary.failed or 0) == 0
+    and (summary.retried or 0) == 0 and (summary.pending or 0) == 0
+    and (tonumber(summary.rate_limited) or 0) == 0
+    and (tonumber(summary.waited_ms) or 0) < 100 then
+    return "", ""
+  end
   local label = string.format(
     _("queue: %d ok, %d failed, %d retried, %d pending"),
     summary.succeeded or 0, summary.failed or 0, summary.retried or 0, summary.pending or 0)
@@ -10796,7 +10809,12 @@ function panel_sets.clear_current_choices()
   panel_sets.current_ids = {}
   clear_widget_items(panel_sets.current_widget)  -- not a cached for-loop; see clear_widget_items
   panel_sets.current_widget[1] = _("Select one of this photo's albums")
-  panel_sets.current_widget.selected = 1
+  -- Guarded: one cold-start GUI smoke run showed `selected = 1` raising
+  -- "Invalid index for combo box : 1" — the bauhaus combobox reported length 0
+  -- right after the append while the panel was still being assembled
+  -- (register_lib view callback racing widget realization). Selecting is
+  -- cosmetic here, so skip it rather than let the error abort refresh_panel.
+  if #panel_sets.current_widget > 0 then panel_sets.current_widget.selected = 1 end
 end
 
 function panel_sets.update_current_choices(image, account_nsid)
@@ -10967,7 +10985,7 @@ function panel_sets.refresh_url_actions(selection, owner, account_nsid)
     panel_sets.url_label.label = string.format(_("%d Flickr URLs ready (open/copy)"), result.published)
   end
   -- Echo the linked URL into the always-visible header (issue #86) so a Flickr
-  -- user sees the linked page without opening the link tab; the interactive
+  -- user sees the linked page without opening the fix tab; the interactive
   -- open/copy buttons still live there acting on the same url_links set.
   if panel_sets.header_url_label then
     panel_sets.header_url_label.label = u.header_url_summary(result, _)
@@ -13783,50 +13801,31 @@ do
   panel_sets.queue_jobs_box = dt.new_widget("box")(children)
 end
 
--- Tabbed panel layout (issue #82). darktable's Lua widget API has no GtkNotebook
--- (that is C-only, via dt_ui_notebook_new), so "tabs" are a `stack` (shows one
--- child at a time) switched by a row of tab buttons. Each stack page is a
--- vertical box of the sections that used to be stacked flat; only layout changed,
--- every widget/callback is the same object as before. Pages are built inline so
--- they cost no main-chunk locals (only the stack + its status label are named).
-local panel_tab_label = dt.new_widget("label") { label = _("section: meta") }
-
+-- Tabbed panel layout (issue #82, reorganized per #85). darktable's Lua widget
+-- API has no GtkNotebook (that is C-only, via dt_ui_notebook_new), so "tabs" are
+-- a `stack` (shows one child at a time) switched by a single row of tab buttons.
+-- Five task-oriented tabs (was eight data-type tabs), ordered by how often a
+-- Flickr photographer needs them:
+--   1 sync     the daily loop: per-field divergence + push/pull/compare
+--   2 tags     tag reconciler + people tagging
+--   3 albums   album membership/cover/order/create + groups/pools
+--   4 settings Flickr photo settings (the panel's only "save") + location privacy
+--   5 fix      link/claim plumbing, publish-state repair, job grid, delete
+-- Every widget/callback is the same object as before, only layout changed. Pages
+-- are built inline so they cost no main-chunk locals (only the stack is named).
 local panel_tab_stack = dt.new_widget("stack") {
-  -- 1: meta — Flickr settings (save settings) + title/description sync + GPS/date
+  -- 1: sync — the daily loop (#87): one diff-driven summary of every syncable
+  -- field's divergence from the last-synced baseline, a single "push all
+  -- changed", then the per-field push/pull/compare actions.
   dt.new_widget("box") {
     orientation = "vertical",
     panel_remote_label,
-    -- Unified sync surface (#87): lead the meta tab with one diff-driven summary of
-    -- every syncable field's state + a single "push all changed". The individual
-    -- push/pull/compare buttons stay available below for per-field control.
     dt.new_widget("label") { label = _("sync status") },
     panel_sets.sync_surface_label,
     dt.new_widget("button") {
       label = _("push all changed"),
-      tooltip = _("push every field the sync status shows as 'local newer' to Flickr in one click (title/description, keywords, GPS/date taken as applicable). Conflicts and Flickr-newer fields are left for you to resolve per-field below."),
+      tooltip = _("push every field the sync status shows as 'edited in darktable' to Flickr in one click (title/description, keywords, GPS/date taken as applicable). Fields edited on Flickr or on both sides are left for you to resolve per-field below."),
       clicked_callback = function() panel_sets.push_all_changed() end,
-    },
-    panel_tags_label,
-    panel_sets.batch_indicator_label,
-    panel_privacy_widget,
-    panel_safety_widget,
-    panel_content_type_widget,
-    panel_license_widget,
-    panel_comment_perm_widget,
-    panel_addmeta_perm_widget,
-    dt.new_widget("button") {
-      label = _("save settings"),
-      tooltip = _("apply the Flickr settings comboboxes above (privacy, safety, content type, license, comment/metadata permissions) to the published photo; with more than one image selected, applies to every selected published photo (two-click confirm). Other tabs' actions apply immediately on click and need no save."),
-      clicked_callback = function()
-        -- Dispatch by selection size (issue #49): one image keeps the verified
-        -- single-image path untouched; >1 routes to the batch applier with
-        -- two-click confirmation.
-        if (panel_current.selection_count or 0) > 1 then
-          panel_sets.apply_settings_to_selection()
-        else
-          save_panel_settings()
-        end
-      end,
     },
     dt.new_widget("button") {
       label = _("push title/description to Flickr"),
@@ -13844,24 +13843,25 @@ local panel_tab_stack = dt.new_widget("stack") {
       clicked_callback = function() panel_sets.compare_remote_meta() end,
     },
     dt.new_widget("button") {
+      label = _("push keywords to Flickr"),
+      tooltip = _("push the local darktable keywords to the linked Flickr photo's tags; the tags tab has the fine-grained reconciler"),
+      clicked_callback = function() sync_panel_tags() end,
+    },
+    dt.new_widget("button") {
       label = _("push GPS/date taken to Flickr"),
       tooltip = _("push darktable GPS location and date taken to the linked Flickr photo without re-uploading"),
       clicked_callback = function() panel_sets.sync_geo_date() end,
     },
     dt.new_widget("button") {
-      label = _("remove Flickr location"),
-      tooltip = _("remove the geotag/location from the selected published photo(s) on Flickr (privacy); idempotent and does not re-upload"),
-      clicked_callback = function() panel_sets.remove_geo_location() end,
+      label = _("push metadata to selected"),
+      tooltip = _("resend only the changed, sync-enabled metadata (title/description, keywords, GPS, date taken) for every selected published photo, without re-uploading pixels"),
+      clicked_callback = function() panel_sets.push_selected_metadata() end,
     },
   },
-  -- 2: keywords — sync darktable keywords + the tag reconciler (issue #3)
+  -- 2: tags — remote tags + the tag reconciler (issue #3) + people tags (#24)
   dt.new_widget("box") {
     orientation = "vertical",
-    dt.new_widget("button") {
-      label = _("push keywords to Flickr"),
-      tooltip = _("push the local darktable keywords to the linked Flickr photo's tags"),
-      clicked_callback = function() sync_panel_tags() end,
-    },
+    panel_tags_label,
     dt.new_widget("label") { label = _("tag reconciler") },
     panel_reconcile.diff_label,
     dt.new_widget("box") {
@@ -13891,10 +13891,6 @@ local panel_tab_stack = dt.new_widget("stack") {
         clicked_callback = function() panel_reconcile.replace_from_local() end,
       },
     },
-  },
-  -- 3: people — people tags (issue #24)
-  dt.new_widget("box") {
-    orientation = "vertical",
     dt.new_widget("label") { label = _("people tags") },
     panel_sets.people_entry,
     dt.new_widget("button") {
@@ -13903,7 +13899,7 @@ local panel_tab_stack = dt.new_widget("stack") {
       clicked_callback = function() panel_sets.tag_people() end,
     },
   },
-  -- 4: albums — album membership, cover/order, create
+  -- 3: albums — album membership, cover/order, create + groups/pools
   dt.new_widget("box") {
     orientation = "vertical",
     panel_sets_label,
@@ -13978,10 +13974,8 @@ local panel_tab_stack = dt.new_widget("stack") {
       },
     },
     panel_sets.status_label,
-  },
-  -- 5: groups — Flickr groups / pools
-  dt.new_widget("box") {
-    orientation = "vertical",
+    -- Groups/pools (#32) share the tab: like albums, they are "where does this
+    -- photo get shared" destinations.
     dt.new_widget("label") { label = _("groups / pools") },
     panel_pools.entry,
     dt.new_widget("box") {
@@ -14004,7 +13998,42 @@ local panel_tab_stack = dt.new_widget("stack") {
     panel_pools.match_widget,
     panel_pools.status_label,
   },
-  -- 6: link — the linked photo's URL, plus photo link / claim / batch claim
+  -- 4: settings — Flickr photo *properties* (privacy/safety/content type/
+  -- license/permissions), changed occasionally, separated from the daily sync
+  -- tab so the panel's only "save" button lives where saving is the model.
+  -- Location privacy (remove geotag) is a property too, so it lives here.
+  dt.new_widget("box") {
+    orientation = "vertical",
+    panel_sets.batch_indicator_label,
+    panel_privacy_widget,
+    panel_safety_widget,
+    panel_content_type_widget,
+    panel_license_widget,
+    panel_comment_perm_widget,
+    panel_addmeta_perm_widget,
+    dt.new_widget("button") {
+      label = _("save settings"),
+      tooltip = _("apply the Flickr settings comboboxes above (privacy, safety, content type, license, comment/metadata permissions) to the published photo; with more than one image selected, applies to every selected published photo (two-click confirm). Other tabs' actions apply immediately on click and need no save."),
+      clicked_callback = function()
+        -- Dispatch by selection size (issue #49): one image keeps the verified
+        -- single-image path untouched; >1 routes to the batch applier with
+        -- two-click confirmation.
+        if (panel_current.selection_count or 0) > 1 then
+          panel_sets.apply_settings_to_selection()
+        else
+          save_panel_settings()
+        end
+      end,
+    },
+    dt.new_widget("button") {
+      label = _("remove Flickr location"),
+      tooltip = _("remove the geotag/location from the selected published photo(s) on Flickr (privacy); idempotent and does not re-upload"),
+      clicked_callback = function() panel_sets.remove_geo_location() end,
+    },
+  },
+  -- 5: fix — the repair tab: link/claim plumbing, publish-state reconciliation,
+  -- the live job grid, and (last) the destructive delete. Rare tasks, out of
+  -- the daily path.
   dt.new_widget("box") {
     orientation = "vertical",
     panel_sets.url_label,
@@ -14037,10 +14066,9 @@ local panel_tab_stack = dt.new_widget("stack") {
       tooltip = _("link the selected images, in order, to the pasted Flickr photo IDs/URLs"),
       clicked_callback = function() panel_sets.batch_claim_from_list() end,
     },
-  },
-  -- 7: publish — publish-state actions + destructive delete
-  dt.new_widget("box") {
-    orientation = "vertical",
+    -- Publish-state repair (#17): manual overrides of the auto-scan drift flag
+    -- plus reconciliation of drifted publish state.
+    dt.new_widget("label") { label = _("publish state") },
     dt.new_widget("box") {
       orientation = "horizontal",
       dt.new_widget("button") {
@@ -14059,17 +14087,20 @@ local panel_tab_stack = dt.new_widget("stack") {
     },
     dt.new_widget("button") {
       label = _("scan selected"),
+      tooltip = _("re-evaluate publish state for the selection now; auto-scan already does this on selection change, so this is a manual fallback"),
       clicked_callback = function() panel_sets.scan_selected_publish_state() end,
     },
-    dt.new_widget("button") {
-      label = _("push metadata to selected"),
-      tooltip = _("resend only the changed, sync-enabled metadata (title/description, keywords, GPS, date taken) for every selected published photo, without re-uploading pixels"),
-      clicked_callback = function() panel_sets.push_selected_metadata() end,
-    },
+    -- Upload jobs (issue #56): the live job-lifecycle grid. The one-line counts
+    -- summary (queue_label) lives in the always-visible header (#85) so queue
+    -- activity is visible on every tab; the detail grid stays here.
+    dt.new_widget("label") { label = _("upload jobs") },
+    panel_sets.queue_detail_label,
+    panel_sets.queue_jobs_box,
     -- Destructive delete section (issue #19): the confirm checkbox gates the
     -- button, which permanently removes the photo from Flickr and forgets the
     -- local link. Needs a delete-scope login (Lua options > 'request delete
-    -- permission on next login').
+    -- permission on next login'). Deliberately last on the repair tab so the
+    -- scariest action sits at the bottom, not on a daily-use surface.
     panel_sets.delete_confirm,
     dt.new_widget("button") {
       label = _("delete from Flickr"),
@@ -14077,14 +14108,50 @@ local panel_tab_stack = dt.new_widget("stack") {
       clicked_callback = function() panel_sets.delete_selected() end,
     },
   },
-  -- 8: jobs — the live queue job-lifecycle grid (issue #56)
-  dt.new_widget("box") {
-    orientation = "vertical",
-    panel_sets.queue_label,
-    panel_sets.queue_detail_label,
-    panel_sets.queue_jobs_box,
-  },
 }
+
+-- Tab switcher (#82/#85): ONE row of five buttons. darktable Lua buttons have
+-- no pressed/active rendering, so the active tab is marked with a "▸ " label
+-- prefix instead of the old "section:" status line. The active index persists
+-- across sessions via a preference. All state hangs off panel_sets (no new
+-- main-chunk locals).
+panel_sets.tab_names = { _("sync"), _("tags"), _("albums"), _("settings"), _("fix") }
+panel_sets.tab_buttons = {}
+panel_sets.set_active_tab = function(index, startup)
+  if type(index) ~= "number" or index < 1 or index > #panel_sets.tab_names then index = 1 end
+  panel_tab_stack.active = index
+  for i, button in ipairs(panel_sets.tab_buttons) do
+    local name = panel_sets.tab_names[i]
+    button.label = (i == index) and ("▸ " .. name) or name
+  end
+  if not startup then
+    dt.preferences.write(PLUGIN, "panel_active_tab", "integer", index)
+    -- First albums-tab open with an empty cache: load the album list
+    -- automatically so search/add work without a manual "refresh albums" click.
+    -- Once per session, only when logged in, and never during the startup
+    -- restore (no network while the script loads).
+    if index == 3 and #album_cache == 0 and not panel_sets.albums_autoloaded and load_token() then
+      panel_sets.albums_autoloaded = true
+      panel_sets.refresh_list()
+    end
+  end
+end
+do
+  local tab_tooltips = {
+    _("sync status + push/pull/compare title/description, keywords, GPS/date taken"),
+    _("tag reconciler: local keywords vs Flickr tags + people tags"),
+    _("album membership, cover/order, create + groups/pools"),
+    _("Flickr photo settings: privacy, safety, content type, license, permissions + location privacy"),
+    _("link/claim an existing Flickr photo, publish-state repair, upload jobs, delete"),
+  }
+  for i, name in ipairs(panel_sets.tab_names) do
+    panel_sets.tab_buttons[i] = dt.new_widget("button") {
+      label = name,
+      tooltip = tab_tooltips[i],
+      clicked_callback = function() panel_sets.set_active_tab(i) end,
+    }
+  end
+end
 
 local panel_widget = dt.new_widget("box") {
   orientation = "vertical",
@@ -14103,75 +14170,39 @@ local panel_widget = dt.new_widget("box") {
   -- header so a Flickr user sees them regardless of the active tab (#85, "lead
   -- with state"). Populated on remote load; blank until then.
   panel_stats_label,
+  -- Queue one-liner (#85): the "queue: N ok/failed …" counts summary is header
+  -- state too — whether an upload is in flight should be visible on every tab,
+  -- not only while the fix tab's job grid is showing. Blank when idle.
+  panel_sets.queue_label,
   -- Selection-aware guidance (issue #88): one contextual line telling the user
   -- what the selection can/can't do ("select an image", "log in to Flickr first",
   -- "not on Flickr yet — publish first"), so a control that doesn't apply reads as
   -- an explained next step instead of a dead button. Blank when everything is
   -- actionable. Sits above the tab bar it governs.
   panel_sets.guidance_label,
-  -- Tab bar (issue #82): two rows of buttons switch panel_tab_stack. Two rows
-  -- keep the short labels readable in a narrow lighttable panel.
   dt.new_widget("box") {
     orientation = "horizontal",
-    dt.new_widget("button") {
-      label = _("meta"),
-      tooltip = _("Flickr settings (privacy/safety/license/…) + push/pull title/description + GPS/date"),
-      clicked_callback = function() panel_tab_stack.active = 1; panel_tab_label.label = _("section: meta") end,
-    },
-    dt.new_widget("button") {
-      label = _("keywords"),
-      tooltip = _("push keywords + tag reconciler: local keywords vs Flickr tags"),
-      clicked_callback = function() panel_tab_stack.active = 2; panel_tab_label.label = _("section: keywords") end,
-    },
-    dt.new_widget("button") {
-      label = _("people"),
-      tooltip = _("people tags: add Flickr members to the photo"),
-      clicked_callback = function() panel_tab_stack.active = 3; panel_tab_label.label = _("section: people") end,
-    },
-    dt.new_widget("button") {
-      label = _("albums"),
-      tooltip = _("album membership, cover/order, create"),
-      clicked_callback = function() panel_tab_stack.active = 4; panel_tab_label.label = _("section: albums") end,
-    },
+    panel_sets.tab_buttons[1],
+    panel_sets.tab_buttons[2],
+    panel_sets.tab_buttons[3],
+    panel_sets.tab_buttons[4],
+    panel_sets.tab_buttons[5],
   },
-  dt.new_widget("box") {
-    orientation = "horizontal",
-    dt.new_widget("button") {
-      label = _("groups"),
-      tooltip = _("Flickr groups / pools"),
-      clicked_callback = function() panel_tab_stack.active = 5; panel_tab_label.label = _("section: groups") end,
-    },
-    dt.new_widget("button") {
-      label = _("link"),
-      tooltip = _("the linked photo's URL + link/claim this image to an existing Flickr photo"),
-      clicked_callback = function() panel_tab_stack.active = 6; panel_tab_label.label = _("section: link") end,
-    },
-    dt.new_widget("button") {
-      label = _("publish"),
-      tooltip = _("publish-state actions, push metadata, delete"),
-      clicked_callback = function() panel_tab_stack.active = 7; panel_tab_label.label = _("section: publish") end,
-    },
-    dt.new_widget("button") {
-      label = _("jobs"),
-      tooltip = _("live upload/queue job tracker"),
-      clicked_callback = function() panel_tab_stack.active = 8; panel_tab_label.label = _("section: jobs") end,
-    },
-  },
-  panel_tab_label,
   panel_tab_stack,
   -- Persistent footer (issue #82): common actions that apply regardless of the
   -- active tab live below the stack so they're always reachable. "refresh"
   -- reloads the panel for the current selection. (Unlike "save settings", which
-  -- is meta-specific because only that tab holds the settings comboboxes; every
-  -- other tab's actions apply immediately on click.)
+  -- is settings-specific because only that tab holds the settings comboboxes;
+  -- every other tab's actions apply immediately on click.)
   dt.new_widget("button") {
     label = _("refresh"),
     tooltip = _("reload the panel for the current selection — available on every tab"),
     clicked_callback = function() refresh_panel(true, true) end,
   },
 }
--- Open on the meta tab by default.
-panel_tab_stack.active = 1
+-- Restore the last active tab (defaults to sync). startup=true skips the pref
+-- rewrite and the lazy album load — no network during script load.
+panel_sets.set_active_tab(dt.preferences.read(PLUGIN, "panel_active_tab", "integer"), true)
 
 ----------------------------------------------------------------------
 -- Storage callbacks.
