@@ -112,8 +112,17 @@ end
 ----------------------------------------------------------------------
 -- RFC 3986 percent-encoding (OAuth-correct: only A-Z a-z 0-9 - . _ ~ raw)
 ----------------------------------------------------------------------
+-- The unreserved set is matched with an EXPLICIT ASCII class, NOT `%w`.
+-- Lua's `%w` is locale-dependent: darktable sets a UI locale at runtime (e.g. a
+-- Windows *.1252 codepage) under which `%w` matches high bytes (0x80-0xFF), so a
+-- byte like 0xC3 (the lead byte of "é") would be left un-encoded. That silently
+-- corrupts BOTH the OAuth signature base string and the POST body for ANY
+-- non-ASCII parameter value (accented titles, CJK, emoji, em-dash, curly quotes),
+-- which Flickr rejects with a generic error 201. Standalone offline tests never
+-- caught it because plain Lua runs in the C locale, where `%w` is ASCII-only.
+-- Keep this ASCII-literal so encoding is identical regardless of process locale.
 local function encode(s)
-  return (tostring(s):gsub("[^%w%-%._~]", function(c)
+  return (tostring(s):gsub("[^A-Za-z0-9%-%._~]", function(c)
     return string.format("%%%02X", string.byte(c))
   end))
 end
