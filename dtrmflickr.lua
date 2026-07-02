@@ -14803,8 +14803,8 @@ local panel_tab_stack = dt.new_widget("stack") {
       end,
     },
     dt.new_widget("button") {
-      label = _("remove Flickr location"),
-      tooltip = _("remove the geotag/location from the selected published photo(s) on Flickr (privacy); idempotent and does not re-upload"),
+      label = _("remove Flickr GPS location"),
+      tooltip = _("remove the GPS geotag/location from the selected published photo(s) on Flickr (privacy); idempotent and does not re-upload"),
       clicked_callback = function() panel_sets.remove_geo_location() end,
     },
   },
