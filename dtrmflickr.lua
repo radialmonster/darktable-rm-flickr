@@ -8648,6 +8648,491 @@ M.selection_summary = selection_summary
 return M
 end
 
+package.preload["dtrmflickr.preflight"] = function(...)
+-- preflight.lua — pure guided-preflight / dry-run planner (issue #13).
+--
+-- Before a large upload/update the user wants to *preview* what the plugin is
+-- about to do — how many photos, to which account and albums, with what
+-- privacy/safety/license/permissions and which metadata actions — and be
+-- *warned* about anything that will silently misbehave (missing originals,
+-- formats Flickr won't accept, oversized exports, keyword lists past Flickr's
+-- 75-tag limit, and photos the upload rules will skip). For a big job it also
+-- helps to see a rough count of the Flickr API calls and paged reads the job
+-- will make.
+--
+-- All of that is pure computation over already-resolved per-image descriptors
+-- plus the active export config, so — like panel_helpers.lua — it lives here as
+-- small offline-testable functions instead of bloating the main module's tight
+-- main-chunk local budget. The caller builds the per-image descriptors (from the
+-- live image + rules/metadata/state) and the config table, hands them here, and
+-- renders the returned summary. Nothing in this module touches darktable
+-- widgets, preferences, or the network; `opts.translate` is an optional
+-- gettext-style wrapper (defaults to identity) so the formatting stays pure and
+-- testable while the caller localizes.
+
+local M = {}
+
+-- Flickr silently drops tags past this count on a single photo.
+M.TAG_LIMIT = 75
+
+-- Flickr's per-photo upload size ceiling (200 MB). Only enforced when a
+-- descriptor carries a known byte size.
+M.MAX_PHOTO_BYTES = 200 * 1024 * 1024
+
+-- Image formats Flickr accepts for photo uploads. darktable's Flickr export
+-- always produces one of these, but a preflight over source files (or a future
+-- pass-through path) can still surface an unsupported extension. Keys are
+-- lowercase, dot-stripped.
+M.SUPPORTED_FORMATS = {
+  jpg = true, jpeg = true, png = true, gif = true, tif = true, tiff = true,
+}
+
+-- Normalize a format/extension string to the lowercase, dot-stripped key used
+-- by SUPPORTED_FORMATS. Returns "" for nil/empty.
+function M.normalize_format(fmt)
+  fmt = tostring(fmt or ""):match("^%s*%.?(.-)%s*$") or ""
+  return fmt:lower()
+end
+
+-- True when `fmt` is a Flickr-accepted photo format. An empty/nil format is
+-- treated as unknown (not supported) so it surfaces as a warning rather than
+-- silently passing.
+function M.is_supported_format(fmt)
+  local key = M.normalize_format(fmt)
+  if key == "" then return false end
+  return M.SUPPORTED_FORMATS[key] == true
+end
+
+-- Human label for one image in a warning list: prefer the filename, fall back to
+-- a durable/db id, then to a positional "#<index>".
+local function image_label(desc, index)
+  if desc then
+    local name = desc.filename or desc.name
+    if name and tostring(name) ~= "" then return tostring(name) end
+    if desc.id ~= nil and tostring(desc.id) ~= "" then return "#" .. tostring(desc.id) end
+  end
+  return "#" .. tostring(index)
+end
+M.image_label = image_label
+
+-- Cap a list of names for display, appending "(+N more)" past `limit`.
+local function join_capped(names, limit, tr)
+  limit = limit or 5
+  local shown = {}
+  for i = 1, math.min(#names, limit) do shown[i] = names[i] end
+  local text = table.concat(shown, ", ")
+  if #names > limit then
+    text = text .. string.format(tr("(+%d more)"), #names - limit)
+  end
+  return text
+end
+
+-- The ordered set of metadata "actions" a config enables, as display labels.
+-- Mirrors settings.sync_field_defaults; strip_gps is privacy-first and wins over
+-- gps, so only one geo action is ever listed. Returns { labels = {...},
+-- flags = { <key>=true } } where flags is the de-duplicated enabled-action set
+-- the estimator consumes.
+local METADATA_ACTION_ORDER = {
+  { key = "title",        label = "title" },
+  { key = "description",  label = "description" },
+  { key = "tags",         label = "keywords/tags" },
+  { key = "date_taken",   label = "date taken" },
+  { key = "privacy",      label = "privacy" },
+  { key = "safety",       label = "safety" },
+  { key = "content_type", label = "content type" },
+  { key = "license",      label = "license" },
+  { key = "permissions",  label = "permissions" },
+}
+
+local function metadata_actions(config, tr)
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  local actions = (config and config.metadata_actions) or {}
+  local labels = {}
+  local flags = {}
+  -- Geo first so its ordering is stable relative to the rest.
+  if actions.strip_gps then
+    labels[#labels + 1] = tr("strip GPS (privacy)")
+    flags.geo = true
+  elseif actions.gps then
+    labels[#labels + 1] = tr("GPS location")
+    flags.geo = true
+  end
+  for _, entry in ipairs(METADATA_ACTION_ORDER) do
+    if actions[entry.key] then
+      labels[#labels + 1] = tr(entry.label)
+      flags[entry.key] = true
+    end
+  end
+  return labels, flags
+end
+M.metadata_actions = metadata_actions
+
+-- Count the album targets on the config, split into existing vs to-be-created.
+-- Accepts either config.albums = { {name=, kind="existing"|"create"}, ... } or a
+-- plain list of names (all treated as existing).
+local function album_targets(config)
+  local targets = (config and config.albums) or {}
+  local total, new_count = 0, 0
+  local names = {}
+  for _, t in ipairs(targets) do
+    total = total + 1
+    if type(t) == "table" then
+      names[#names + 1] = tostring(t.name or t.title or ("#" .. total))
+      if t.kind == "create" or t.create == true then new_count = new_count + 1 end
+    else
+      names[#names + 1] = tostring(t)
+    end
+  end
+  return { total = total, new = new_count, existing = total - new_count, names = names }
+end
+M.album_targets = album_targets
+
+-- Rough count of the Flickr API calls a job will make, as a transparent
+-- breakdown. `mode` is "publish" (fresh upload; privacy/safety/content_type and
+-- title/description/tags ride the upload call) or "update" (no upload; every
+-- enabled field is a separate setter). This is an estimate — batching and
+-- already-clean fields can lower it — so it is reported as a breakdown, not a
+-- promise. `actionable` is the number of photos that will actually be sent
+-- (missing / rule-skipped photos excluded by the caller/summary).
+local function estimate_calls(actionable, config, flags)
+  actionable = math.max(0, math.floor(tonumber(actionable) or 0))
+  flags = flags or {}
+  local mode = (config and config.mode) or "publish"
+  local albums = album_targets(config)
+
+  local per_image = 0
+  if mode == "update" then
+    if flags.title or flags.description then per_image = per_image + 1 end -- setMeta
+    if flags.tags then per_image = per_image + 1 end                      -- setTags
+    if flags.safety then per_image = per_image + 1 end                    -- setSafetyLevel
+    if flags.content_type then per_image = per_image + 1 end              -- setContentType
+    -- setPerms bundles is_public/is_friend/is_family + perm_comment/perm_addmeta.
+    if flags.privacy or flags.permissions then per_image = per_image + 1 end
+  else
+    -- Fresh upload: privacy/safety/content_type/title/description/tags ride the
+    -- upload call itself, but perm_comment/perm_addmeta are not accepted by
+    -- flickr.upload, so permissions still needs its own setPerms.
+    if flags.permissions then per_image = per_image + 1 end
+  end
+  -- These need a separate call in both modes (not accepted by flickr.upload):
+  if flags.license then per_image = per_image + 1 end                     -- setLicense
+  if flags.date_taken then per_image = per_image + 1 end                  -- setDates
+  if flags.geo then per_image = per_image + 1 end                         -- geo set/remove
+
+  local uploads = (mode == "update") and 0 or actionable
+  local metadata_calls = per_image * actionable
+  local album_adds = albums.total * actionable                            -- addPhoto per (photo, set)
+  local album_creates = albums.new                                       -- create once per new set
+  local paged_reads = math.max(0, math.floor(tonumber(config and config.estimate_paged_reads) or 0))
+
+  return {
+    mode = mode,
+    actionable = actionable,
+    uploads = uploads,
+    metadata_calls = metadata_calls,
+    album_adds = album_adds,
+    album_creates = album_creates,
+    paged_reads = paged_reads,
+    total_calls = uploads + metadata_calls + album_adds + album_creates,
+  }
+end
+M.estimate_calls = estimate_calls
+
+-- Build the dry-run summary from per-image descriptors + the export config.
+--
+-- `images` is a list of descriptors:
+--   { filename    = "IMG_0001.jpg",  -- for warning lists (or `name`/`id`)
+--     exists       = true,           -- source/original present (false => warn)
+--     format       = "jpg",          -- export/target extension
+--     bytes        = 1234567,        -- optional; oversized check when known
+--     tag_count    = 12,             -- optional; >TAG_LIMIT => warn
+--     skip         = { kind=, detail= }, -- rule-skip (rating/color/keyword) or nil
+--     overrides    = { privacy=true, ... } } -- optional keyword-rule overrides
+--
+-- `config` is the active export config (account, mode, albums, privacy/safety/
+-- content_type/license/permissions, size, metadata_actions, limits). See the
+-- field notes inline above.
+--
+-- Returns a structured table (count/actionable/skipped/missing, account, albums,
+-- settings, actions, warnings, estimate) plus `lines`/`text` for direct display.
+function M.summarize(images, config, opts)
+  opts = opts or {}
+  config = config or {}
+  images = images or {}
+  local tr = opts.translate
+  if type(tr) ~= "function" then tr = function(s) return s end end
+
+  local limits = config.limits or {}
+  local tag_limit = tonumber(limits.tag_limit) or M.TAG_LIMIT
+  local max_bytes = tonumber(limits.max_bytes) or M.MAX_PHOTO_BYTES
+
+  local missing, unsupported, oversized, over_tag, skipped = {}, {}, {}, {}, {}
+  local override_counts = {}
+  local actionable = 0
+
+  for i, desc in ipairs(images) do
+    desc = desc or {}
+    local label = image_label(desc, i)
+    local is_missing = desc.exists == false
+    local is_skipped = desc.skip ~= nil
+
+    if is_missing then missing[#missing + 1] = label end
+    if is_skipped then
+      local detail = desc.skip and desc.skip.detail
+      skipped[#skipped + 1] = detail and (label .. " (" .. tostring(detail) .. ")") or label
+    end
+    -- Only warn about format/size/tags for photos that will actually be sent.
+    if not is_missing and not is_skipped then
+      actionable = actionable + 1
+      -- Only flag format when the caller actually knows it. The Flickr export
+      -- transcodes, so a panel-time preflight often can't determine the final
+      -- format; an absent `format` means "unknown, not checked", not a warning.
+      if desc.format ~= nil and not M.is_supported_format(desc.format) then
+        unsupported[#unsupported + 1] = label .. " (" .. M.normalize_format(desc.format) .. ")"
+      end
+      local bytes = tonumber(desc.bytes)
+      if bytes and bytes > max_bytes then oversized[#oversized + 1] = label end
+      local tags = tonumber(desc.tag_count)
+      if tags and tags > tag_limit then
+        over_tag[#over_tag + 1] = string.format("%s (%d)", label, tags)
+      end
+      for key in pairs(desc.overrides or {}) do
+        override_counts[key] = (override_counts[key] or 0) + 1
+      end
+    end
+  end
+
+  local _, flags = metadata_actions(config, tr)
+  local action_labels = (select(1, metadata_actions(config, tr)))
+  local albums = album_targets(config)
+  local estimate = estimate_calls(actionable, config, flags)
+
+  local warnings = {}
+  local function warn(list, singular, plural)
+    if #list == 0 then return end
+    local n = #list
+    local head = (n == 1) and tr(singular) or string.format(tr(plural), n)
+    warnings[#warnings + 1] = head .. ": " .. join_capped(list, 5, tr)
+  end
+  warn(missing, "1 image missing its source file", "%d images missing their source file")
+  warn(unsupported, "1 unsupported format (Flickr may reject it)", "%d unsupported formats (Flickr may reject them)")
+  warn(oversized, "1 oversized export (over Flickr's per-photo limit)", "%d oversized exports (over Flickr's per-photo limit)")
+  warn(over_tag, "1 photo over Flickr's 75-tag limit", "%d photos over Flickr's 75-tag limit")
+  warn(skipped, "1 photo will be skipped by upload rules", "%d photos will be skipped by upload rules")
+
+  -- Assemble display lines.
+  local lines = {}
+  local mode_word = (config.mode == "update") and tr("update") or tr("upload")
+  lines[#lines + 1] = string.format(tr("Flickr preflight (%s): %d selected, %d to send, %d skipped, %d missing"),
+    mode_word, #images, actionable, #skipped, #missing)
+
+  local account = config.account
+  if account then
+    local uname = type(account) == "table" and (account.username or account.nsid) or tostring(account)
+    lines[#lines + 1] = string.format(tr("account: %s"), tostring(uname or "?"))
+  else
+    lines[#lines + 1] = tr("account: (not logged in)")
+  end
+
+  if albums.total > 0 then
+    local album_line = string.format(tr("albums: %s"), join_capped(albums.names, 5, tr))
+    if albums.new > 0 then
+      album_line = album_line .. string.format(tr(" (%d to create)"), albums.new)
+    end
+    lines[#lines + 1] = album_line
+  end
+
+  -- Settings line: privacy / safety / content type / license, with a note when
+  -- keyword rules override some photos.
+  local function setting(name, value)
+    if value == nil or tostring(value) == "" then return nil end
+    local text = string.format("%s %s", tr(name), tostring(value))
+    local overridden = override_counts[name]
+    if overridden and overridden > 0 then
+      text = text .. string.format(tr(" (%d by keyword rule)"), overridden)
+    end
+    return text
+  end
+  local setting_parts = {}
+  for _, pair in ipairs({
+    { "privacy", config.privacy }, { "safety", config.safety },
+    { "content type", config.content_type }, { "license", config.license },
+  }) do
+    local part = setting(pair[1], pair[2])
+    if part then setting_parts[#setting_parts + 1] = part end
+  end
+  if config.permissions then
+    local p = config.permissions
+    if type(p) == "table" then
+      setting_parts[#setting_parts + 1] = string.format(tr("comments %s, add-info %s"),
+        tostring(p.comment or "?"), tostring(p.addmeta or "?"))
+    else
+      setting_parts[#setting_parts + 1] = string.format(tr("permissions %s"), tostring(p))
+    end
+  end
+  if #setting_parts > 0 then
+    lines[#lines + 1] = table.concat(setting_parts, " · ")
+  end
+
+  if config.size then
+    local size = config.size
+    if type(size) == "table" then
+      size = string.format("%sx%s", tostring(size.width or "?"), tostring(size.height or "?"))
+    end
+    lines[#lines + 1] = string.format(tr("size: %s"), tostring(size))
+  end
+
+  if #action_labels > 0 then
+    lines[#lines + 1] = string.format(tr("metadata: %s"), table.concat(action_labels, ", "))
+  else
+    lines[#lines + 1] = tr("metadata: (none)")
+  end
+
+  do
+    local est_line = string.format(
+      tr("estimated Flickr calls: ~%d (%d upload, %d metadata, %d album)"),
+      estimate.total_calls, estimate.uploads, estimate.metadata_calls,
+      estimate.album_adds + estimate.album_creates)
+    if estimate.paged_reads > 0 then
+      est_line = est_line .. string.format(tr(" + %d paged reads"), estimate.paged_reads)
+    end
+    lines[#lines + 1] = est_line
+  end
+
+  for _, w in ipairs(warnings) do
+    lines[#lines + 1] = tr("warning: ") .. w
+  end
+  if #warnings == 0 then
+    lines[#lines + 1] = tr("no warnings")
+  end
+
+  return {
+    count = #images,
+    actionable = actionable,
+    skipped = #skipped,
+    missing = #missing,
+    account = account,
+    albums = albums,
+    actions = action_labels,
+    warnings = warnings,
+    warning_detail = {
+      missing = missing, unsupported = unsupported, oversized = oversized,
+      over_tag = over_tag, skipped = skipped,
+    },
+    override_counts = override_counts,
+    estimate = estimate,
+    lines = lines,
+    text = table.concat(lines, "\n"),
+  }
+end
+
+return M
+end
+
+package.preload["dtrmflickr.preflight_run"] = function(...)
+-- preflight_run.lua — glue that turns a live darktable selection + export config
+-- into the per-image descriptors the pure preflight planner consumes (issue #13).
+--
+-- The planner in preflight.lua is deliberately pure (no darktable, no rules, no
+-- I/O); it only knows how to summarize already-resolved descriptors. This module
+-- is the thin bridge: given the selected images and a set of injected accessors
+-- (keyword names, skip-rule checks, keyword overrides, file existence — all of
+-- which the main module already has via rules/metadata/io), it builds one
+-- descriptor per image and hands them to preflight.summarize. Injecting the
+-- accessors keeps this module free of a hard darktable dependency, so its
+-- descriptor-building logic is unit-testable offline with plain stubs, exactly
+-- like the planner it feeds.
+
+local preflight = require "dtrmflickr.preflight"
+
+local M = {}
+
+-- Build one descriptor per image using injected accessors. `deps` supplies:
+--   filename(image)          -> display name (defaults to image.filename)
+--   file_exists(image)       -> bool (source/original present)
+--   keyword_names(image)     -> list of publishable keyword leaf names
+--   tag_names(image)         -> list of raw darktable tag names (for skip match)
+--   skip_keyword(tag_names)  -> filter, tag   (nil when no skip-by-keyword rule)
+--   skip_rating(image)       -> threshold, rating (nil when not below threshold)
+--   skip_color(image)        -> label (nil when no skip-by-color rule)
+--   overrides(tag_names)     -> { privacy=bool, safety=bool, content_type=bool,
+--                                 license=bool } keyword-rule override map
+-- Any missing accessor is treated as "no data" so a partial wiring degrades to a
+-- plain count rather than erroring.
+function M.build_descriptors(images, deps)
+  images = images or {}
+  deps = deps or {}
+  local out = {}
+  for i = 1, #images do
+    local image = images[i]
+    local name = deps.filename and deps.filename(image) or (image and image.filename) or nil
+
+    local skip = nil
+    if deps.skip_keyword and deps.tag_names then
+      local filter, tag = deps.skip_keyword(deps.tag_names(image))
+      if filter then
+        skip = { kind = "keyword", detail = "keyword '" .. tostring(tag or "") ..
+          "' matched '" .. tostring(filter) .. "'" }
+      end
+    end
+    if not skip and deps.skip_rating then
+      local threshold, rating = deps.skip_rating(image)
+      if threshold then
+        skip = { kind = "rating", detail = "rating " .. tostring(rating) ..
+          " < " .. tostring(threshold) }
+      end
+    end
+    if not skip and deps.skip_color then
+      local label = deps.skip_color(image)
+      if label then
+        skip = { kind = "color_label", detail = "color label " .. tostring(label) }
+      end
+    end
+
+    local tag_count = nil
+    if deps.keyword_names then
+      local names = deps.keyword_names(image) or {}
+      tag_count = #names
+    end
+
+    local overrides = nil
+    if deps.overrides and deps.tag_names then
+      local map = deps.overrides(deps.tag_names(image)) or {}
+      local any = false
+      overrides = {}
+      for key, on in pairs(map) do
+        if on then overrides[key] = true; any = true end
+      end
+      if not any then overrides = nil end
+    end
+
+    local exists = nil
+    if deps.file_exists then exists = deps.file_exists(image) and true or false end
+
+    out[i] = {
+      filename = name,
+      exists = exists,
+      -- format intentionally omitted: the export transcodes, so the final
+      -- format is unknown at preflight time (planner skips the check when nil).
+      tag_count = tag_count,
+      skip = skip,
+      overrides = overrides,
+    }
+  end
+  return out
+end
+
+-- Build descriptors then summarize. `config` is the export config the caller
+-- assembles from the live widgets (see preflight.summarize). Returns the planner
+-- summary table (with `.text` ready to display).
+function M.run(images, config, deps, opts)
+  local descriptors = M.build_descriptors(images, deps)
+  return preflight.summarize(descriptors, config, opts)
+end
+
+return M
+end
+
 package.preload["dtrmflickr.panel_gating"] = function(...)
 -- panel_gating.lua — pure selection-aware control gating for the Flickr panel (#88).
 --
@@ -10473,6 +10958,94 @@ local upload_copy_button = dt.new_widget("button") {
   end,
 }
 
+-- Guided preflight / dry run (issue #13): a read-only preview of what an
+-- Export > Flickr of the current selection would do — count, account, albums,
+-- privacy/safety/license/permissions, which metadata actions run, a rough Flickr
+-- call estimate — plus warnings (missing originals, oversized exports, keyword
+-- lists past Flickr's 75-tag limit, rule-skipped photos). The heavy lifting is
+-- pure (preflight.lua) fed by preflight_run.lua; this button only gathers the
+-- live selection + config and paints the result into preflight_result_label. It
+-- changes nothing and makes no network call, so it is safe to click any time.
+local preflight_result_label = dt.new_widget("label") { label = "" }
+
+local function run_export_preflight()
+  local pr = require "dtrmflickr.preflight_run"
+  local images = (dt.gui and dt.gui.action_images) or {}
+  -- action_images can be a sparse/keyed table; normalize to a dense list.
+  local list = {}
+  for _, im in pairs(images) do list[#list + 1] = im end
+  if #list == 0 then
+    preflight_result_label.label = _("Flickr preflight: no images selected")
+    return
+  end
+
+  local account = active_account()
+  local sync = current_sync_fields()
+
+  -- Album targets from the export album widgets (best-effort; comma-separated).
+  local albums = {}
+  local mode = tostring(album_mode_widget.value or "")
+  local function add_album_names(text, kind)
+    for name in tostring(text or ""):gmatch("[^,]+") do
+      name = name:match("^%s*(.-)%s*$")
+      if name ~= "" then albums[#albums + 1] = { name = name, kind = kind } end
+    end
+  end
+  if mode == _("existing album") then
+    add_album_names(album_input_value(), "existing")
+  elseif mode == _("create new album") then
+    add_album_names(album_new_entry.text, "create")
+  end
+
+  local config = {
+    mode = "publish", -- export path uploads; already-published images update in place
+    account = account and { username = account.username, nsid = account.nsid } or nil,
+    privacy = privacy_widget.value,
+    safety = safety_widget.value,
+    content_type = content_type_widget.value,
+    license = license_widget.value,
+    permissions = { comment = comment_perm_widget.value, addmeta = addmeta_perm_widget.value },
+    albums = albums,
+    metadata_actions = sync,
+    -- One photosets.getList read is needed to resolve album ids when albums are
+    -- targeted; nothing paged otherwise.
+    estimate_paged_reads = (#albums > 0) and 1 or 0,
+  }
+
+  local deps = {
+    filename = function(im) return im and im.filename or nil end,
+    file_exists = function(im)
+      if not im then return false end
+      local path = tostring(im.path or "")
+      local name = tostring(im.filename or "")
+      if path == "" or name == "" then return false end
+      local sep = path:sub(-1) == "/" or path:sub(-1) == "\\"
+      local full = sep and (path .. name) or (path .. "/" .. name)
+      local f = io.open(full, "rb")
+      if f then f:close(); return true end
+      return false
+    end,
+    keyword_names = function(im) return rules.image_keyword_names(im) or {} end,
+    tag_names = function(im) return metadata.image_tag_names(im) or {} end,
+    skip_keyword = function(tn)
+      return rules.first_matching_keyword_filter(tn,
+        rules.split_filter_list(dt.preferences.read(PLUGIN, "skip_upload_keyword_filters", "string")))
+    end,
+    skip_rating = function(im) return rules.should_skip_upload_by_rating(im) end,
+    skip_color = function(im) return rules.should_skip_upload_by_color_label(im) end,
+    overrides = function(tn)
+      local _, _, _, _, forced = rules.apply_keyword_overrides(tn,
+        privacy_widget.value, safety_widget.value, content_type_widget.value, license_widget.value)
+      return forced
+    end,
+  }
+
+  local summary = pr.run(list, config, deps, { translate = _ })
+  preflight_result_label.label = summary.text or ""
+  dt.print(string.format(_("Flickr preflight: %d to send, %d skipped, %d missing, %d warning(s)"),
+    summary.actionable, summary.skipped, summary.missing, #summary.warnings))
+end
+
 local storage_widget = dt.new_widget("box") {
   orientation = "vertical",
   dt.new_widget("label") { label = _("upload metadata") },
@@ -10502,6 +11075,14 @@ local storage_widget = dt.new_widget("box") {
   dt.new_widget("label") { label = _("new album") },
   album_new_entry,
   album_status_label,
+  -- Guided preflight / dry run (issue #13): preview + warnings before uploading.
+  dt.new_widget("label") { label = _("preflight / dry run") },
+  dt.new_widget("button") {
+    label = _("preflight selection"),
+    tooltip = _("preview what an Export > Flickr of the currently selected image(s) would do — count, account, albums, privacy/safety/license/permissions, which metadata actions run, and a rough Flickr call estimate — and warn about missing originals, oversized exports, keyword lists over Flickr's 75-tag limit, and photos your upload rules will skip. Read-only: uploads nothing and makes no network call."),
+    clicked_callback = function() run_export_preflight() end,
+  },
+  preflight_result_label,
   -- A clear, in-context result table after each export (issue #40). finalize
   -- fills upload_result_label with the summary line + a capped per-image grid so
   -- the outcome (uploaded / skipped / failed / post-upload errors) is visible
