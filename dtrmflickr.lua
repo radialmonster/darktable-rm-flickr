@@ -3207,15 +3207,24 @@ local PLUGIN <const> = "dtrmflickr"
 local TAG_FLAG_CATEGORY <const> = 1
 local TAG_FLAG_PRIVATE <const> = 2
 
--- Read the optional title template (issue #42). Empty/unset => no templating, so
--- the historical filename-fallback behavior is preserved with zero regression.
--- Guarded so a missing preferences API (bare test harness) never throws here.
-local function title_template()
+-- Read an optional template preference (issue #42 title, #100 description).
+-- Empty/unset => no templating, so the historical raw-value behavior is preserved
+-- with zero regression. Guarded so a missing preferences API (bare test harness)
+-- never throws here.
+local function read_template(key)
   local ok, value = pcall(function()
-    return dt.preferences and dt.preferences.read and dt.preferences.read(PLUGIN, "title_template", "string")
+    return dt.preferences and dt.preferences.read and dt.preferences.read(PLUGIN, key, "string")
   end)
   if not ok then return "" end
   return value and tostring(value):match("^%s*(.-)%s*$") or ""
+end
+
+local function title_template()
+  return read_template("title_template")
+end
+
+local function description_template()
+  return read_template("description_template")
 end
 
 -- The Flickr title for an image. When a non-empty title template is configured it
@@ -3234,6 +3243,27 @@ function M.image_title(image, filename)
   if image and image.title and image.title ~= "" then return image.title end
   if image and image.filename and image.filename ~= "" then return image.filename end
   return tostring(filename or ""):match("[^/\\]+$") or tostring(filename or "")
+end
+
+-- The Flickr description/caption for an image (issue #100). When a non-empty
+-- description template is configured it is expanded against the image's metadata
+-- tokens (camera/lens/date/…); when the template yields nothing usable (all
+-- referenced fields empty) or no template is set, fall back to the raw image
+-- description (unlike the title there is no filename fallback — an empty
+-- description is a legitimate value). This is the single shared chokepoint for the
+-- LOCAL description value, so templating applies uniformly to the upload,
+-- metadata-sync push, sync-diff local-value and fingerprint paths (keeping drift
+-- detection coherent because they all read through here). The remote-pull WRITE
+-- sites (image.description = plan.description.new) and the pull/conflict raw-read
+-- comparison are deliberately NOT routed through here, so a template neither masks
+-- a remote edit nor suppresses pulling it (issue #100 pull-path precedence).
+function M.image_description(image)
+  local template = description_template()
+  if template ~= "" then
+    local expanded = templating.expand_trimmed(template, templating.build_vars(image))
+    if expanded ~= "" then return expanded end
+  end
+  return image and image.description or ""
 end
 
 -- Normalize a taken-date string (darktable EXIF "YYYY:MM:DD HH:MM:SS" or Flickr's
@@ -5639,7 +5669,7 @@ function M.resend_image(image, acc, deps)
     -- it AND then match the filename-based stored fingerprint forever (silent loss,
     -- no re-flag). Use the same fallback so the resume converges to what was pushed.
     local title = sync.title and meta.image_title(image, image and image.filename or "") or nil
-    local description = sync.description and (image.description or "") or nil
+    local description = sync.description and meta.image_description(image) or nil
     local ok, err = push("title_description", "flickr.photos.setMeta", function()
       return rest.photos_set_meta(deps.api_key, deps.api_secret, acc, photo_id, title, description)
     end)
@@ -11473,6 +11503,18 @@ dt.preferences.register(PLUGIN, "title_template_help", "lua",
     label = _("title template expands tokens from photo metadata\nleave blank to use the image title, then its filename\ntokens: {title} {camera} {lens} {iso} {aperture} {focal} {date} {year} {lat} {lon} {dimensions} {mp} {creator}\nfilters: {iso|round} {camera|upper} {title|title} {lens|default:unknown}\noptional groups: [ISO {iso}] disappears when the photo has no ISO"),
   },
   keep_label_pref)
+dt.preferences.register(PLUGIN, "description_template", "string",
+  _("Flickr: description template"),
+  _("blank uses the image description as-is. Otherwise expand tokens against the photo's metadata, e.g. {description} [ - shot on {camera}] [ISO {iso}]. Tokens: title, description, filename, basename, camera, lens, iso, aperture, focal, exposure, date, year, month, day, lat, lon, dimensions, mp, creator. Filters: |upper |lower |title |trim |round:N |default:X. [ ... ] groups drop when a token inside is empty"),
+  "")
+dt.preferences.register(PLUGIN, "description_template_help", "lua",
+  _("Flickr: description template help"),
+  _("how the description template works"),
+  "info",
+  dt.new_widget("label") {
+    label = _("description template expands tokens from photo metadata\nleave blank to send the image description unchanged\ntokens: {description} {title} {camera} {lens} {iso} {aperture} {focal} {date} {year} {lat} {lon} {dimensions} {mp} {creator}\nfilters: {iso|round} {camera|upper} {description|trim} {lens|default:unknown}\noptional groups: [shot on {camera}] disappears when the photo has no camera"),
+  },
+  keep_label_pref)
 dt.preferences.register(PLUGIN, "skip_upload_min_rating", "string",
   _("Flickr: minimum rating to upload"), _("blank disables; images rated below this 0-5 threshold are not uploaded to Flickr"), "")
 dt.preferences.register(PLUGIN, "skip_upload_color_labels", "string",
@@ -13925,7 +13967,7 @@ local function sync_panel_meta()
   -- wiping the filename-derived title Flickr got at upload -- and disagreeing with
   -- the stored fingerprint, so a later compare would falsely flag drift.
   local title = sync.title and metadata.image_title(image, image and image.filename or "") or nil
-  local description = sync.description and (image and image.description or "") or nil
+  local description = sync.description and metadata.image_description(image) or nil
   if not sync.title and not sync.description then
     dt.print(_("Flickr: title/description sync disabled in Lua Options."))
     return
@@ -14173,7 +14215,7 @@ function panel_sets.compare_remote_meta()
   if sync.description then
     fields[#fields + 1] = {
       label = _("description"),
-      local_value = image and image.description or "",
+      local_value = metadata.image_description(image),
       remote = remote.description or "",
     }
   end
@@ -15060,7 +15102,7 @@ function panel_sets.push_selected_metadata()
           -- Filename-fallback title, consistent with the fingerprint/upload/replace
           -- paths (see sync_panel_meta) so an empty title never wipes Flickr's.
           local title = sync.title and metadata.image_title(image, image.filename) or nil
-          local description = sync.description and (image.description or "") or nil
+          local description = sync.description and metadata.image_description(image) or nil
           push("title_description", "title_description", _("title/description"),
             "flickr.photos.setMeta", function()
               return rest.photos_set_meta(api_key, api_secret, acc, photo_id, title, description)
@@ -16369,7 +16411,7 @@ function effective_metadata_fingerprints(image, sync, opts)
     include_gps = sync.gps,
     include_date_taken = sync.date_taken,
     title = sync.title and metadata.image_title(image, image and image.filename or "") or nil,
-    description = sync.description and image and image.description or nil,
+    description = sync.description and metadata.image_description(image) or nil,
     tags = tags,
     date_taken = sync.date_taken and metadata.image_date_taken(image) or nil,
     lat = lat,
@@ -16550,7 +16592,7 @@ local function store(storage, image, format, filename, number, total, high_quali
     photo_id, err = __dtrmflickr_call("flickr.upload", function()
       return upload.upload_photo(extra_data.api_key, extra_data.api_secret, extra_data.account, filename, {
         title = sync.title and metadata.image_title(image, filename) or nil,
-        description = sync.description and image and image.description or nil,
+        description = sync.description and metadata.image_description(image) or nil,
         tags = tags,
         is_public = (sync.privacy or forced.privacy) and privacy.is_public or nil,
         is_friend = (sync.privacy or forced.privacy) and privacy.is_friend or nil,
@@ -16627,7 +16669,7 @@ local function store(storage, image, format, filename, number, total, high_quali
     end
     if is_replace then
       local meta_title = sync.title and metadata.image_title(image, filename) or nil
-      local meta_desc = sync.description and image and image.description or nil
+      local meta_desc = sync.description and metadata.image_description(image) or nil
       if meta_title ~= nil or meta_desc ~= nil then
         push_meta("flickr.photos.setMeta", { "title_description" }, "title/description", function()
           return rest.photos_set_meta(extra_data.api_key, extra_data.api_secret,
