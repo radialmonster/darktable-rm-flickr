@@ -10974,7 +10974,9 @@ package.preload["dtrmflickr.account_ui"] = function(...)
 --   deps.load_token      () -> account|nil   (reads the saved OAuth token)
 --   deps.save_token      (acc) -> ok, err    (used only to read back; callbacks call it)
 --   deps.clear_token     ()                  (logout)
---   deps.get_credentials () -> key, secret   (API key/secret from prefs)
+--   (API key/secret are now owned by this widget's own live entries — see
+--   live_credentials() below — not injected; the main module's get_credentials()
+--   still reads the same underlying preference for use outside this dialog.)
 --   deps.open_url        (url)               (launch the browser for authorize)
 -- The OAuth handshake (flickr_auth) and the token-expiry classifier (flickr_rest)
 -- are pure and required directly.
@@ -11005,13 +11007,40 @@ function M.build(deps)
   local load_token = deps.load_token
   local save_token = deps.save_token
   local clear_token = deps.clear_token
-  local get_credentials = deps.get_credentials
   local open_url = deps.open_url
   -- Issue #12: account-identity (username/avatar/quota). account_info + the REST
   -- module are injectable so the refresh-button path is offline-testable with a
   -- fake rest (tests/test_account_ui.lua); the live wiring uses the real modules.
   local info_mod = deps.account_info or account_info
   local rest_mod = deps.rest or rest
+
+  -- API key/secret entries (issue: login click read the OLD dt.preferences value
+  -- when key/secret were typed in the SAME still-open preferences dialog). Native
+  -- dt.preferences.register("string", ...) rows only commit to storage when the
+  -- dialog closes — the same darktable behavior already worked around below for
+  -- delete_perm_check. Live `entry` widgets here are readable immediately; their
+  -- value is written to the (unregistered, hidden) api_key/api_secret prefs the
+  -- moment a login/complete/info click actually needs it, so get_credentials()
+  -- reflects a same-session edit instead of the stale committed value.
+  local api_key_entry = dt.new_widget("entry") {
+    text = dt.preferences.read(PLUGIN, "api_key", "string") or "",
+    placeholder = _("Flickr app API key"),
+    tooltip = _("Flickr app API key used for OAuth and upload requests"),
+  }
+  local api_secret_entry = dt.new_widget("entry") {
+    text = dt.preferences.read(PLUGIN, "api_secret", "string") or "",
+    placeholder = _("Flickr app API secret"),
+    is_password = true,
+    tooltip = _("Flickr app API secret used for OAuth request signing"),
+  }
+  local function live_credentials()
+    local key = (api_key_entry.text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local secret = (api_secret_entry.text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if key == "" or secret == "" then return nil end
+    dt.preferences.write(PLUGIN, "api_key", "string", key)
+    dt.preferences.write(PLUGIN, "api_secret", "string", secret)
+    return key, secret
+  end
 
   local status_label = dt.new_widget("label") { label = "" }
   local verifier_label = dt.new_widget("label") { label = _("verifier code") }
@@ -11048,6 +11077,13 @@ function M.build(deps)
     -- surface the re-login prompt loudly instead of pretending we are still logged
     -- in. Cleared on a fresh login (save_token) and on logout (clear_token).
     local revoked = logged_in and __dtrmflickr_auth_revoked == true
+    -- Read the live entries directly (not live_credentials(), which also writes —
+    -- refresh_status runs on every keystroke-adjacent event and should not commit
+    -- a half-typed value). Surface their absence proactively in the status line
+    -- instead of only toasting on a login click the user might miss.
+    local key_typed = (api_key_entry.text or ""):gsub("^%s+", ""):gsub("%s+$", "") ~= ""
+    local secret_typed = (api_secret_entry.text or ""):gsub("^%s+", ""):gsub("%s+$", "") ~= ""
+    local missing_credentials = not logged_in and not (key_typed and secret_typed)
 
     status_label.label = revoked
         and string.format(_("status: login for %s expired or was revoked — log out and log in again"),
@@ -11060,6 +11096,8 @@ function M.build(deps)
         and string.format(_("status: login failed: %s"), last_error)
       or waiting_for_verifier
         and _("status: authorize in browser, paste the code, then 'complete login'")
+      or missing_credentials
+        and _("status: enter your Flickr API key and secret in preferences first, then log in")
         or  _("status: not logged in")
 
     verifier_label.visible = waiting_for_verifier
@@ -11122,13 +11160,15 @@ function M.build(deps)
 
   login_button = dt.new_widget("button") {
     label = _("log in to Flickr…"),
+    tooltip = _("requires the API key and secret entries in this widget to be filled in first"),
     clicked_callback = function()
       last_error = nil
-      local key, secret = get_credentials()
-      if not key then
-        dt.print(_("Enter your Flickr API key and secret first."))
-        return
-      end
+      -- No client-side blank-credentials gate: get_request_token is nil-safe
+      -- (an absent/blank key or secret just signs a request Flickr rejects with
+      -- its own clean error), so a same-session type-then-click always at least
+      -- attempts the real call instead of relying on us to have anticipated every
+      -- way "invalid" can look.
+      local key, secret = live_credentials()
       dt.print(_("Requesting Flickr authorization…"))
       local tok, sec_or_err = auth.get_request_token(key, secret)
       if not tok then
@@ -11160,7 +11200,7 @@ function M.build(deps)
       last_error = nil
       local code = (verifier_entry.text or ""):gsub("%D", "")
       if code == "" then dt.print(_("Enter the verifier code from Flickr.")); return end
-      local key, secret = get_credentials()
+      local key, secret = live_credentials()
       if not key then dt.print(_("Enter your Flickr API key and secret first.")); return end
       local acc, err = auth.get_access_token(key, secret, pending.token, pending.secret, code)
       if not acc then
@@ -11192,6 +11232,10 @@ function M.build(deps)
       last_error = nil
       verifier_entry.text = ""
       refresh_status()
+      -- Login happened in this dialog, not the lighttable panel — nudge it to
+      -- repaint its gating/guidance now instead of waiting for an unrelated
+      -- selection change (see __dtrmflickr_refresh_panel in the main module).
+      if __dtrmflickr_refresh_panel then __dtrmflickr_refresh_panel() end
       dt.print(string.format(_("Logged in to Flickr as %s"), acc.username or acc.nsid))
       dt.print_log("[dtrmflickr] logged in, nsid=" .. tostring(acc.nsid))
     end,
@@ -11207,7 +11251,7 @@ function M.build(deps)
     clicked_callback = function()
       local acc = load_token()
       if not acc then dt.print(_("Log in to Flickr first.")); return end
-      local key, secret = get_credentials()
+      local key, secret = live_credentials()
       if not key then dt.print(_("Enter your Flickr API key and secret first.")); return end
       local info, ierr = info_mod.fetch_identity(rest_mod, key, secret, acc)
       if not info then
@@ -11243,12 +11287,24 @@ function M.build(deps)
       pending = nil
       last_error = nil
       refresh_status()
+      if __dtrmflickr_refresh_panel then __dtrmflickr_refresh_panel() end
       dt.print(_("Logged out of Flickr."))
     end,
   }
 
+  local credentials_help_label = dt.new_widget("label") {
+    label = _("enter your Flickr app's API key and secret below — both are required before you can log in"),
+  }
+  local api_key_label = dt.new_widget("label") { label = _("Flickr API key") }
+  local api_secret_label = dt.new_widget("label") { label = _("Flickr API secret") }
+
   local account_widget = dt.new_widget("box") {
     orientation = "vertical",
+    credentials_help_label,
+    api_key_label,
+    api_key_entry,
+    api_secret_label,
+    api_secret_entry,
     status_label,
     delete_perm_check,
     login_button,
@@ -11265,6 +11321,177 @@ function M.build(deps)
     refresh_status = refresh_status,
     note_auth_failure = note_auth_failure,
   }
+end
+
+return M
+end
+
+package.preload["dtrmflickr.geo_perm_picker"] = function(...)
+-- geo_perm_picker.lua — the "Flickr: who can see location" Lua-preferences
+-- widget, built as a row of plain buttons instead of a combobox.
+--
+-- Why: `dt.preferences.register(..., "enum", ...)` renders as a native combobox
+-- row inside the tall, scrollable Preferences -> Lua dialog. GTK comboboxes
+-- intercept a mouse-wheel scroll over them to change their selected value instead
+-- of passing the scroll through to the dialog's scrollable list — so scrolling
+-- past this setting on the way to another one can silently change it. The
+-- project already worked around the identical problem for the per-export upload
+-- defaults (privacy/safety/content type/license/...) by moving them into the
+-- Export panel's own widgets instead of registered enum prefs (see
+-- docs/design-notes.md, "Upload defaults with per-export override"). This
+-- setting has no natural per-export home (it is a background policy applied
+-- automatically after every GPS sync, not a per-photo export choice), so the fix
+-- here is a click-only button row — mirroring the tab-switcher pattern already
+-- used for the lighttable panel (dtrmflickr.lua panel_sets.tab_buttons): the
+-- active choice is marked with a "▸ " label prefix, and only a click (never a
+-- scroll) changes it.
+--
+-- Kept as its own module rather than inline in the main module: the main
+-- chunk's per-function local budget is tight (see tools/build-single-file.ps1 /
+-- test_lua_limits.lua), so new UI logic that does not need to close over main-
+-- chunk state belongs in a module, injected via build(deps) like account_ui.lua.
+--
+--   deps.dt          darktable (new_widget, preferences)
+--   deps.translate    gettext-style _(msgid) the caller already defined
+--   deps.PLUGIN       conf namespace ("dtrmflickr")
+--   deps.values       array of { pref = string, ... } in display order (the
+--                     caller passes settings.geo_perm_values so the button
+--                     labels/persisted strings stay the single source of truth
+--                     shared with settings.geo_perms_for_pref)
+--   deps.pref_name    the preference key to read/write (default_geo_perm)
+--   deps.default      the pref string selected when nothing is stored yet
+
+local M = {}
+
+-- build(deps) -> { widget, set_callback }
+--   widget        the button-row box to register as the "lua" preference
+--   set_callback  darktable calls this(widget) whenever the preference screen
+--                 needs to repaint the widget from the stored value (dialog
+--                 open, after a "reset to default"); it re-labels the buttons
+--                 to reflect whichever value is currently stored and returns
+--                 the widget unchanged, matching the register() contract.
+function M.build(deps)
+  local dt = deps.dt
+  local _ = deps.translate
+  local PLUGIN = deps.PLUGIN
+  local values = deps.values
+  local pref_name = deps.pref_name
+  local default_value = deps.default
+
+  local buttons = {}
+
+  local function current_value()
+    local stored = dt.preferences.read(PLUGIN, pref_name, "enum")
+    if stored == nil or stored == "" then return default_value end
+    return stored
+  end
+
+  local function relabel()
+    local current = current_value()
+    for i, spec in ipairs(values) do
+      buttons[i].label = (spec.pref == current) and ("▸ " .. spec.pref) or spec.pref
+    end
+  end
+
+  for i, spec in ipairs(values) do
+    buttons[i] = dt.new_widget("button") {
+      label = spec.pref,
+      clicked_callback = function()
+        dt.preferences.write(PLUGIN, pref_name, "enum", spec.pref)
+        relabel()
+      end,
+    }
+  end
+  relabel()
+
+  local row = dt.new_widget("box") { orientation = "horizontal", table.unpack(buttons) }
+  local widget = dt.new_widget("box") { orientation = "vertical", row }
+
+  local function set_callback(w)
+    relabel()
+    return w
+  end
+
+  return {
+    widget = widget,
+    set_callback = set_callback,
+    -- exposed for tests only: which button is showing the "-> " active marker
+    __buttons = buttons,
+  }
+end
+
+return M
+end
+
+package.preload["dtrmflickr.debug_dump"] = function(...)
+-- debug_dump.lua — writes a plain-text snapshot of the lighttable panel's
+-- current widget state to a file, on demand (a "dump debug state" button) or
+-- whenever the caller invokes dump().
+--
+-- Why: iterating on this plugin with an AI pairing partner hits a wall the
+-- moment a fix needs live-GUI confirmation — screenshots require interactive
+-- computer-use approval that a scheduled/background session often can't get,
+-- and even when available it's slow and imprecise for reading small label
+-- text. A plain text file the assistant can just read is faster and exact.
+-- This is a developer aid, not a user-facing feature: harmless if unused (one
+-- extra button, no state), and produces one small text file per dump, nothing
+-- persistent or automatic.
+--
+--   deps.dt      darktable (used only for dt.print_log on a write failure)
+--   deps.path    absolute path to write the dump to
+--   deps.labels  array of { name = string, widget = lua_widget } — each
+--                widget's `.label` (or `.text` for entry-type widgets) is
+--                read at dump time, not cached, so the snapshot is always
+--                current as of the click.
+--   deps.extra   optional function() -> array of extra "key: value" strings
+--                (e.g. selection count, login state, active tab) for state
+--                that doesn't live on a single label widget.
+
+local M = {}
+
+local function widget_value(widget)
+  if widget == nil then return "<nil>" end
+  if widget.label ~= nil then return widget.label end
+  if widget.text ~= nil then return widget.text end
+  return "<unreadable>"
+end
+
+-- build(deps) -> { dump = function() -> ok, err }
+function M.build(deps)
+  local dt = deps.dt
+  local path = deps.path
+  local labels = deps.labels or {}
+  local extra = deps.extra
+
+  local function dump()
+    local f, err = io.open(path, "w")
+    if not f then
+      if dt and dt.print_log then dt.print_log("[dtrmflickr] debug_dump: could not open " .. tostring(path) .. ": " .. tostring(err)) end
+      return false, err
+    end
+    f:write("=== dtrmflickr debug dump — " .. os.date("%Y-%m-%d %H:%M:%S") .. " ===\n")
+    if extra then
+      local ok, lines = pcall(extra)
+      if ok and type(lines) == "table" then
+        for _, line in ipairs(lines) do f:write(tostring(line) .. "\n") end
+      elseif not ok then
+        f:write("(extra info failed: " .. tostring(lines) .. ")\n")
+      end
+    end
+    f:write("\n")
+    for _, entry in ipairs(labels) do
+      local value = widget_value(entry.widget)
+      -- Multi-line label values (e.g. the tag-reconciler diff, the sync-surface
+      -- per-field breakdown) get an indented continuation so the dump stays
+      -- greppable by name at line start.
+      value = tostring(value):gsub("\n", "\n    ")
+      f:write(string.format("%s: %s\n", entry.name, value))
+    end
+    f:close()
+    return true
+  end
+
+  return { dump = dump }
 end
 
 return M
@@ -11820,23 +12047,21 @@ local account = account_ui.build({
   load_token = load_token,
   save_token = save_token,
   clear_token = clear_token,
-  get_credentials = get_credentials,
   open_url = open_url,
 })
 __dtrmflickr_note_auth_failure = account.note_auth_failure
 
-dt.preferences.register(PLUGIN, "api_secret", "string",
-  _("Flickr: API secret"), _("Flickr app API secret used for OAuth request signing"), "")
-dt.preferences.register(PLUGIN, "api_key", "string",
-  _("Flickr: API key"), _("Flickr app API key used for OAuth and upload requests"), "")
--- NOTE: the "request delete permission on next login" opt-in (issue #19) is NOT a
--- registered bool preference. It is a live check_button in the account login
--- widget (delete_perm_check) backed by the hidden `request_delete_perm` conf key.
--- A registered bool preference only commits when the preferences dialog closes,
--- so it could never agree with a login click made inside that same open dialog —
--- the login would silently fall back to write scope. The live widget is read at
--- click time and persists immediately on toggle. Delete is never requested
--- silently. See docs/design-notes.md.
+-- NOTE: API key/secret and the "request delete permission on next login" opt-in
+-- (issue #19) are deliberately NOT registered dt.preferences.register("string"/
+-- "bool", ...) rows. darktable only commits a registered preference to config when
+-- the dialog closes — its value is written by the dialog "response" handler, not
+-- live. The login button lives in that same dialog, so a freshly-typed key/secret
+-- or freshly-ticked checkbox would be invisible to a login click made inside that
+-- same still-open dialog session. Both are instead live widgets inside the account
+-- login widget itself (api_key_entry/api_secret_entry, delete_perm_check),
+-- read/written immediately at click time via the hidden api_key/api_secret/
+-- request_delete_perm conf keys, which get_credentials() still reads for use
+-- outside this dialog. See docs/design-notes.md.
 dt.preferences.register(PLUGIN, "account_login", "lua",
   _("Flickr: account login"),
   _("authorize the default Flickr account used for uploads and lighttable sync"),
@@ -11923,11 +12148,24 @@ dt.preferences.register(PLUGIN, "sync_privacy", "bool",
 -- may view it, instead of stripping it (the "strip GPS on resend" toggle). Applied
 -- via geo.setPerms only after coordinates are (re)sent; "strip GPS on resend" wins
 -- (it removes the location entirely, so there is nothing to restrict).
-dt.preferences.register(PLUGIN, "default_geo_perm", "enum",
-  _("Flickr: who can see location"),
-  _("when a photo's GPS location is sent to Flickr, restrict who may view that location. 'keep current' leaves Flickr's default untouched. Ignored when 'strip GPS on resend' is on (that removes the location entirely)"),
-  "keep current",
-  "keep current", "public", "your contacts", "friends & family", "only you")
+--
+-- Deliberately NOT a registered "enum" preference (that renders as a combobox in
+-- the tall, scrollable Preferences -> Lua dialog, and GTK comboboxes intercept a
+-- mouse-wheel scroll over them to change value instead of scrolling the dialog —
+-- so scrolling past it can silently change it). geo_perm_picker builds the same
+-- choice as a click-only button row instead; see that module for the rationale.
+do
+  local gp = require("dtrmflickr.geo_perm_picker").build({
+    dt = dt, translate = _, PLUGIN = PLUGIN,
+    values = settings.geo_perm_values, pref_name = "default_geo_perm", default = "keep current",
+  })
+  dt.preferences.register(PLUGIN, "default_geo_perm_picker", "lua",
+    _("Flickr: who can see location"),
+    _("when a photo's GPS location is sent to Flickr, restrict who may view that location. 'keep current' leaves Flickr's default untouched. Ignored when 'strip GPS on resend' is on (that removes the location entirely)"),
+    "info",
+    gp.widget,
+    gp.set_callback)
+end
 dt.preferences.register(PLUGIN, "settings_help", "lua",
   _("Flickr: settings guide"),
   _("how these Lua options relate to the Export and lighttable Flickr widgets"),
@@ -16046,6 +16284,18 @@ function refresh_panel(force, fetch_remote)
   end
 end
 
+-- Login/logout happen in the Lua Options dialog, a completely separate UI surface
+-- from the lighttable panel — no darktable event connects them (same class of gap
+-- as issue #3's tag-changed problem). Without this hook the panel's gating/guidance
+-- ("add your Flickr app credentials…", "log in…") stays computed from before the
+-- login/logout until the next unrelated selection change. account_ui calls this
+-- (if set) right after a successful login/logout so the panel repaints immediately.
+-- force=true bypasses the "only refresh while visible" guard (the panel may not
+-- have focus while Lua Options is open); fetch_remote=false — this is a local
+-- gating repaint, not a reason to re-fetch the currently selected image's remote
+-- Flickr data.
+__dtrmflickr_refresh_panel = function() refresh_panel(true, false) end
+
 panel_sets.claim_existing_button = dt.new_widget("button") {
   label = _("claim existing"),
   clicked_callback = function() claim_existing_selection() end,
@@ -16680,6 +16930,21 @@ local panel_widget = dt.new_widget("box") {
     label = _("refresh"),
     tooltip = _("reload the panel for the current selection — available on every tab"),
     clicked_callback = function() refresh_panel(true, true) end,
+  },
+  -- Developer aid, not a user-facing feature: writes the panel's current widget
+  -- state to a plain text file (dtrmflickr_debug_dump.txt in the darktable config
+  -- directory) so an AI pairing session can read it directly instead of needing
+  -- interactive screen access. __dtrmflickr_debug_dump is built further down
+  -- (near the auto-scan poll it mirrors); referencing it here by name is fine —
+  -- globals are late-bound and this button is only ever clicked long after
+  -- script load finishes.
+  dt.new_widget("button") {
+    label = _("dump debug state"),
+    tooltip = _("write the current panel widget state to dtrmflickr_debug_dump.txt in the darktable config directory — a developer aid"),
+    clicked_callback = function()
+      local ok, err = __dtrmflickr_debug_dump.dump()
+      dt.print(ok and _("Flickr: debug state dumped") or (_("Flickr: debug dump failed: ") .. tostring(err)))
+    end,
   },
 }
 -- Restore the last active tab (defaults to sync). startup=true skips the pref
@@ -17756,6 +18021,62 @@ __dtrmflickr_autoscan:start_poll {
   get_account = load_token,
   on_error = function(err) dt.print_log("[dtrmflickr] auto-scan poll tick error: " .. tostring(err)) end,
 }
+end
+
+-- Developer aid (see debug_dump.lua): writes the panel's current widget state to
+-- a plain text file so an AI pairing session can read it directly instead of
+-- needing interactive screen access. A global, not a main-chunk local, so it
+-- costs nothing against the local limit; both the manual "dump debug state"
+-- button and the optional auto-poll below share this one instance.
+__dtrmflickr_debug_dump = require("dtrmflickr.debug_dump").build({
+  dt = dt,
+  path = dt.configuration.config_dir .. "/dtrmflickr_debug_dump.txt",
+  labels = {
+    { name = "panel_status", widget = panel_status_label },
+    { name = "panel_file", widget = panel_file_label },
+    { name = "panel_account", widget = panel_account_label },
+    { name = "panel_photo", widget = panel_photo_label },
+    { name = "panel_sets_label", widget = panel_sets_label },
+    { name = "guidance", widget = panel_sets.guidance_label },
+    { name = "publish_state", widget = panel_sets.publish_label },
+    { name = "sync_status", widget = panel_sets.status_label },
+    { name = "remote_status", widget = panel_remote_label },
+    { name = "header_url", widget = panel_sets.header_url_label },
+    { name = "batch_indicator", widget = panel_sets.batch_indicator_label },
+    { name = "mixed_values", widget = panel_sets.mixed_label },
+    { name = "tag_reconciler_diff", widget = panel_reconcile.diff_label },
+  },
+  extra = function()
+    local acc = load_token()
+    local sel = dt.gui.selection and dt.gui.selection() or {}
+    return {
+      "selection_count: " .. tostring(#sel),
+      "logged_in: " .. tostring(acc ~= nil),
+      "account: " .. tostring(acc and (acc.username or acc.nsid) or "none"),
+      "credentials_set: " .. tostring(get_credentials() ~= nil),
+      "active_tab: " .. tostring(panel_sets.tab_names[panel_tab_stack.active] or "?"),
+    }
+  end,
+})
+dt.preferences.register(PLUGIN, "debug_dump_auto", "bool",
+  _("Flickr: auto-dump debug state (dev)"),
+  _("every few seconds, write the current panel widget state to dtrmflickr_debug_dump.txt — a developer aid for AI-assisted debugging; leave off unless you're actively using it"),
+  false)
+-- Same dispatch/sleep/should_stop gating as the auto-scan poll above: only runs
+-- with real async dispatch (real darktable / darktable-cli), and only while the
+-- pref is on, so this is zero-cost by default and never busy-loops an offline
+-- test host. Checks the pref every tick (not just once) so toggling it off in a
+-- running session actually stops the writes without needing a restart.
+if dt.control and dt.control.dispatch then
+  dt.control.dispatch(function()
+    while not (dt.control.ending == true) do
+      if dt.control.sleep then dt.control.sleep(2000) end
+      if dt.control.ending ~= true and dt.preferences.read(PLUGIN, "debug_dump_auto", "bool") == true then
+        local ok, err = pcall(__dtrmflickr_debug_dump.dump)
+        if not ok then dt.print_log("[dtrmflickr] debug-dump auto-poll tick error: " .. tostring(err)) end
+      end
+    end
+  end)
 end
 
 account.refresh_status()
