@@ -3462,7 +3462,7 @@ local function has_private_category_parent(name)
   while parent and parent ~= "" do
     local parent_tag = dt.tags and dt.tags.find and dt.tags.find(parent) or nil
     local flags = tag_flags(parent_tag)
-    if (flags & (TAG_FLAG_PRIVATE | TAG_FLAG_CATEGORY)) == (TAG_FLAG_PRIVATE | TAG_FLAG_CATEGORY) then
+    if (flags & (TAG_FLAG_PRIVATE | TAG_FLAG_CATEGORY)) ~= 0 then
       return true
     end
     parent = parent:match("^(.*)|[^|]+$")
@@ -3900,14 +3900,17 @@ function M.choose_existing_match(candidates, terms, taken)
   local exact_date = {}
   if taken then
     for _, candidate in ipairs(candidates or {}) do
-      if candidate.datetaken == taken or candidate.reasons.taken then exact_date[#exact_date + 1] = candidate end
+      if metadata.normalize_date_taken(candidate.datetaken) == taken or candidate.reasons.taken then
+        exact_date[#exact_date + 1] = candidate
+      end
     end
     if #exact_date == 1 then return exact_date[1], "exact date/time" end
   end
 
   local title_matches = {}
   for _, candidate in ipairs(candidates or {}) do
-    if candidate_title_matches(candidate, terms) and (not taken or candidate.datetaken == taken or candidate.reasons.taken) then
+    if candidate_title_matches(candidate, terms)
+        and (not taken or metadata.normalize_date_taken(candidate.datetaken) == taken or candidate.reasons.taken) then
       title_matches[#title_matches + 1] = candidate
     end
   end
@@ -13437,7 +13440,7 @@ function panel_sets.move_to_front()
   end
 end
 
-local function load_remote_content_type(api_key, api_secret, acc, photo_id, dateuploaded)
+local function load_remote_content_type(api_key, api_secret, acc, photo_id)
   local args = {
     user_id = acc and acc.nsid or nil,
     -- `views` is free here (same call) and feeds the panel-only stats line (#73).
@@ -13445,10 +13448,11 @@ local function load_remote_content_type(api_key, api_secret, acc, photo_id, date
     per_page = 50,
     page = 1,
   }
-  if dateuploaded and dateuploaded ~= "" then
-    args.min_upload_date = dateuploaded
-    args.max_upload_date = dateuploaded
-  end
+  -- No upload-date filter (issue #106): `dateuploaded` is a UTC epoch second
+  -- that does not always round-trip exactly with Flickr's date_upload search
+  -- index (drift + boundary-equality fragility), which could make the search
+  -- return an empty page for the just-fetched photo. The matcher below scans
+  -- the returned page for the photo's own id, so no date window is needed.
 
   local body, err
   if acc then
@@ -13512,7 +13516,7 @@ local function load_remote_settings(api_key, api_secret, acc, photo_id)
       state.set_uploaded_at(panel_current.image, acc.nsid, upload_stamp)
     end
   end
-  local content_type_index, _ctv, _cte, remote_views = load_remote_content_type(api_key, api_secret, acc, photo_id, remote_dateuploaded)
+  local content_type_index, _ctv, _cte, remote_views = load_remote_content_type(api_key, api_secret, acc, photo_id)
   panel_content_type_widget.selected = content_type_index or 0
   -- Faves count (issue #9): unlike views/comments there is no free source, so spend
   -- one explicit flickr.photos.getFavorites per panel load. Display-only and
@@ -13958,8 +13962,7 @@ function panel_sets.fetch_photo_setting_indices(api_key, api_secret, acc, photo_
     visibility and panel_helpers.remote_attr(visibility, "isfamily"))
   out.safety = panel_helpers.panel_safety_index_from_remote(panel_helpers.remote_attr(body, "safety_level"))
   out.license = panel_helpers.panel_license_index_from_id(panel_helpers.remote_attr(body, "license"))
-  local dateuploaded = panel_helpers.remote_attr(body, "dateuploaded")
-  out.content_type = load_remote_content_type(api_key, api_secret, acc, photo_id, dateuploaded)
+  out.content_type = load_remote_content_type(api_key, api_secret, acc, photo_id)
   local perms_body = __dtrmflickr_call("flickr.photos.getPerms", function()
     return rest.photos_get_perms(api_key, api_secret, acc, photo_id)
   end, { coalesce_key = "consensus-perms:" .. tostring(photo_id) })
