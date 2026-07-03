@@ -18049,12 +18049,21 @@ __dtrmflickr_debug_dump = require("dtrmflickr.debug_dump").build({
   extra = function()
     local acc = load_token()
     local sel = dt.gui.selection and dt.gui.selection() or {}
+    -- stack.active reads back as the child WIDGET, not an index (types.lua_stack
+    -- docs), so it can't index tab_names directly. The tab buttons already mark
+    -- the active one with a "▸ " prefix (set_active_tab) — read that instead.
+    local active_tab = "?"
+    for _, name in ipairs(panel_sets.tab_names) do
+      for _, button in ipairs(panel_sets.tab_buttons) do
+        if button.label == ("▸ " .. name) then active_tab = name end
+      end
+    end
     return {
       "selection_count: " .. tostring(#sel),
       "logged_in: " .. tostring(acc ~= nil),
       "account: " .. tostring(acc and (acc.username or acc.nsid) or "none"),
       "credentials_set: " .. tostring(get_credentials() ~= nil),
-      "active_tab: " .. tostring(panel_sets.tab_names[panel_tab_stack.active] or "?"),
+      "active_tab: " .. active_tab,
     }
   end,
 })
