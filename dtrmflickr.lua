@@ -5785,6 +5785,36 @@ function M.resend_image(image, acc, deps)
     end)
     if not ok then return nil, err end
   end
+  if plan.clear_date then
+    -- issue #105/#116: date-taken drifted but the local value is now empty; there
+    -- is no Flickr "clear date-taken" call and setDates rejects an empty date, so
+    -- resolve the stuck state instead of leaving `date_taken` flagged forever: no
+    -- Flickr write, just clear the reason and re-baseline the fingerprint (mirrors
+    -- the panel/batch push path).
+    state.clear_reason(image, acc.nsid, "date_taken")
+    if deps.store_fingerprints and fingerprints then
+      deps.store_fingerprints(image, acc.nsid, fingerprints, { "date_taken" })
+    end
+    meta_pushed = meta_pushed + 1
+    pushed = pushed + 1
+  end
+  if plan.strip_gps then
+    -- issue #23/#116: "strip GPS on resend" is on, so REMOVE the Flickr location
+    -- instead of sending coords (mirrors the panel/batch push path). removeLocation
+    -- is idempotent (Flickr err 2 "no location" == ok).
+    local ok, err = call("flickr.photos.geo.removeLocation", function()
+      return rest.photos_geo_remove_location(deps.api_key, deps.api_secret, acc, photo_id)
+    end)
+    if ok then
+      state.clear_reason(image, acc.nsid, "gps")
+      state.clear_fingerprint(image, acc.nsid, "gps")
+      meta_pushed = meta_pushed + 1
+      pushed = pushed + 1
+    else
+      state.mark_reason(image, acc.nsid, "gps")
+      return nil, err
+    end
+  end
 
   -- File the photo into any still-pending intended albums (issue #79). addPhoto
   -- is idempotent: replaying a member add converges, and Flickr error 3 ("already
