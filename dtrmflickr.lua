@@ -7419,10 +7419,18 @@ local M = {}
 -- Tokens are separated by commas or new lines only — NOT spaces, because Flickr
 -- usernames may legitimately contain spaces (e.g. "Jane Doe"). Each token is
 -- trimmed; empty tokens are dropped; duplicates collapse case-insensitively with
--- the first spelling winning. A token containing "@" is classified as an email
--- (resolved via flickr.people.findByEmail), otherwise a username
+-- the first spelling winning. A token matching an email shape is classified as
+-- an email (resolved via flickr.people.findByEmail); everything else — including
+-- a Flickr screen name that happens to contain "@" (e.g. "foo@bar"), which is a
+-- legal username character — is classified as a username
 -- (flickr.people.findByUsername). Returns a list of { value = <trimmed string>,
 -- kind = "email" | "username" }.
+local EMAIL_PATTERN = "^[%w%.%+%-]+@[%w%.%-]+%.[%a][%a]+$"
+
+local function looks_like_email(value)
+  return value:match(EMAIL_PATTERN) ~= nil
+end
+
 function M.parse_identifiers(text)
   local out, seen = {}, {}
   for token in tostring(text or ""):gmatch("[^,\r\n]+") do
@@ -7433,7 +7441,7 @@ function M.parse_identifiers(text)
         seen[key] = true
         out[#out + 1] = {
           value = value,
-          kind = value:find("@", 1, true) and "email" or "username",
+          kind = looks_like_email(value) and "email" or "username",
         }
       end
     end
