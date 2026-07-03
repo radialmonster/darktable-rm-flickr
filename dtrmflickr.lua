@@ -1329,17 +1329,50 @@ end
 -- ordered list of photo-id strings, or (nil, err). Used to build a FULL reorder
 -- list for move-to-front, since a partial reorderPhotos list is unreliable
 -- against real Flickr (see albums.move_to_front / reorder_csv notes).
+--
+-- Pages through flickr.photosets.getPhotos (issue #103): Flickr caps a page at
+-- 500 photos, so any album larger than that would otherwise be silently
+-- truncated to its first page and produce a wrong reorder. We request the max
+-- per_page, loop until the reported `total` is reached, and error if the
+-- accumulated count falls short of `total` so truncation can never pass as
+-- success.
 function M.photosets_get_photos(api_key, api_secret, account, photoset_id, opts)
   if not photoset_id or photoset_id == "" then return nil, "missing photoset id" end
-  local params = { photoset_id = photoset_id, media = "photos" }
-  if opts and opts.user_id then params.user_id = opts.user_id end
-  local body, err = M.call(api_key, api_secret, account, "flickr.photosets.getPhotos", params)
-  if not body then return nil, err end
   local ids = {}
-  -- match each <photo ... id="123" ...> in document order; the leading space
-  -- after `photo` avoids matching <photoset ...>.
-  for id in tostring(body):gmatch('<photo%s[^>]-id="(%d+)"') do
-    ids[#ids + 1] = id
+  local page = 1
+  local pages, total
+  while true do
+    local params = {
+      photoset_id = photoset_id,
+      media = "photos",
+      per_page = 500,
+      page = page,
+    }
+    if opts and opts.user_id then params.user_id = opts.user_id end
+    local body, err = M.call(api_key, api_secret, account, "flickr.photosets.getPhotos", params)
+    if not body then return nil, err end
+    body = tostring(body)
+    -- Read pagination bounds from the <photoset ...> open tag (page/pages/total).
+    local attrs = body:match("<photoset%s+([^>]*)>") or body:match("<photoset%s+([^>]*)/>")
+    if attrs then
+      local a = M.parse_attrs(attrs)
+      pages = tonumber(a.pages) or pages
+      total = tonumber(a.total) or total
+    end
+    -- match each <photo ... id="123" ...> in document order; the leading space
+    -- after `photo` avoids matching <photoset ...>.
+    for id in body:gmatch('<photo%s[^>]-id="(%d+)"') do
+      ids[#ids + 1] = id
+    end
+    if not pages or page >= pages then break end
+    page = page + 1
+  end
+  -- Guard against silent truncation: if Flickr told us a total, we must have
+  -- collected all of them before this list is safe to reorder against.
+  if total and #ids < total then
+    return nil, string.format(
+      "photosets_get_photos: got %d of %d photos for set %s (pagination short — refusing partial reorder list)",
+      #ids, total, tostring(photoset_id))
   end
   return ids
 end
