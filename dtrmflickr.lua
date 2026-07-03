@@ -595,10 +595,21 @@ end
 
 -- Test hook: lets offline tests force the in-process native path with a stubbed
 -- request() on any OS (the real selection is gated on is_windows() + a loaded DLL).
+-- Once an override has been engaged (`native_http_override_set`), it is
+-- authoritative — including when explicitly cleared to nil, which then means
+-- "native module ABSENT" and short-circuits the real re-resolution below.
+-- Without this, `set_native_http(nil)` on a dev box with a loadable DLL would
+-- fall through and re-resolve the real module, so the "DLL absent" branch could
+-- never be exercised deterministically (#91). Production never sets this flag.
 local native_http_override = nil
+local native_http_override_set = false
 
 local function multipart_native()
-  if native_http_override then return native_http_override end
+  if native_http_override_set then
+    local ov = native_http_override
+    if ov and ov.request then return ov end
+    return nil
+  end
   if is_windows() and native_http_ok and native_http and native_http.request then
     return native_http
   end
@@ -609,7 +620,7 @@ end
 -- probe for other DLL exports (shell_open / clipboard_set — #83). Honors the
 -- test override so the Windows-only branch is exercisable on any OS.
 local function native_helper()
-  if native_http_override then return native_http_override end
+  if native_http_override_set then return native_http_override end
   if is_windows() and native_http_ok and native_http then return native_http end
   return nil
 end
@@ -678,7 +689,18 @@ end
 M.__test = {
   run_curl_config = run_curl_config,
   build_multipart = build_multipart,
-  set_native_http = function(mod) native_http_override = mod end,
+  -- Engage an authoritative override. Passing a stub forces the native path;
+  -- passing nil forces the "native ABSENT" branch deterministically on any box
+  -- (even one with a loadable DLL) — see native_http_override_set (#91).
+  set_native_http = function(mod)
+    native_http_override = mod
+    native_http_override_set = true
+  end,
+  -- Disengage the override entirely and fall back to real OS/DLL resolution.
+  reset_native_http = function()
+    native_http_override = nil
+    native_http_override_set = false
+  end,
 }
 
 return M
