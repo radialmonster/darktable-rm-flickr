@@ -14432,6 +14432,13 @@ function panel_sets.pull_remote_meta()
   local changed = {}
   if plan.title then image.title = plan.title.new; changed[#changed + 1] = "title" end
   if plan.description then image.description = plan.description.new; changed[#changed + 1] = "description" end
+  -- Local copies now match what was just pulled, so the stored fingerprint (still
+  -- the pre-pull baseline) would otherwise re-flag "title_description" on the very
+  -- next evaluate. Clear the reason and re-snapshot the baseline, mirroring the
+  -- push path (sync_panel_meta) above.
+  state.clear_reason(image, acc.nsid, "title_description")
+  store_metadata_fingerprints(image, acc.nsid,
+    effective_metadata_fingerprints(image, sync), { "title_description" })
   -- Local copies now match the remote that was just pushed/edited; refresh the
   -- per-image publish-state label so title/description no longer reads as drifted.
   if panel_sets.refresh_publish_state_label then
@@ -15119,6 +15126,7 @@ function panel_reconcile.pull_remote_only()
   local names = tag_reconcile.plan_pull_remote_only(d.remote_only)
   if #names == 0 then dt.print(_("Flickr: no Flickr-only tags to pull.")); return end
   local image = panel_current.image
+  local acc = panel_current.account
   local added = 0
   for _, name in ipairs(names) do
     local tag = dt.tags.find and dt.tags.find(name) or nil
@@ -15126,6 +15134,20 @@ function panel_reconcile.pull_remote_only()
     if tag then
       if image.attach_tag then image:attach_tag(tag) else dt.tags.attach(tag, image) end
       added = added + 1
+    end
+  end
+  -- Local keywords now include what was just pulled, so the stored fingerprint
+  -- (still the pre-pull baseline) would otherwise re-flag "keywords" on the very
+  -- next evaluate. Clear the reason and re-snapshot the baseline, mirroring the
+  -- push path (panel_reconcile.apply) above -- only possible when the image is
+  -- actually linked to an account (pull_remote_only can run on an image whose
+  -- remote_tags came from a still-open diff even if it was since unlinked).
+  if added > 0 and acc then
+    state.clear_reason(image, acc.nsid, "keywords")
+    store_metadata_fingerprints(image, acc.nsid,
+      effective_metadata_fingerprints(image, master_sync_fields()), { "keywords" })
+    if panel_sets.refresh_publish_state_label and panel_current.photo_id then
+      panel_sets.refresh_publish_state_label(image, acc, panel_current.photo_id)
     end
   end
   panel_remote_label.label = string.format(_("Flickr: pulled %d tag(s) into darktable"), added)
