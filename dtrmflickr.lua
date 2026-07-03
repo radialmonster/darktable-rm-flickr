@@ -2298,6 +2298,31 @@ end
 -- compared by equality rather than ordering.
 local PIXEL_FIELD = "pixels"
 
+-- Fingerprint field snapshotting the host's date/time rendering environment
+-- alongside the pixel baseline (issue #95). change_timestamp is a locale- and
+-- timezone-formatted string, so a host locale/TZ change (or a DST transition
+-- affecting the formatted string) reformats it for every photo with no pixel
+-- edit at all -- which would otherwise read as a genuine mass pixel-drift and
+-- queue every published photo for full reupload. See M.locale_env_signature.
+local PIXEL_ENV_FIELD = "pixelsenv"
+
+-- A fixed reference instant used purely as an environment sentinel -- never a
+-- real event. Formatting it with the *local*, locale-aware os.date (no "!"
+-- prefix) yields a string that changes whenever the host's TZ or LC_TIME
+-- configuration changes, the same class of host state that reformats
+-- image.change_timestamp (see M.pixel_fingerprint). os.date/strftime is a
+-- different formatting engine than darktable's GLib g_date_time_format, so
+-- the two strings are never compared to each other -- only this signature
+-- against its own prior snapshot, to detect that the host's rendering
+-- environment moved between two evaluate_publish_state calls.
+local LOCALE_PROBE_EPOCH <const> = 1577880000 -- 2020-01-01T12:00:00Z
+
+function M.locale_env_signature()
+  local ok, value = pcall(os.date, "%x %X %Z", LOCALE_PROBE_EPOCH)
+  if not ok or type(value) ~= "string" or value == "" then return nil end
+  return value
+end
+
 -- darktable exposes image.change_timestamp as a locale-formatted "%a %x %X"
 -- string (src/lua/image.c change_timestamp_member -> dt_datetime_gdatetime_to_local
 -- with tz=TRUE -> g_date_time_format(..., "%a %x %X")), e.g. "Sun 06/28/2026
@@ -2526,8 +2551,15 @@ function M.set_image_published_at(image, account_nsid, stamp)
   local fp = M.pixel_fingerprint(image)
   if fp then
     M.set_fingerprint(image, account_nsid, PIXEL_FIELD, fp)
+    local env = M.locale_env_signature()
+    if env then
+      M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, env)
+    else
+      M.clear_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
+    end
   else
     M.clear_fingerprint(image, account_nsid, PIXEL_FIELD)
+    M.clear_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
   end
   return result
 end
@@ -2566,11 +2598,17 @@ function M.mark_published(image, account_nsid, stamp, fingerprints)
   assert_component("account id", account_nsid)
   if not M.get_photo_id(image, account_nsid) then return false end
   local prior_pixels = M.get_fingerprint(image, account_nsid, PIXEL_FIELD)
+  local prior_env = M.get_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
   local applied = M.set_published_at(image, account_nsid, stamp)
   if prior_pixels then
     M.set_fingerprint(image, account_nsid, PIXEL_FIELD, prior_pixels)
   else
     M.clear_fingerprint(image, account_nsid, PIXEL_FIELD)
+  end
+  if prior_env then
+    M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, prior_env)
+  else
+    M.clear_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
   end
   if fingerprints then M.set_fingerprints(image, account_nsid, fingerprints) end
   return true, applied
@@ -2802,6 +2840,8 @@ function M.backfill_baseline(image, account_nsid, metadata_fingerprints)
     local current_pixels = M.pixel_fingerprint(image)
     if current_pixels then
       M.set_fingerprint(image, account_nsid, PIXEL_FIELD, current_pixels)
+      local env = M.locale_env_signature()
+      if env then M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, env) end
       filled = filled + 1
     end
   end
@@ -2901,8 +2941,24 @@ function M.evaluate_publish_state(image, account_nsid, opts)
   local current_pixels = M.pixel_fingerprint(image)
   local baseline_pixels = M.get_fingerprint(image, account_nsid, PIXEL_FIELD)
   if current_pixels and baseline_pixels and current_pixels ~= baseline_pixels then
-    M.mark_needs_republish(image, account_nsid)
-    return "needs-republish", published_at, photo_id, M.get_reasons(image, account_nsid)
+    -- Guard against a host locale/timezone change re-rendering change_timestamp
+    -- for every photo with no pixel edit at all (issue #95): if the env
+    -- signature snapshotted alongside the baseline no longer matches the
+    -- current one, the host's date/time rendering moved since the baseline was
+    -- recorded, so this mismatch is inconclusive rather than a proven edit.
+    -- Re-snapshot both to the current state and leave this photo "current" --
+    -- consistent with the existing "no baseline -> current" rule, this trades
+    -- a possible missed edit (one that happens to coincide with the env
+    -- change) for never mass-flagging the whole library on a locale/TZ change.
+    local baseline_env = M.get_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
+    local current_env = M.locale_env_signature()
+    if baseline_env and current_env and baseline_env ~= current_env then
+      M.set_fingerprint(image, account_nsid, PIXEL_FIELD, current_pixels)
+      M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, current_env)
+    else
+      M.mark_needs_republish(image, account_nsid)
+      return "needs-republish", published_at, photo_id, M.get_reasons(image, account_nsid)
+    end
   end
 
   M.clear_needs_republish(image, account_nsid)
@@ -2931,6 +2987,7 @@ function M.clear_photo_id(image, account_nsid)
   M.clear_needs_republish(image, account_nsid)
   for _, reason in ipairs(known_metadata_reasons()) do M.clear_fingerprint(image, account_nsid, reason) end
   M.clear_fingerprint(image, account_nsid, PIXEL_FIELD)
+  M.clear_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
   return true
 end
 
@@ -2990,6 +3047,7 @@ function M.clear_account(image, account_nsid)
     removed = removed + M.clear_fingerprint(image, account_nsid, field)
   end
   removed = removed + M.clear_fingerprint(image, account_nsid, PIXEL_FIELD)
+  removed = removed + M.clear_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
   if M.clear_needs_republish(image, account_nsid) then removed = removed + 1 end
   if M.clear_photo_id(image, account_nsid) then removed = removed + 1 end
   return removed
