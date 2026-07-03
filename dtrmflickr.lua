@@ -2803,17 +2803,31 @@ function M.set_fingerprints(image, account_nsid, fingerprints)
   return changed
 end
 
+-- Returns two sorted lists: `drifted` (fields whose current fingerprint no
+-- longer matches the stored baseline) and `reverted` (fields whose current
+-- fingerprint matches the baseline again -- i.e. an edit that was undone).
+-- Fields with no stored baseline yet, or no fingerprint supplied at all
+-- (settings-only reasons like visibility/safety/content_type/license/
+-- permissions have no fingerprint concept), appear in neither list and are
+-- left alone -- there is nothing to compare them against (issue #119).
 function M.metadata_fingerprint_reasons(image, account_nsid, fingerprints)
-  local reasons = {}
+  local drifted, reverted = {}, {}
   for _, reason in ipairs(known_metadata_reasons()) do
     local current = fingerprints and fingerprints[reason] or nil
     if current ~= nil then
       local previous = M.get_fingerprint(image, account_nsid, reason)
-      if previous and previous ~= tostring(current) then reasons[#reasons + 1] = reason end
+      if previous then
+        if previous ~= tostring(current) then
+          drifted[#drifted + 1] = reason
+        else
+          reverted[#reverted + 1] = reason
+        end
+      end
     end
   end
-  table.sort(reasons)
-  return reasons
+  table.sort(drifted)
+  table.sort(reverted)
+  return drifted, reverted
 end
 
 -- Backfill missing fingerprint baselines for an already-linked, already-
@@ -2908,13 +2922,6 @@ function M.evaluate_publish_state(image, account_nsid, opts)
   local image_published_at = M.get_image_published_at(image, account_nsid)
   local metadata_published_at = M.get_metadata_published_at(image, account_nsid)
   local published_at = image_published_at or metadata_published_at or M.get_published_at(image, account_nsid)
-  local reasons = M.get_reasons(image, account_nsid)
-  if #reasons > 0 or M.needs_republish(image, account_nsid) then
-    return "needs-republish", published_at, photo_id, reasons
-  end
-  if not published_at then
-    return "unknown", published_at, photo_id, reasons
-  end
 
   -- Metadata fingerprints (keywords/title/GPS/etc.) are compared unconditionally,
   -- NOT gated behind image.change_timestamp: darktable's C core only bumps that
@@ -2924,10 +2931,24 @@ function M.evaluate_publish_state(image, account_nsid, opts)
   -- keyword-only or metadata-only edit could never be detected: change_timestamp
   -- never advances for that edit, so the branch was skipped and needs-republish
   -- was actively cleared underneath it.
-  local metadata_requeue = M.metadata_fingerprint_reasons(image, account_nsid, opts.metadata_fingerprints)
-  if #metadata_requeue > 0 then
-    for _, reason in ipairs(metadata_requeue) do M.mark_reason(image, account_nsid, reason) end
-    return "needs-republish", published_at, photo_id, M.get_reasons(image, account_nsid)
+  --
+  -- This runs BEFORE the "existing reasons" check below (issue #119): a field
+  -- reverted back to its stored baseline (e.g. the user undoes a keyword edit)
+  -- must clear its own stale "needs-republish: keywords" flag instead of that
+  -- flag lingering forever just because it was once set. Reasons with no
+  -- fingerprint baseline (settings-only reasons, or fields never fingerprinted)
+  -- are untouched by this pass and stay whatever a caller explicitly marked.
+  local metadata_drifted, metadata_reverted =
+    M.metadata_fingerprint_reasons(image, account_nsid, opts.metadata_fingerprints)
+  for _, reason in ipairs(metadata_drifted) do M.mark_reason(image, account_nsid, reason) end
+  for _, reason in ipairs(metadata_reverted) do M.clear_reason(image, account_nsid, reason) end
+
+  local reasons = M.get_reasons(image, account_nsid)
+  if #reasons > 0 or M.needs_republish(image, account_nsid) then
+    return "needs-republish", published_at, photo_id, reasons
+  end
+  if not published_at then
+    return "unknown", published_at, photo_id, reasons
   end
 
   -- Pixel (develop-history) changes. image.change_timestamp is a locale-formatted
