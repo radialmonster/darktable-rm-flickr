@@ -2544,10 +2544,23 @@ end
 -- flipping the photo back to "needs-sync"/"unknown". Returns false (without
 -- touching anything) when the image is not linked to this account: there is no
 -- published photo to re-mark.
+--
+-- set_published_at (via set_image_published_at) always re-snapshots the pixel
+-- fingerprint from the image's *current* change_timestamp, which is correct
+-- after a real pixel upload but wrong here: no pixels were sent, so refreshing
+-- the baseline to "now" would mask any develop edit made since the last real
+-- publish (issue #104). Preserve the pixel baseline that was on record before
+-- this call instead of letting it jump forward.
 function M.mark_published(image, account_nsid, stamp, fingerprints)
   assert_component("account id", account_nsid)
   if not M.get_photo_id(image, account_nsid) then return false end
+  local prior_pixels = M.get_fingerprint(image, account_nsid, PIXEL_FIELD)
   local applied = M.set_published_at(image, account_nsid, stamp)
+  if prior_pixels then
+    M.set_fingerprint(image, account_nsid, PIXEL_FIELD, prior_pixels)
+  else
+    M.clear_fingerprint(image, account_nsid, PIXEL_FIELD)
+  end
   if fingerprints then M.set_fingerprints(image, account_nsid, fingerprints) end
   return true, applied
 end
