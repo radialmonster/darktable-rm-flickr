@@ -5350,6 +5350,16 @@ function M.new(opts)
   local function pending_key(image_key, nsid)
     return tostring(image_key or "") .. "\0" .. tostring(nsid or "")
   end
+
+  -- Recursive plain-data copy (records are serializable tables — no metatables,
+  -- no cycles, per save_records' contract), used so a parked record can never be
+  -- corrupted by a caller mutating a table it still holds a reference to (#113).
+  local function deep_copy(v)
+    if type(v) ~= "table" then return v end
+    local out = {}
+    for k, vv in pairs(v) do out[k] = deep_copy(vv) end
+    return out
+  end
   local function pending_records()
     local out = {}
     for _, rec in pairs(pending) do out[#out + 1] = rec end
@@ -5372,11 +5382,15 @@ function M.new(opts)
     return out
   end
 
-  -- Replace the parked keep-set (issue #57's resume executor owns this). Defensive
-  -- copy so the caller's table cannot mutate the store's state afterward.
+  -- Replace the parked keep-set (issue #57's resume executor owns this). Deep-copies
+  -- each record so neither the caller's list NOR any of its record tables can mutate
+  -- the store's state afterward (#113: a shallow per-list copy still shared record
+  -- objects by reference — e.g. the plan's `uncertain`/`orphaned` tables — so a later
+  -- in-place edit of `rec.state`/`rec.nsid`/etc. silently drifted the parked set and
+  -- the next persisted blob).
   function self.set_parked(records)
     parked = {}
-    for _, rec in ipairs(records or {}) do parked[#parked + 1] = rec end
+    for _, rec in ipairs(records or {}) do parked[#parked + 1] = deep_copy(rec) end
   end
 
   -- Persist the current resumable set (tracker-live ∪ parked ∪ pending). Returns
@@ -5390,9 +5404,15 @@ function M.new(opts)
   -- after a fresh upload in the same batch) just overwrites it. Persists
   -- immediately — the synchronous export path is NOT gated by `is_pumping`, so the
   -- durable blob reflects the in-progress batch the moment a photo's pixels land.
-  -- A nil/keyless record is ignored. Returns the blob written, or nil if ignored.
+  -- A nil/keyless record is ignored, and so is a nil/empty-nsid one (#113):
+  -- `pending_key` reduces a nil nsid to the same "" slot for every account, so
+  -- without this guard two different accounts' (or any unbound) records would
+  -- collapse onto one key and silently overwrite each other, losing a resume
+  -- entry — this module's account-binding contract requires every record to carry
+  -- its owning nsid. Returns the blob written, or nil if ignored.
   function self.add_pending(rec)
     if type(rec) ~= "table" or rec.image == nil then return nil end
+    if rec.nsid == nil or rec.nsid == "" then return nil end
     pending[pending_key(rec.image, rec.nsid)] = rec
     return self.persist()
   end
