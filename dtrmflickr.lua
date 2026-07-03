@@ -3616,14 +3616,30 @@ end
 -- state.evaluate_publish_state (e.g. {"keywords","gps"}); only the four reasons
 -- that have a metadata-only Flickr push (title_description, keywords, gps,
 -- date_taken) are considered here. Pure/offline-testable.
-function M.metadata_resend_plan(sync, reasons)
+function M.metadata_resend_plan(sync, reasons, values)
   sync = sync or {}
+  values = values or {}
+  -- Whether the image actually carries a non-empty local date-taken to push. The
+  -- caller passes this so the pure planner can gate the date op offline (#105).
+  -- Default true when unspecified so legacy callers / non-date plans are unchanged;
+  -- only an explicit has_date=false gates the date branch.
+  local has_date = values.has_date
+  if has_date == nil then has_date = true end
   local flagged = {}
   for _, reason in ipairs(reasons or {}) do flagged[reason] = true end
+  local date_flagged = (sync.date_taken == true) and flagged.date_taken == true
   local plan = {
     send_meta = ((sync.title == true) or (sync.description == true)) and flagged.title_description == true,
     send_tags = (sync.tags == true) and flagged.keywords == true,
-    send_date = (sync.date_taken == true) and flagged.date_taken == true,
+    -- issue #105: only push a date when there's a non-empty local value.
+    -- flickr.photos.setDates hard-errors on an empty date_taken, so an empty-local
+    -- photo would fail every batch and stay wedged in needs-sync forever.
+    send_date = date_flagged and has_date,
+    -- ...and when the date drifted but the local value is now empty (e.g. the user
+    -- cleared the EXIF date), there is no Flickr "clear date-taken" call to make.
+    -- Rather than retry setDates and fail on every batch, resolve the stuck reason:
+    -- the caller clears it and re-baselines the fingerprint (issue #105).
+    clear_date = date_flagged and (not has_date),
     -- Privacy-first: "strip GPS on resend" suppresses the metadata-only GPS push so
     -- a batch resend never re-sends coordinates the user asked to strip (issue #23).
     send_gps  = (sync.gps == true) and flagged.gps == true and (sync.strip_gps ~= true),
@@ -3634,7 +3650,8 @@ function M.metadata_resend_plan(sync, reasons)
     -- mutually exclusive by construction (the strip_gps flag flips which one fires).
     strip_gps = (sync.gps == true) and flagged.gps == true and (sync.strip_gps == true),
   }
-  plan.any = plan.send_meta or plan.send_tags or plan.send_date or plan.send_gps or plan.strip_gps
+  plan.any = plan.send_meta or plan.send_tags or plan.send_date or plan.send_gps
+    or plan.strip_gps or plan.clear_date
   return plan
 end
 
@@ -15146,7 +15163,13 @@ function panel_sets.push_selected_metadata()
       local _status, _pub, _pid, reasons = state.evaluate_publish_state(image, acc.nsid, {
         metadata_fingerprints = fingerprints,
       })
-      local plan = metadata.metadata_resend_plan(sync, reasons)
+      -- Read the local date-taken up front so the planner can gate the date op on
+      -- a non-empty value (issue #105): setDates rejects an empty date, so a photo
+      -- with a cleared local date must not keep failing the batch forever.
+      local date_taken = metadata.image_date_taken(image)
+      local plan = metadata.metadata_resend_plan(sync, reasons, {
+        has_date = date_taken ~= nil and tostring(date_taken) ~= "",
+      })
       if not plan.any then
         unchanged = unchanged + 1
       else
@@ -15185,11 +15208,20 @@ function panel_sets.push_selected_metadata()
             end)
         end
         if plan.send_date then
-          local date_taken = metadata.image_date_taken(image)
           push("date_taken", "date_taken", _("date taken"),
             "flickr.photos.setDates", function()
               return rest.photos_set_dates(api_key, api_secret, acc, photo_id, date_taken, 0)
             end)
+        end
+        if plan.clear_date then
+          -- issue #105: date-taken drifted but the local value is now empty; Flickr
+          -- has no "clear date-taken" call and setDates rejects an empty date, so
+          -- there is nothing to push. Resolve the stuck state instead of failing the
+          -- batch every run: clear the reason and re-baseline the fingerprint so the
+          -- now-empty local value stops re-flagging. No Flickr write, no field tally.
+          state.clear_reason(image, acc.nsid, "date_taken")
+          store_metadata_fingerprints(image, acc.nsid, fingerprints, { "date_taken" })
+          photo_ok = true
         end
         if plan.send_gps then
           local lat, lon = metadata.image_location(image)
