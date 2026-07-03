@@ -4502,11 +4502,21 @@ function Queue:call(method, fn, opts)
   local job = self:enqueue(method, fn, opts)
   -- `done` is now wired in enqueue (so both enqueue and call honour it); the
   -- surviving job after a coalesce already carries the newest job's `done`.
-  if self.running then
-    -- Reentrant call from inside a running job: run it now (synchronously,
-    -- jumping the queue) and return its real result instead of leaving it
-    -- pending. The job is the just-enqueued/surviving pending entry, so pull it
-    -- out of pending if present and finish it directly.
+  if self.running or self.pump_running then
+    -- Run this job now (synchronously, jumping the queue) and return its real
+    -- result instead of leaving it pending. Two cases share this path:
+    --   * `running` — a reentrant call from inside a job the drain/pump is
+    --     already running.
+    --   * `pump_running` (issue #102) — a foreground call (panel button, export)
+    --     arriving during the async pump's `pump_yield` window, where `running`
+    --     is momentarily false but the pump still owns the pending batch. Without
+    --     this guard the call fell through to `self:drain()` and collapsed the
+    --     whole remaining batch into a synchronous UI-thread drain — the exact
+    --     freeze the pump exists to prevent.
+    -- Either way we take out and finish only *this* job, leaving the rest of the
+    -- pending list for the drain/pump to own. The job is the just-enqueued (or
+    -- coalesce-surviving) pending entry, so pull it out of pending if present and
+    -- finish it directly.
     for i, pending in ipairs(self.pending) do
       if pending == job then
         table.remove(self.pending, i)
