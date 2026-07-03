@@ -12927,6 +12927,9 @@ function panel_sets.copy_links()
   end
 end
 
+-- Selected-entry helpers return the full settings table entry (pref/flags/
+-- flickr_value), not just the raw value, so callers can feed them straight
+-- into rules.apply_keyword_overrides. The plain-value helpers below reuse them.
 local function panel_privacy_flags()
   local selected = settings.privacy_values[panel_privacy_widget.selected or 1] or settings.privacy_values[1]
   return selected.is_public, selected.is_friend, selected.is_family
@@ -13710,7 +13713,26 @@ local function save_panel_settings()
   local skipped = {}
   local saved_fields = {}
   local sync = master_sync_fields()
-  local is_public, is_friend, is_family = panel_privacy_flags()
+  -- Apply the same keyword-driven privacy/safety/content-type/license overrides
+  -- (and rating/color-label forced-private) that the upload/replace path applies,
+  -- so the value actually pushed to Flickr never diverges from the fingerprint
+  -- stored for drift detection (issue #94).
+  local tag_names = metadata.image_tag_names(panel_current.image)
+  local privacy, safety, content_type, license, forced, conflicts =
+    rules.apply_keyword_overrides(tag_names,
+      settings.privacy_values[panel_privacy_widget.selected or 1] or settings.privacy_values[1],
+      settings.safety_values[panel_safety_widget.selected or 1] or settings.safety_values[1],
+      (panel_content_type_widget.selected or 0) ~= 0 and settings.content_type_values[panel_content_type_widget.selected] or nil,
+      settings.license_values[panel_license_widget.selected or 1] or settings.license_values[1])
+  local override_extra_data = {}
+  for _, conflict in ipairs(conflicts or {}) do rules.record_keyword_conflict(override_extra_data, conflict) end
+  local private_rating_threshold = rules.should_force_private_by_rating(panel_current.image)
+  local private_label = rules.should_force_private_by_color_label(panel_current.image)
+  if private_rating_threshold or private_label then
+    privacy = settings.privacy_values[1]
+    forced.privacy = true
+  end
+  local is_public, is_friend, is_family = privacy.is_public, privacy.is_friend, privacy.is_family
   local wants_privacy = panel_dirty.privacy
   local wants_comment_perm = panel_dirty.comment_perm
   local wants_addmeta_perm = panel_dirty.addmeta_perm
@@ -13738,12 +13760,11 @@ local function save_panel_settings()
   if (wants_comment_perm or wants_addmeta_perm) and not sync.permissions then
     skipped[#skipped + 1] = "permissions"
   end
-  local safety = panel_safety_value()
   -- setSafetyLevel pushes the safety level, gated by its sync master toggle.
   local push_safety = panel_dirty.safety and sync.safety
   if push_safety then
     local ok, err = __dtrmflickr_call("flickr.photos.setSafetyLevel", function()
-      return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety)
+      return rest.photos_set_safety_level(api_key, api_secret, acc, photo_id, safety.flickr_value)
     end)
     if not ok then
       state.mark_reason(panel_current.image, acc.nsid, "safety")
@@ -13755,11 +13776,10 @@ local function save_panel_settings()
   elseif panel_dirty.safety then
     skipped[#skipped + 1] = "safety"
   end
-  local content_type = panel_content_type_value()
   if panel_dirty.content_type and sync.content_type then
     if content_type then
       local ok, err = __dtrmflickr_call("flickr.photos.setContentType", function()
-        return rest.photos_set_content_type(api_key, api_secret, acc, photo_id, content_type)
+        return rest.photos_set_content_type(api_key, api_secret, acc, photo_id, content_type.flickr_value)
       end)
       if not ok then
         state.mark_reason(panel_current.image, acc.nsid, "content_type")
@@ -13774,10 +13794,9 @@ local function save_panel_settings()
   elseif panel_dirty.content_type then
     skipped[#skipped + 1] = "content type"
   end
-  local license = panel_license_value()
   if panel_dirty.license and sync.license then
     local ok, err = __dtrmflickr_call("flickr.photos.licenses.setLicense", function()
-      return rest.photos_licenses_set_license(api_key, api_secret, acc, photo_id, license)
+      return rest.photos_licenses_set_license(api_key, api_secret, acc, photo_id, license.flickr_value)
     end)
     if not ok then
       state.mark_reason(panel_current.image, acc.nsid, "license")
@@ -13797,7 +13816,11 @@ local function save_panel_settings()
     if #saved_fields > 0 then
       state.set_metadata_published_at(panel_current.image, acc.nsid)
       store_metadata_fingerprints(panel_current.image, acc.nsid,
-        effective_metadata_fingerprints(panel_current.image, sync), saved_fields)
+        effective_metadata_fingerprints(panel_current.image, sync, {
+          skip_keyword_overrides = true, tag_names = tag_names, forced = forced,
+          privacy = privacy, safety = safety, content_type = content_type, license = license,
+          permissions = { perm_comment = panel_comment_perm_value(), perm_addmeta = panel_addmeta_perm_value() },
+        }), saved_fields)
       panel_sets.refresh_publish_state_label(panel_current.image, acc, photo_id)
     end
     panel_remote_label.label = _("Flickr: settings skipped by Lua sync options")
@@ -13805,7 +13828,11 @@ local function save_panel_settings()
   else
     state.set_metadata_published_at(panel_current.image, acc.nsid)
     store_metadata_fingerprints(panel_current.image, acc.nsid,
-      effective_metadata_fingerprints(panel_current.image, sync), saved_fields)
+      effective_metadata_fingerprints(panel_current.image, sync, {
+        skip_keyword_overrides = true, tag_names = tag_names, forced = forced,
+        privacy = privacy, safety = safety, content_type = content_type, license = license,
+        permissions = { perm_comment = panel_comment_perm_value(), perm_addmeta = panel_addmeta_perm_value() },
+      }), saved_fields)
     panel_sets.refresh_publish_state_label(panel_current.image, acc, photo_id)
     panel_remote_label.label = _("Flickr: settings saved")
     dt.print(_("Flickr: settings saved."))
@@ -13877,16 +13904,22 @@ function panel_sets.apply_settings_to_selection()
   end
   panel_sets.batch_save_armed = nil
 
-  -- Snapshot the user-chosen values once; they are identical for every photo.
+  -- Snapshot the user-chosen widget values once; they are the same for every
+  -- photo. The keyword-driven overrides and rating/color-label forced-private
+  -- checks are NOT snapshotted here because they depend on each photo's own
+  -- keywords/rating/color label (issue #94) — they are recomputed per image
+  -- inside the loop below.
   local want = {}
   for _, e in ipairs(apply_entries) do want[e.dirty_key] = true end
-  local is_public, is_friend, is_family = panel_privacy_flags()
+  local privacy_sel = settings.privacy_values[panel_privacy_widget.selected or 1] or settings.privacy_values[1]
+  local safety_sel = settings.safety_values[panel_safety_widget.selected or 1] or settings.safety_values[1]
+  local content_type_sel = (panel_content_type_widget.selected or 0) ~= 0
+    and settings.content_type_values[panel_content_type_widget.selected] or nil
+  local license_sel = settings.license_values[panel_license_widget.selected or 1] or settings.license_values[1]
   local comment_val = panel_comment_perm_value()
   local addmeta_val = panel_addmeta_perm_value()
-  local safety_val = panel_safety_value()
-  local content_val = panel_content_type_value()
-  local license_val = panel_license_value()
   local want_perm = want.comment_perm or want.addmeta_perm
+  local batch_override_extra_data = {}
 
   local applied, with_errors, unlinked = 0, 0, 0
   local fail_notes = {}
@@ -13898,6 +13931,21 @@ function panel_sets.apply_settings_to_selection()
     else
       local photo_ok, photo_failed = false, false
       local saved_fields = {}
+
+      local tag_names = metadata.image_tag_names(image)
+      local privacy, safety, content_type, license, forced, conflicts =
+        rules.apply_keyword_overrides(tag_names, privacy_sel, safety_sel, content_type_sel, license_sel)
+      for _, conflict in ipairs(conflicts or {}) do rules.record_keyword_conflict(batch_override_extra_data, conflict) end
+      local private_rating_threshold = rules.should_force_private_by_rating(image)
+      local private_label = rules.should_force_private_by_color_label(image)
+      if private_rating_threshold or private_label then
+        privacy = settings.privacy_values[1]
+        forced.privacy = true
+      end
+      local is_public, is_friend, is_family = privacy.is_public, privacy.is_friend, privacy.is_family
+      local safety_val = safety.flickr_value
+      local content_val = content_type and content_type.flickr_value or nil
+      local license_val = license.flickr_value
 
       -- privacy + permissions fold into one setPerms call (mirrors single path).
       if want.privacy or want_perm then
@@ -13971,7 +14019,11 @@ function panel_sets.apply_settings_to_selection()
         -- flagging them (same bookkeeping as the single-image save).
         state.set_metadata_published_at(image, acc.nsid)
         store_metadata_fingerprints(image, acc.nsid,
-          effective_metadata_fingerprints(image, sync), saved_fields)
+          effective_metadata_fingerprints(image, sync, {
+            skip_keyword_overrides = true, tag_names = tag_names, forced = forced,
+            privacy = privacy, safety = safety, content_type = content_type, license = license,
+            permissions = { perm_comment = comment_val, perm_addmeta = addmeta_val },
+          }), saved_fields)
       end
       if photo_failed then with_errors = with_errors + 1
       elseif photo_ok then applied = applied + 1 end
