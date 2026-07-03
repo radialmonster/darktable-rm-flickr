@@ -194,6 +194,16 @@ package.preload["dtrmflickr.http"] = function(...)
 local M = {}
 local temp_counter = 0
 local temp_token = tostring({}):gsub("%W", "")
+-- Seed once from a high-resolution clock plus the table-identity token above,
+-- so temp_path()'s random component isn't the same sequence on every launch
+-- (Lua's un-seeded math.random is otherwise deterministic per-process).
+do
+  local seed = tostring(os.time() * 1000 + math.floor((os.clock() or 0) * 1000) % 1000)
+    .. temp_token
+  local n = 0
+  for i = 1, #seed do n = (n * 31 + seed:byte(i)) % 2147483647 end
+  pcall(math.randomseed, n)
+end
 local native_http_ok, native_http = false, nil
 local native_http_error = nil
 local run
@@ -277,11 +287,18 @@ local function curl_config_quote(s)
     .. '"'
 end
 
+-- Higher-entropy name: os.time() alone is second-granular and temp_counter
+-- restarts at 0 each launch, so both are guessable across processes. The random
+-- component (seeded once above from a high-res clock, #111) makes the full name
+-- practically unpredictable to another local process, closing the TOCTOU/
+-- symlink-tampering window on these OAuth-bearing temp files.
 local function temp_path(suffix)
   temp_counter = temp_counter + 1
   local dir = os.getenv("TEMP") or os.getenv("TMP") or "."
   local sep = is_windows() and "\\" or "/"
-  return dir .. sep .. "dtrmflickr-" .. tostring(os.time()) .. "-" .. temp_token .. "-" .. tostring(temp_counter) .. suffix
+  local rnd = string.format("%08x", math.random(0, 0xffffffff))
+  return dir .. sep .. "dtrmflickr-" .. tostring(os.time()) .. "-" .. temp_token
+    .. "-" .. tostring(temp_counter) .. "-" .. rnd .. suffix
 end
 
 local function read_file(path)
@@ -328,9 +345,12 @@ local function run_curl_config(lines)
     return nil, "could not write temporary curl config"
   end
   -- via M.run (not the local upvalue) so offline tests can stub the shell-out and
-  -- exercise the status-sentinel parsing below without spawning curl.
-  local out, err = M.run("curl --config " .. shq(config_path))
+  -- exercise the status-sentinel parsing below without spawning curl. pcall'd so
+  -- the config file (OAuth-signed URL/body) is removed even if M.run raises
+  -- instead of returning nil, err (#111).
+  local ok, out, err = pcall(M.run, "curl --config " .. shq(config_path))
   os.remove(config_path)
+  if not ok then error(out) end
   if not out then return nil, err end
   -- On Windows, curl is only used for multipart upload and runs under -o (body to
   -- file, write-out to a discarded stdout), so the sentinel is simply absent and
@@ -390,13 +410,16 @@ local function run_windows_hidden(cmd)
     'WScript.Quit code',
   }, "\r\n")
   if not write_file(vbs_path, script) then return nil, "could not write temporary script" end
-  local ok, why, code = launch_windows("wscript.exe //B //Nologo " .. shq(vbs_path))
+  -- pcall'd so the vbs/bat/out/err temp files are always removed, even if
+  -- launch_windows raises instead of returning a failure code (#111).
+  local pok, ok, why, code = pcall(launch_windows, "wscript.exe //B //Nologo " .. shq(vbs_path))
   local out = read_file(out_path) or ""
   local err = read_file(err_path) or ""
   os.remove(vbs_path)
   if bat_path then os.remove(bat_path) end
   os.remove(out_path)
   os.remove(err_path)
+  if not pok then error(ok) end
   if not command_succeeded(ok, why, code) then
     local detail = err ~= "" and err or out
     return nil, detail ~= "" and detail or ("command failed: " .. tostring(why or code or ok))
@@ -477,7 +500,9 @@ local function windows_http(method, url, body, content_type)
   local script = build_windows_http_vbs(method, url, body_path, content_type, out_path, err_path)
 
   if not write_file(vbs_path, script) then return nil, "could not write temporary HTTP script" end
-  local ok, why, code = launch_windows("wscript.exe //B //Nologo " .. shq(vbs_path))
+  -- pcall'd so the vbs/body/out/err temp files (the body may carry OAuth-signed
+  -- form data, #111) are always removed, even if launch_windows raises.
+  local pok, ok, why, code = pcall(launch_windows, "wscript.exe //B //Nologo " .. shq(vbs_path))
 
   local out = read_file(out_path) or ""
   local err = read_file(err_path) or ""
@@ -485,6 +510,7 @@ local function windows_http(method, url, body, content_type)
   if body_path ~= "" then os.remove(body_path) end
   os.remove(out_path)
   os.remove(err_path)
+  if not pok then error(ok) end
   if not command_succeeded(ok, why, code) then
     local detail = err ~= "" and err or out
     return nil, detail ~= "" and detail or ("HTTP helper failed: " .. tostring(why or code or ok))
@@ -4485,7 +4511,10 @@ function Queue:wait(job, ms, why, attempt)
   -- previously had no event at all, so a UI could not distinguish pace-throttling
   -- from a plain run. The `retry` event still fires first for retry waits.
   self:emit("waiting", job, { ms = ms, why = why, attempt = attempt })
-  if job and job.on_wait then job.on_wait(ms, why, job.method, attempt) end
+  -- pcall'd like emit()'s on_event: job.on_wait is caller-supplied UI/panel code
+  -- and can raise. Unprotected, that raise was the main escape hatch that killed
+  -- the pump coroutine and permanently wedged the queue for the session (#112).
+  if job and job.on_wait then pcall(job.on_wait, ms, why, job.method, attempt) end
   sleep_ms(self.sleep_ms, ms)
 end
 
@@ -4655,7 +4684,17 @@ function Queue:pump()
     end
   end)
   self.pump_running = false
-  if not ok then error(err) end
+  if not ok then
+    -- A non-job scheduler error (e.g. an on_event/backoff_delay_ms callback
+    -- raising, or anything else that slips past the per-job pcalls in run_job)
+    -- must not permanently wedge the queue for the session (#112): log it and
+    -- leave any remaining `pending` jobs intact rather than re-raising, which
+    -- would kill the dispatched pump coroutine with pending work stranded until
+    -- a later submit_async's ensure_pump happens to retry the same trigger and
+    -- hit the same throw again. The next ensure_pump()/submit_async() call will
+    -- start a fresh pump over the still-pending jobs.
+    self:emit("pump_error", nil, { error = err })
+  end
 end
 
 -- Enqueue work to run asynchronously and make sure a pump is draining it. Use
