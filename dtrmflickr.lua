@@ -2767,6 +2767,42 @@ function M.metadata_fingerprint_reasons(image, account_nsid, fingerprints)
   return reasons
 end
 
+-- Backfill missing fingerprint baselines for an already-linked, already-
+-- published photo (issue #92, residual A). Photos published before this
+-- snapshotting existed (or claimed via a path that set a publish stamp
+-- without fingerprints) have no baseline, so evaluate_publish_state can never
+-- detect drift for them -- it reads "current" forever regardless of edits.
+-- This assumes the CURRENT local state matches what is on Flickr (there is no
+-- other reference point) and snapshots it as the new baseline.
+--
+-- Only fills fields that have NO stored baseline yet -- an existing baseline
+-- (even a stale/mismatched one) is left untouched so a real, already-tracked
+-- drift signal is never silently masked. No-op (returns 0) when the image is
+-- not linked or never published: there is nothing to establish a baseline
+-- for. `metadata_fingerprints` is a table of {reason = value}, same shape
+-- accepted by set_fingerprints/evaluate_publish_state.
+function M.backfill_baseline(image, account_nsid, metadata_fingerprints)
+  assert_component("account id", account_nsid)
+  if not M.get_photo_id(image, account_nsid) then return 0 end
+  if not M.get_published_at(image, account_nsid) then return 0 end
+
+  local filled = 0
+  if not M.get_fingerprint(image, account_nsid, PIXEL_FIELD) then
+    local current_pixels = M.pixel_fingerprint(image)
+    if current_pixels then
+      M.set_fingerprint(image, account_nsid, PIXEL_FIELD, current_pixels)
+      filled = filled + 1
+    end
+  end
+  for field, fingerprint in pairs(metadata_fingerprints or {}) do
+    if fingerprint ~= nil and not M.get_fingerprint(image, account_nsid, field) then
+      M.set_fingerprint(image, account_nsid, field, fingerprint)
+      filled = filled + 1
+    end
+  end
+  return filled
+end
+
 function M.get_reasons(image, account_nsid)
   local prefix = PREFIX .. "|" .. tostring(account_nsid) .. "|reason|"
   local reasons = {}
@@ -15124,6 +15160,44 @@ function panel_sets.mark_published_selection()
   dt.print(panel_remote_label.label)
 end
 
+-- Backfill missing fingerprint baselines (issue #92, residual A) for the
+-- current selection: legacy linked+published photos that predate fingerprint
+-- snapshotting (or were claimed via a path that skipped it) show as "current"
+-- forever because there is nothing to compare drift against. This assumes
+-- the CURRENT local state matches Flickr and snapshots it as the baseline;
+-- it never overwrites an existing baseline, so real already-tracked drift is
+-- untouched. Unlinked/unpublished images and photos that already have every
+-- baseline are silently skipped (not an error -- most selections will have
+-- nothing to backfill once this has been run once).
+function panel_sets.backfill_baseline_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  if #selection == 0 then
+    dt.print(_("Flickr: select one or more linked images before backfilling baselines."))
+    return
+  end
+  local acc = load_token()
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before backfilling baselines."))
+    return
+  end
+  local sync = master_sync_fields()
+  local filled_photos, filled_fields = 0, 0
+  for _, image in ipairs(selection) do
+    local fingerprints = effective_metadata_fingerprints
+      and effective_metadata_fingerprints(image, sync) or nil
+    local n = state.backfill_baseline(image, acc.nsid, fingerprints)
+    if n > 0 then
+      filled_photos = filled_photos + 1
+      filled_fields = filled_fields + n
+    end
+  end
+  refresh_panel(true, false)
+  panel_remote_label.label = string.format(
+    _("Flickr: backfilled %d baseline field(s) across %d photo(s); rest already had one or aren't linked/published"),
+    filled_fields, filled_photos)
+  dt.print(panel_remote_label.label)
+end
+
 function panel_sets.scan_selected_publish_state()
   local selection = dt.gui.selection and dt.gui.selection() or {}
   if #selection == 0 then
@@ -16260,6 +16334,11 @@ local panel_tab_stack = dt.new_widget("stack") {
       label = _("mark as published"),
       tooltip = _("re-mark the linked photo(s) as published/current without re-uploading; reconciles drifted state"),
       clicked_callback = function() panel_sets.mark_published_selection() end,
+    },
+    dt.new_widget("button") {
+      label = _("backfill sync baselines"),
+      tooltip = _("one-time fix for legacy linked photos published before drift detection existed: snapshot current local state as the sync baseline so future edits can be detected. Never overwrites an existing baseline."),
+      clicked_callback = function() panel_sets.backfill_baseline_selection() end,
     },
     dt.new_widget("button") {
       label = _("scan selected"),
