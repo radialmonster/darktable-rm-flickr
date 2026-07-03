@@ -7091,7 +7091,13 @@ local function join_names(entries, max)
   if n == 0 then return "" end
   local shown = math.min(n, max)
   local names = {}
-  for i = 1, shown do names[i] = name_of(entries[i]) end
+  -- issue #117: use display_name (original source file), not name_of (which
+  -- prefers entry.filename -- the export TEMP path, deleted right after store
+  -- returns). Every other formatter in this module already uses display_name;
+  -- join_names (used by finalize_detail_lines for the end-of-batch toast) was
+  -- missed. display_name falls back to name_of when no image is attached, so
+  -- rows without an `image` field are unaffected.
+  for i = 1, shown do names[i] = display_name(entries[i]) end
   local joined = table.concat(names, ", ")
   if n > shown then
     joined = joined .. string.format(" (+%d more)", n - shown)
@@ -8145,21 +8151,51 @@ end
 -- `order_ids` is the set's current photo order (as returned by getPhotos). The
 -- result is a complete list (the chosen photo first, then the rest in their
 -- existing order), deduped and trimmed, suitable for reorderPhotos — which is
--- exact/reliable only with a full list. `photo_id` is included at the front even
--- if it is not present in `order_ids` (defensive; normally it is a member).
--- Returns the comma-joined string ("" when no usable id remains).
+-- exact/reliable only with a full list.
+--
+-- Flickr's reorderPhotos rejects the WHOLE call atomically if any id in the
+-- list isn't a member of the set (issue #114), so `photo_id` is prepended ONLY
+-- when it already appears in `order_ids` — putting a non-member id at the front
+-- would silently kill the entire reorder with no distinguishable error. When
+-- `photo_id` is not a member, the order is returned UNCHANGED (trimmed/deduped,
+-- same as reorder_csv) and a second return value `"not_a_member"` signals the
+-- caller so it can react (e.g. re-fetch membership) instead of assuming the
+-- move happened.
+--
+-- Returns: csv, status
+--   csv    — the comma-joined string ("" when no usable id remains)
+--   status — "moved" when photo_id was promoted to the front, "not_a_member"
+--            when photo_id was not found in order_ids (csv is the unchanged
+--            deduped order_ids list in that case), or "empty" when photo_id
+--            itself has no usable value.
 function M.move_to_front(order_ids, photo_id)
   local first = trim(photo_id)
-  local out, seen = {}, {}
-  if first ~= "" then out[#out + 1] = first; seen[first] = true end
+
+  -- Trimmed/deduped copy of order_ids (also the base list when photo_id is
+  -- not a member, or the "rest" to append after photo_id when it is).
+  local rest, seen = {}, {}
+  local is_member = false
   for _, id in ipairs(order_ids or {}) do
     local s = trim(id)
     if s ~= "" and not seen[s] then
       seen[s] = true
-      out[#out + 1] = s
+      rest[#rest + 1] = s
+      if first ~= "" and s == first then is_member = true end
     end
   end
-  return table.concat(out, ",")
+
+  if first == "" then
+    return table.concat(rest, ","), "empty"
+  end
+  if not is_member then
+    return table.concat(rest, ","), "not_a_member"
+  end
+
+  local out = { first }
+  for _, s in ipairs(rest) do
+    if s ~= first then out[#out + 1] = s end
+  end
+  return table.concat(out, ","), "moved"
 end
 
 -- Resolve a comma-separated list of NEW-album titles into targets. Each title
@@ -11286,7 +11322,14 @@ function Scan:flag(images, account)
   local flagged = 0
   for _, image in ipairs(images) do
     if self.photo_id(image, account.nsid) then
-      self.evaluate(image, account.nsid, { metadata_fingerprints = self.fingerprints(image) })
+      -- issue #115: Scan.new does not require opts.fingerprints, so
+      -- self.fingerprints can be nil. flag() is called from
+      -- on_selection_changed/flush, which are NOT pcall-wrapped (unlike
+      -- poll_tick), so an unconditional call would throw a raw Lua error
+      -- straight out of the selection-changed handler and kill auto-scan for
+      -- the rest of the session on any misconfigured Scan.
+      local metadata_fingerprints = self.fingerprints and self.fingerprints(image) or nil
+      self.evaluate(image, account.nsid, { metadata_fingerprints = metadata_fingerprints })
       flagged = flagged + 1
     end
   end
@@ -13666,7 +13709,15 @@ function panel_sets.move_to_front()
     return
   end
 
-  local photo_ids = albums.move_to_front(current, photo_id)
+  local photo_ids, move_status = albums.move_to_front(current, photo_id)
+  if move_status ~= "moved" then
+    -- issue #114: Flickr's reorderPhotos rejects the WHOLE call if any id in
+    -- the list isn't a member of the set, so a stale/wrong photo_id must never
+    -- be sent — report distinctly instead of silently corrupting the order.
+    panel_sets.status_label.label = _("reorder failed")
+    dt.print(_("Flickr: this photo is not a member of the chosen album (try refreshing the album list)."))
+    return
+  end
   local ok, err = __dtrmflickr_call("flickr.photosets.reorderPhotos", function()
     return rest.photosets_reorder_photos(api_key, api_secret, acc, set_id, photo_ids)
   end)
@@ -16862,13 +16913,27 @@ function effective_metadata_fingerprints(image, sync, opts)
   local tags = sync.tags and (opts.tags ~= nil and opts.tags or rules.image_keyword_tags(image, tag_names)) or nil
   local lat, lon = nil, nil
   if sync.gps then lat, lon = metadata.image_location(image) end
+  -- issue #120: the title_description fingerprint is one atomic
+  -- hash(title, description) covering BOTH fields, but the reason key used to
+  -- report drift is that same single atomic "title_description". Gating each
+  -- half of the pair on its OWN sync.title/sync.description toggle meant
+  -- flipping just one toggle (no photo edit at all) changed the computed
+  -- fingerprint -- e.g. from hash(title, desc) to hash(title, "") -- producing
+  -- a false "needs sync: title/description" flag. Once title_description is
+  -- tracked at all (sync.title or sync.description), compute it from BOTH
+  -- fields' actual current values regardless of which one's individual toggle
+  -- is on, so the fingerprint only changes when the photo's title/description
+  -- text itself changes, not when a sync preference is toggled.
+  local track_title_description = sync.title or sync.description
+  local title = track_title_description and metadata.image_title(image, image and image.filename or "") or nil
+  local description = track_title_description and metadata.image_description(image) or nil
   return metadata.fingerprints_from_values({
     include_keywords = sync.tags,
-    include_title_description = sync.title or sync.description,
+    include_title_description = track_title_description,
     include_gps = sync.gps,
     include_date_taken = sync.date_taken,
-    title = sync.title and metadata.image_title(image, image and image.filename or "") or nil,
-    description = sync.description and metadata.image_description(image) or nil,
+    title = title,
+    description = description,
     tags = tags,
     date_taken = sync.date_taken and metadata.image_date_taken(image) or nil,
     lat = lat,
