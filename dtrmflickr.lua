@@ -404,28 +404,25 @@ local function run_windows_hidden(cmd)
   return out ~= "" and out or err
 end
 
-local function windows_http(method, url, body, content_type)
-  local out_path = temp_path(".out")
-  local err_path = temp_path(".err")
-  local body_path = body ~= nil and temp_path(".body") or ""
-  local vbs_path = temp_path(".vbs")
-
-  if body ~= nil and not write_file(body_path, body) then
-    return nil, "could not write temporary request body"
-  end
-
-  local script = table.concat({
+-- Builds the VBS transport script as a string (no I/O), so offline tests can
+-- inspect its shape without spawning wscript.exe. The request body is read as
+-- raw bytes (adTypeBinary), not text (#110): reqBody must be a byte-exact copy
+-- of what the caller signed/sent, and a UTF-8 text reader silently mangles any
+-- byte sequence that isn't valid UTF-8. Only the response (already-decoded
+-- .responseText) and error strings go through the text writer.
+local function build_windows_http_vbs(method, url, body_path, content_type, out_path, err_path)
+  return table.concat({
     "On Error Resume Next",
+    "Const adTypeBinary = 1",
     "Const adTypeText = 2",
     "Const adSaveCreateOverWrite = 2",
-    "Function ReadUtf8(path)",
+    "Function ReadBinary(path)",
     "  Dim s",
     "  Set s = CreateObject(\"ADODB.Stream\")",
-    "  s.Type = adTypeText",
-    "  s.Charset = \"utf-8\"",
+    "  s.Type = adTypeBinary",
     "  s.Open",
     "  s.LoadFromFile path",
-    "  ReadUtf8 = s.ReadText",
+    "  ReadBinary = s.Read",
     "  s.Close",
     "End Function",
     "Sub WriteUtf8(path, text)",
@@ -440,7 +437,7 @@ local function windows_http(method, url, body, content_type)
     "End Sub",
     "Dim http, reqBody",
     "reqBody = \"\"",
-    "If " .. vbs_quote(body_path) .. " <> \"\" Then reqBody = ReadUtf8(" .. vbs_quote(body_path) .. ")",
+    "If " .. vbs_quote(body_path) .. " <> \"\" Then reqBody = ReadBinary(" .. vbs_quote(body_path) .. ")",
     "Set http = CreateObject(\"MSXML2.ServerXMLHTTP.6.0\")",
     "http.setTimeouts 15000, 15000, 30000, 30000",
     "http.open " .. vbs_quote(method) .. ", " .. vbs_quote(url) .. ", False",
@@ -465,6 +462,19 @@ local function windows_http(method, url, body, content_type)
     "WriteUtf8 " .. vbs_quote(out_path) .. ", http.responseText",
     "WScript.Quit 0",
   }, "\r\n")
+end
+
+local function windows_http(method, url, body, content_type)
+  local out_path = temp_path(".out")
+  local err_path = temp_path(".err")
+  local body_path = body ~= nil and temp_path(".body") or ""
+  local vbs_path = temp_path(".vbs")
+
+  if body ~= nil and not write_file(body_path, body) then
+    return nil, "could not write temporary request body"
+  end
+
+  local script = build_windows_http_vbs(method, url, body_path, content_type, out_path, err_path)
 
   if not write_file(vbs_path, script) then return nil, "could not write temporary HTTP script" end
   local ok, why, code = launch_windows("wscript.exe //B //Nologo " .. shq(vbs_path))
@@ -689,6 +699,7 @@ end
 M.__test = {
   run_curl_config = run_curl_config,
   build_multipart = build_multipart,
+  build_windows_http_vbs = build_windows_http_vbs,
   -- Engage an authoritative override. Passing a stub forces the native path;
   -- passing nil forces the "native ABSENT" branch deterministically on any box
   -- (even one with a loadable DLL) — see native_http_override_set (#91).
