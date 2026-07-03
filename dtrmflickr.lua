@@ -1191,10 +1191,14 @@ function M.is_auth_error(err)
   end
   -- Transport-level 401 on a signed request (the OAuth endpoints can answer 401
   -- rather than a REST <err> body). A 401 against a signed call means the token
-  -- is rejected outright, so treat it as expired/revoked. Matches both the
-  -- "http 401 ..." form our transports emit and a raw "HTTP/1.1 401" status line.
-  if s:find("http 401", 1, true) or s:find("(401)", 1, true)
-    or s:match("http/[%d.]+%s+401") then
+  -- is rejected outright, so treat it as expired/revoked. Anchor the code to a
+  -- transport status context — "HTTP NNN <statusText>" (the form our transports
+  -- emit for any status >= 400, see http.lua) or a raw "HTTP/1.1 NNN" status
+  -- line — so an echoed "(401)" in a Flickr response body/title/tag can never be
+  -- mistaken for a status (same discipline as queue.default_retryable). A bare
+  -- unanchored "(401)" substring is intentionally NOT matched.
+  local http_code = tonumber(s:match("http (%d%d%d)") or s:match("http/[%d.]+%s+(%d%d%d)"))
+  if http_code == 401 then
     return 401, "expired"
   end
   return nil
