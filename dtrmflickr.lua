@@ -11380,8 +11380,23 @@ function M.build(deps)
 
   local buttons = {}
 
+  -- Stored as "string", not "enum": dt.preferences write/read for the "enum"
+  -- type requires the key to have been registered via
+  -- dt.preferences.register(..., "enum", ...) first (the C side needs that
+  -- registration's value list to build the type conversion) — an unregistered
+  -- "enum" read/write raises "luaA_to: conversion ... LUAA_INVALID_TYPE not
+  -- registered!" and aborts the calling callback. This key is deliberately
+  -- registered as "lua" (see dtrmflickr.lua, default_geo_perm_picker) so the
+  -- widget itself, not a combobox, appears in Preferences -> Lua — so its
+  -- underlying value must use the same unregistered-safe "string" type the
+  -- other default-setting prefs already use (see read_stored_default_pref /
+  -- DEFAULT_SETTING_PREF_TYPE in dtrmflickr.lua). Confirmed live (2026-07-03)
+  -- against the real darktable-cli Lua runtime via
+  -- tests/live/verify_geo_perm_picker_cli.lua.
+  local PREF_TYPE = "string"
+
   local function current_value()
-    local stored = dt.preferences.read(PLUGIN, pref_name, "enum")
+    local stored = dt.preferences.read(PLUGIN, pref_name, PREF_TYPE)
     if stored == nil or stored == "" then return default_value end
     return stored
   end
@@ -11397,7 +11412,7 @@ function M.build(deps)
     buttons[i] = dt.new_widget("button") {
       label = spec.pref,
       clicked_callback = function()
-        dt.preferences.write(PLUGIN, pref_name, "enum", spec.pref)
+        dt.preferences.write(PLUGIN, pref_name, PREF_TYPE, spec.pref)
         relabel()
       end,
     }
@@ -12186,7 +12201,9 @@ dt.preferences.register(PLUGIN, "settings_help", "lua",
 -- restriction is pending. setPerms is idempotent (a full re-set of the same flags),
 -- so a retry never corrupts state.
 function __dtrmflickr_apply_geo_perms(api_key, api_secret, acc, photo_id)
-  local gp = settings.geo_perms_for_pref(dt.preferences.read(PLUGIN, "default_geo_perm", "enum"))
+  -- "string", not "enum": see geo_perm_picker.lua's PREF_TYPE comment — an
+  -- unregistered "enum" read/write aborts with a Lua error on real darktable.
+  local gp = settings.geo_perms_for_pref(dt.preferences.read(PLUGIN, "default_geo_perm", "string"))
   if not gp then return true end
   return __dtrmflickr_call("flickr.photos.geo.setPerms", function()
     return rest.photos_geo_set_perms(api_key, api_secret, acc, photo_id,
