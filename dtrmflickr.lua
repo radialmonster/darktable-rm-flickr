@@ -17941,6 +17941,9 @@ script_data.__test = {
   image_date_taken = metadata.image_date_taken,
   image_location = metadata.image_location,
   refresh_panel = refresh_panel,
+  set_panel_current = function(current)
+    panel_current = current or { image = nil, account = nil, photo_id = nil, selection_count = 0, remote_loaded = false }
+  end,
   parse_remote_tags = panel_helpers.parse_remote_tags,
   parse_search_content_type = panel_helpers.parse_search_content_type,
   parse_search_photos = claim.parse_search_photos,
