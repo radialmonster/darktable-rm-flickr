@@ -2323,8 +2323,6 @@ end
 -- M.pixel_fingerprint / evaluate_publish_state for why change_timestamp is
 -- compared by equality rather than ordering.
 local PIXEL_FIELD = "pixels"
-local PIXEL_NONE <const> = "__none__"
-local PIXEL_ALTERED <const> = "__altered__"
 
 -- Fingerprint field snapshotting the host's date/time rendering environment
 -- alongside the pixel baseline (issue #95). change_timestamp is a locale- and
@@ -2363,11 +2361,7 @@ end
 function M.pixel_fingerprint(image)
   local value = image and image.change_timestamp or nil
   value = value and tostring(value):match("^%s*(.-)%s*$") or nil
-  if not value or value == "" then
-    local ok, altered = pcall(function() return image and image.is_altered end)
-    if ok and altered == true then return PIXEL_ALTERED end
-    return nil
-  end
+  if not value or value == "" then return nil end
   value = value:gsub("|", "/")  -- '|' is the tag-component separator; never store it raw
   if value == "" then return nil end
   return value
@@ -2579,15 +2573,18 @@ function M.set_image_published_at(image, account_nsid, stamp)
   M.clear_reason(image, account_nsid, "image")
   -- Snapshot the pixel baseline so a later develop-history edit is detectable by
   -- equality (see evaluate_publish_state). change_timestamp is empty until the
-  -- image's first develop edit; store an explicit "none yet" sentinel so the
-  -- first later crop/develop edit is still detectable. A truly missing baseline
-  -- remains reserved for legacy links published before pixel snapshots existed.
-  local fp = M.pixel_fingerprint(image) or PIXEL_NONE
-  M.set_fingerprint(image, account_nsid, PIXEL_FIELD, fp)
-  local env = M.locale_env_signature()
-  if env then
-    M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, env)
+  -- image's first develop edit; store nothing then and drop any stale baseline.
+  local fp = M.pixel_fingerprint(image)
+  if fp then
+    M.set_fingerprint(image, account_nsid, PIXEL_FIELD, fp)
+    local env = M.locale_env_signature()
+    if env then
+      M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, env)
+    else
+      M.clear_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
+    end
   else
+    M.clear_fingerprint(image, account_nsid, PIXEL_FIELD)
     M.clear_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
   end
   return result
@@ -2880,11 +2877,13 @@ function M.backfill_baseline(image, account_nsid, metadata_fingerprints)
 
   local filled = 0
   if not M.get_fingerprint(image, account_nsid, PIXEL_FIELD) then
-    local current_pixels = M.pixel_fingerprint(image) or PIXEL_NONE
-    M.set_fingerprint(image, account_nsid, PIXEL_FIELD, current_pixels)
-    local env = M.locale_env_signature()
-    if env then M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, env) end
-    filled = filled + 1
+    local current_pixels = M.pixel_fingerprint(image)
+    if current_pixels then
+      M.set_fingerprint(image, account_nsid, PIXEL_FIELD, current_pixels)
+      local env = M.locale_env_signature()
+      if env then M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, env) end
+      filled = filled + 1
+    end
   end
   for field, fingerprint in pairs(metadata_fingerprints or {}) do
     if fingerprint ~= nil and not M.get_fingerprint(image, account_nsid, field) then
@@ -2986,7 +2985,7 @@ function M.evaluate_publish_state(image, account_nsid, opts)
   -- after a metadata sync is still caught here. When there is no stored baseline
   -- (photo published before this snapshotting existed) we cannot compare, so we
   -- leave it "current" rather than flag every legacy photo.
-  local current_pixels = M.pixel_fingerprint(image) or PIXEL_NONE
+  local current_pixels = M.pixel_fingerprint(image)
   local baseline_pixels = M.get_fingerprint(image, account_nsid, PIXEL_FIELD)
   if current_pixels and baseline_pixels and current_pixels ~= baseline_pixels then
     -- Guard against a host locale/timezone change re-rendering change_timestamp
@@ -9382,7 +9381,7 @@ package.preload["dtrmflickr.sync_surface"] = function(...)
 -- published photo, it classifies every syncable field into one of
 --   in_sync / local (darktable newer) / remote (Flickr newer) / conflict
 -- and derives, per field, whether to offer a push and/or a pull button, plus a
--- single "push changed metadata" set (the safe local-newer fields only). The panel
+-- single "push all changed" set (the safe local-newer fields only). The panel
 -- renders this model as rows; the individual push/pull actions stay wired to the
 -- existing verified code paths underneath.
 --
@@ -9816,10 +9815,10 @@ M.publish_state_label = publish_state_label
 --     reasons      = { <diff reason keys> },           -- optional
 --     published_at = <last local sync stamp string>,   -- optional
 --     uploaded_at  = <Flickr upload date stamp string> } -- optional
--- A single entry renders only extra detail beyond the header's publish-state
--- line (currently the Flickr upload date); a multi-image selection renders a
--- roll-up of category counts plus a per-field breakdown of what needs syncing.
--- `opts.translate` is an optional
+-- A single entry renders full detail (the state line — which already carries
+-- the last-local-sync stamp and which fields differ — plus the Flickr upload
+-- date); a multi-image selection renders a roll-up of category counts plus a
+-- per-field breakdown of what needs syncing. `opts.translate` is an optional
 -- gettext-style wrapper (defaults to identity) so the formatting stays pure and
 -- testable while the caller localizes. Returns
 --   { count, counts = {current, ["needs-republish"], unknown, unpublished,
@@ -9860,10 +9859,7 @@ local function publish_dashboard(entries, opts)
     lines[#lines + 1] = tr("Flickr dashboard: no images selected")
   elseif count == 1 then
     local e = entries[1]
-    local kind = state.classify_reasons and state.classify_reasons(e.reasons) or "none"
-    if e.status == "needs-republish" and (kind == "image" or kind == "both") then
-      lines[#lines + 1] = tr("Export > Flickr to publish darkroom edits.")
-    end
+    lines[#lines + 1] = publish_state_label(e.status, e.published_at, e.reasons, tr)
     if e.uploaded_at and e.uploaded_at ~= "" then
       lines[#lines + 1] = string.format(tr("Flickr upload date: %s"), e.uploaded_at)
     end
@@ -12855,7 +12851,7 @@ end
 panel_sets.queue_uncertain_label = dt.new_widget("label") { label = "" }
 -- Unified sync surface (issue #87): one diff-driven summary of every syncable
 -- field's state (in sync / edited in darktable / edited on Flickr / conflict) for the
--- selected published photo, plus a "push changed metadata" button. Composes the
+-- selected published photo, plus a "push all changed" button. Composes the
 -- already-verified per-field push/pull paths; the pure model lives in
 -- dtrmflickr.sync_surface. Kept on panel_sets (table field) to respect Lua's
 -- per-function main-chunk local limit (see CLAUDE.md).
@@ -12929,11 +12925,6 @@ panel_sets.new_entry = dt.new_widget("entry") {
   placeholder = _("new album title"),
   tooltip = _("create a new Flickr album with the selected photo as its first photo"),
 }
-panel_sets.create_from_selection_button = dt.new_widget("button") {
-  label = _("create from selection"),
-  tooltip = _("create a new album from every published image in the current selection"),
-  clicked_callback = function() panel_sets.create_from_selection() end,
-}
 panel_sets.people_entry = dt.new_widget("entry") {
   text = "",
   placeholder = _("usernames or emails, comma-separated"),
@@ -13004,10 +12995,6 @@ panel_sets.url_label = dt.new_widget("label") { label = "" }
 
 local refresh_panel
 local panel_current = { image = nil, account = nil, photo_id = nil, selection_count = 0, remote_loaded = false }
-function __dtrmflickr_current_selection()
-  if type(__dtrmflickr_test_selection) == "table" then return __dtrmflickr_test_selection end
-  return dt.gui.selection and dt.gui.selection() or {}
-end
 local panel_loading = false
 local panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
 panel_privacy_widget.changed_callback = function()
@@ -13241,7 +13228,7 @@ local function panel_reset_remote(message)
   if panel_sets.sync_surface_label then panel_sets.sync_surface_label.label = "" end
   panel_sets.sync_model = nil
   panel_sets.sync_surface_remote = nil
-  if panel_sets.push_all_button then panel_sets.push_all_button.label = _("push changed metadata") end
+  if panel_sets.push_all_button then panel_sets.push_all_button.label = _("push all changed") end
   if panel_reconcile.reset then panel_reconcile.reset() end
   panel_loading = true
   panel_privacy_widget.selected = 0
@@ -13462,7 +13449,7 @@ end
 local parse_photo_id_or_url = claim.parse_photo_id
 
 local function set_panel_photo_id_link()
-  local selection = __dtrmflickr_current_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
   if #selection ~= 1 then
     dt.print(_("Flickr: select exactly one image before setting the link."))
     return
@@ -13493,7 +13480,7 @@ local function set_panel_photo_id_link()
 end
 
 local function clear_panel_photo_id_link()
-  local selection = __dtrmflickr_current_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
   if #selection ~= 1 then
     dt.print(_("Flickr: select exactly one image before clearing the link."))
     return
@@ -15052,15 +15039,15 @@ function panel_sets.refresh_sync_surface(body)
   if panel_sets.push_all_button then
     local n = #(model.push_all or {})
     local label = (n > 0 and (panel_current.selection_count or 0) == 1)
-      and string.format(_("push %d metadata field(s)"), n)
-      or _("push changed metadata")
+      and string.format(_("push %d changed field(s)"), n)
+      or _("push all changed")
     if panel_sets.push_all_button.label ~= label then
       panel_sets.push_all_button.label = label
     end
   end
 end
 
--- "Push changed metadata" (issue #87): push every field the unified surface classified
+-- "Push all changed" (issue #87): push every field the unified surface classified
 -- as local-newer, driving the existing verified single-field push paths. Skips
 -- conflicts (they need an explicit user choice) and pull-only remote-newer fields.
 -- GPS and date-taken both route through sync_geo_date, so that path runs at most
@@ -15620,7 +15607,7 @@ end
 -- back to needs-sync/unknown. Unlinked images are skipped and reported. Works on
 -- a multi-selection, not just a single image like "clear needs sync".
 function panel_sets.mark_published_selection()
-  local selection = __dtrmflickr_current_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
   if #selection == 0 then
     dt.print(_("Flickr: select one or more linked images before marking as published."))
     return
@@ -15689,7 +15676,7 @@ function panel_sets.backfill_baseline_selection()
 end
 
 function panel_sets.scan_selected_publish_state()
-  local selection = __dtrmflickr_current_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
   if #selection == 0 then
     dt.print(_("Flickr: select one or more images before scanning sync state."))
     return
@@ -15750,7 +15737,7 @@ end
 -- final paint (refresh_panel's refresh_publish_state_label would otherwise overwrite
 -- it with the local-only verdict).
 function panel_sets.scan_missing_on_flickr()
-  local selection = __dtrmflickr_current_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
   if #selection == 0 then
     dt.print(_("Flickr: select one or more images before scanning for missing photos."))
     return
@@ -16176,7 +16163,7 @@ function refresh_panel(force, fetch_remote)
   if not force and not panel_is_visible() then return end
   fetch_remote = fetch_remote == true
 
-  local selection = __dtrmflickr_current_selection()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
   local image = selection[1]
   -- Drop a stale ambiguous-candidate picker when the selection moves off the
   -- image it was populated for (issue #16).
@@ -16557,18 +16544,13 @@ end
 --   5 fix      link/claim plumbing, publish-state repair, job grid, delete
 -- Every widget/callback is the same object as before, only layout changed. Pages
 -- are built inline so they cost no main-chunk locals (only the stack is named).
--- The "push changed metadata" hero button lives on panel_sets (not inline) so
+-- The "push all changed" hero button lives on panel_sets (not inline) so
 -- refresh_sync_surface can rewrite its label with the live pushable-field
--- count ("push 2 metadata field(s)") as the auto-scan poll detects drift.
+-- count ("push 2 changed field(s)") as the auto-scan poll detects drift.
 panel_sets.push_all_button = dt.new_widget("button") {
-  label = _("push changed metadata"),
-  tooltip = _("push changed metadata fields to Flickr: title/description, keywords, GPS/date taken, and other sync-enabled Flickr settings as applicable. This does not upload rendered pixels; crop/develop/darkroom changes need Export > Flickr to reupload/replace the photo."),
+  label = _("push all changed"),
+  tooltip = _("push every field the sync status shows as 'edited in darktable' to Flickr in one click (title/description, keywords, GPS/date taken as applicable). Fields edited on Flickr or on both sides are left for you to resolve per-field below. With more than one image selected, pushes the changed, sync-enabled metadata of every selected published photo."),
   clicked_callback = function() panel_sets.push_all_changed() end,
-}
-panel_sets.mark_published_button = dt.new_widget("button") {
-  label = _("mark as published"),
-  tooltip = _("re-mark the linked photo(s) as published/current without re-uploading; reconciles drifted state"),
-  clicked_callback = function() panel_sets.mark_published_selection() end,
 }
 
 local panel_tab_stack = dt.new_widget("stack") {
@@ -16596,7 +16578,7 @@ local panel_tab_stack = dt.new_widget("stack") {
       tooltip = _("show local vs Flickr title/description side by side and advise whether to push, pull, or leave as-is; detects edit conflicts where both sides changed since the last publish. Read-only — changes nothing."),
       clicked_callback = function() panel_sets.compare_remote_meta() end,
     },
-    -- No standalone "push keywords" button here: "push changed metadata" drives the
+    -- No standalone "push keywords" button here: "push all changed" drives the
     -- same sync_panel_tags path when keywords drift, and the tags tab owns the
     -- explicit tag operations (its "replace Flickr tags from local" is the same
     -- full replace). One field, one explicit home — no duplicates across tabs.
@@ -16715,7 +16697,11 @@ local panel_tab_stack = dt.new_widget("stack") {
         tooltip = _("create a new album containing the current published photo"),
         clicked_callback = function() panel_sets.create() end,
       },
-      panel_sets.create_from_selection_button,
+      dt.new_widget("button") {
+        label = _("create from selection"),
+        tooltip = _("create a new album from every published image in the current selection"),
+        clicked_callback = function() panel_sets.create_from_selection() end,
+      },
     },
     panel_sets.status_label,
     -- Groups/pools (#32) share the tab: like albums, they are "where does this
@@ -16820,8 +16806,8 @@ local panel_tab_stack = dt.new_widget("stack") {
       clicked_callback = function() panel_sets.batch_claim_from_list() end,
     },
     -- Publish-state repair (#17): manual overrides of the auto-scan drift flag
-    -- plus reconciliation of drifted publish state. The live state line is
-    -- already in the always-visible header, so don't repeat a section title here.
+    -- plus reconciliation of drifted publish state.
+    dt.new_widget("label") { label = _("publish state") },
     dt.new_widget("box") {
       orientation = "horizontal",
       dt.new_widget("button") {
@@ -16833,7 +16819,11 @@ local panel_tab_stack = dt.new_widget("stack") {
         clicked_callback = function() panel_sets.clear_needs_republish() end,
       },
     },
-    panel_sets.mark_published_button,
+    dt.new_widget("button") {
+      label = _("mark as published"),
+      tooltip = _("re-mark the linked photo(s) as published/current without re-uploading; reconciles drifted state"),
+      clicked_callback = function() panel_sets.mark_published_selection() end,
+    },
     dt.new_widget("button") {
       label = _("backfill sync baselines"),
       tooltip = _("one-time fix for legacy linked photos published before drift detection existed: snapshot current local state as the sync baseline so future edits can be detected. Never overwrites an existing baseline."),
@@ -17891,7 +17881,6 @@ function script_data.destroy()
   if dt.destroy_event then
     dt.destroy_event(PLUGIN .. "_selection_changed", "selection-changed")
     dt.destroy_event(PLUGIN .. "_view_changed", "view-changed")
-    dt.destroy_event(PLUGIN .. "_darkroom_history_changed", "darkroom-image-history-changed")
     dt.destroy_event(PLUGIN .. "_exit", "exit")
   end
   if __dtrmflickr_autoscan then __dtrmflickr_autoscan:flush(load_token()) end
@@ -17913,12 +17902,6 @@ script_data.__test = {
   json_object = json_object,
   json_string_field = json_string_field,
   current_album = current_album,
-  export_widgets = {
-    album_mode = album_mode_widget,
-    album_entry = album_entry,
-    album_new_entry = album_new_entry,
-    album_match = album_widget,
-  },
   album_label = albums.label,
   set_album_cache = set_album_cache,
   find_album_match = function(value) return albums.find_match(album_cache, value) end,
@@ -17942,9 +17925,6 @@ script_data.__test = {
   image_date_taken = metadata.image_date_taken,
   image_location = metadata.image_location,
   refresh_panel = refresh_panel,
-  set_panel_current = function(current)
-    panel_current = current or { image = nil, account = nil, photo_id = nil, selection_count = 0, remote_loaded = false }
-  end,
   parse_remote_tags = panel_helpers.parse_remote_tags,
   parse_search_content_type = panel_helpers.parse_search_content_type,
   parse_search_photos = claim.parse_search_photos,
@@ -17967,7 +17947,7 @@ script_data.__test = {
   flickr_call = __dtrmflickr_call,
   format_queue_status = format_queue_status,
   -- Keyword push kept test-reachable after its standalone sync-tab button was
-  -- deduplicated away ("push changed metadata" and the tags tab cover the UI paths).
+  -- deduplicated away ("push all changed" and the tags tab cover the UI paths).
   sync_panel_tags = sync_panel_tags,
   -- Sync-surface rebuild (poll-driven live refresh) test hooks.
   refresh_sync_surface = panel_sets.refresh_sync_surface,
@@ -17976,7 +17956,6 @@ script_data.__test = {
   safety_values = settings.safety_values,
   content_type_values = settings.content_type_values,
   license_values = settings.license_values,
-  store = store,
 }
 
 dt.register_storage(STORAGE, HUMAN, store, finalize, supported, initialize, storage_widget)
@@ -18036,25 +18015,6 @@ dt.register_event(PLUGIN .. "_selection_changed", "selection-changed", function(
 end)
 dt.register_event(PLUGIN .. "_view_changed", "view-changed", function()
   __dtrmflickr_autoscan:flush(load_token())
-  refresh_panel(true, false)
-end)
-function __dtrmflickr_on_darkroom_history_changed(image)
-  local acc = load_token()
-  if not acc or not image then return end
-  local photo_id = state.get_photo_id(image, acc.nsid)
-  if not photo_id then return end
-  state.mark_reason(image, acc.nsid, "image")
-  if panel_current and panel_current.account and panel_current.account.nsid == acc.nsid
-    and (panel_current.image == image or panel_current.photo_id == photo_id) then
-    panel_sets.refresh_publish_state_label(image, acc, photo_id)
-    local ok_sync, sync_err = pcall(panel_sets.refresh_sync_surface, nil)
-    if not ok_sync then
-      dt.print_log("[dtrmflickr] refresh_sync_surface (history-changed) failed: " .. tostring(sync_err))
-    end
-  end
-end
-dt.register_event(PLUGIN .. "_darkroom_history_changed", "darkroom-image-history-changed", function(first, second)
-  __dtrmflickr_on_darkroom_history_changed(second or first)
 end)
 dt.register_event(PLUGIN .. "_exit", "exit", function()
   __dtrmflickr_autoscan:flush(load_token())
@@ -18105,7 +18065,7 @@ __dtrmflickr_debug_dump = require("dtrmflickr.debug_dump").build({
   },
   extra = function()
     local acc = load_token()
-    local sel = __dtrmflickr_current_selection()
+    local sel = dt.gui.selection and dt.gui.selection() or {}
     -- stack.active reads back as the child WIDGET, not an index (types.lua_stack
     -- docs), so it can't index tab_names directly. The tab buttons already mark
     -- the active one with a "▸ " prefix (set_active_tab) — read that instead.
