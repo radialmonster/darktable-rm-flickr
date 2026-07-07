@@ -18004,6 +18004,14 @@ script_data.__test = {
   -- Sync-surface rebuild (poll-driven live refresh) test hooks.
   refresh_sync_surface = panel_sets.refresh_sync_surface,
   panel_sets = panel_sets,
+  panel_remote_write_widgets = {
+    privacy = panel_privacy_widget,
+    safety = panel_safety_widget,
+    content_type = panel_content_type_widget,
+    license = panel_license_widget,
+    comment_perm = panel_comment_perm_widget,
+    addmeta_perm = panel_addmeta_perm_widget,
+  },
   panel_pools = panel_pools,
   privacy_values = settings.privacy_values,
   safety_values = settings.safety_values,
