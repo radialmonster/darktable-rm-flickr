@@ -12999,6 +12999,10 @@ panel_sets.url_label = dt.new_widget("label") { label = "" }
 
 local refresh_panel
 local panel_current = { image = nil, account = nil, photo_id = nil, selection_count = 0, remote_loaded = false }
+function __dtrmflickr_current_selection()
+  if type(__dtrmflickr_test_selection) == "table" then return __dtrmflickr_test_selection end
+  return dt.gui.selection and dt.gui.selection() or {}
+end
 local panel_loading = false
 local panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
 panel_privacy_widget.changed_callback = function()
@@ -13453,7 +13457,7 @@ end
 local parse_photo_id_or_url = claim.parse_photo_id
 
 local function set_panel_photo_id_link()
-  local selection = dt.gui.selection and dt.gui.selection() or {}
+  local selection = __dtrmflickr_current_selection()
   if #selection ~= 1 then
     dt.print(_("Flickr: select exactly one image before setting the link."))
     return
@@ -13484,7 +13488,7 @@ local function set_panel_photo_id_link()
 end
 
 local function clear_panel_photo_id_link()
-  local selection = dt.gui.selection and dt.gui.selection() or {}
+  local selection = __dtrmflickr_current_selection()
   if #selection ~= 1 then
     dt.print(_("Flickr: select exactly one image before clearing the link."))
     return
@@ -15611,7 +15615,7 @@ end
 -- back to needs-sync/unknown. Unlinked images are skipped and reported. Works on
 -- a multi-selection, not just a single image like "clear needs sync".
 function panel_sets.mark_published_selection()
-  local selection = dt.gui.selection and dt.gui.selection() or {}
+  local selection = __dtrmflickr_current_selection()
   if #selection == 0 then
     dt.print(_("Flickr: select one or more linked images before marking as published."))
     return
@@ -15680,7 +15684,7 @@ function panel_sets.backfill_baseline_selection()
 end
 
 function panel_sets.scan_selected_publish_state()
-  local selection = dt.gui.selection and dt.gui.selection() or {}
+  local selection = __dtrmflickr_current_selection()
   if #selection == 0 then
     dt.print(_("Flickr: select one or more images before scanning sync state."))
     return
@@ -15741,7 +15745,7 @@ end
 -- final paint (refresh_panel's refresh_publish_state_label would otherwise overwrite
 -- it with the local-only verdict).
 function panel_sets.scan_missing_on_flickr()
-  local selection = dt.gui.selection and dt.gui.selection() or {}
+  local selection = __dtrmflickr_current_selection()
   if #selection == 0 then
     dt.print(_("Flickr: select one or more images before scanning for missing photos."))
     return
@@ -16167,7 +16171,7 @@ function refresh_panel(force, fetch_remote)
   if not force and not panel_is_visible() then return end
   fetch_remote = fetch_remote == true
 
-  local selection = dt.gui.selection and dt.gui.selection() or {}
+  local selection = __dtrmflickr_current_selection()
   local image = selection[1]
   -- Drop a stale ambiguous-candidate picker when the selection moves off the
   -- image it was populated for (issue #16).
@@ -16556,6 +16560,11 @@ panel_sets.push_all_button = dt.new_widget("button") {
   tooltip = _("push changed metadata fields to Flickr: title/description, keywords, GPS/date taken, and other sync-enabled Flickr settings as applicable. This does not upload rendered pixels; crop/develop/darkroom changes need Export > Flickr to reupload/replace the photo."),
   clicked_callback = function() panel_sets.push_all_changed() end,
 }
+panel_sets.mark_published_button = dt.new_widget("button") {
+  label = _("mark as published"),
+  tooltip = _("re-mark the linked photo(s) as published/current without re-uploading; reconciles drifted state"),
+  clicked_callback = function() panel_sets.mark_published_selection() end,
+}
 
 local panel_tab_stack = dt.new_widget("stack") {
   -- 1: sync — the daily loop (#87): one diff-driven summary of every syncable
@@ -16823,11 +16832,7 @@ local panel_tab_stack = dt.new_widget("stack") {
         clicked_callback = function() panel_sets.clear_needs_republish() end,
       },
     },
-    dt.new_widget("button") {
-      label = _("mark as published"),
-      tooltip = _("re-mark the linked photo(s) as published/current without re-uploading; reconciles drifted state"),
-      clicked_callback = function() panel_sets.mark_published_selection() end,
-    },
+    panel_sets.mark_published_button,
     dt.new_widget("button") {
       label = _("backfill sync baselines"),
       tooltip = _("one-time fix for legacy linked photos published before drift detection existed: snapshot current local state as the sync baseline so future edits can be detected. Never overwrites an existing baseline."),
@@ -18090,7 +18095,7 @@ __dtrmflickr_debug_dump = require("dtrmflickr.debug_dump").build({
   },
   extra = function()
     local acc = load_token()
-    local sel = dt.gui.selection and dt.gui.selection() or {}
+    local sel = __dtrmflickr_current_selection()
     -- stack.active reads back as the child WIDGET, not an index (types.lua_stack
     -- docs), so it can't index tab_names directly. The tab buttons already mark
     -- the active one with a "▸ " prefix (set_active_tab) — read that instead.
