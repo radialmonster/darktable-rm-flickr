@@ -17882,6 +17882,7 @@ function script_data.destroy()
   if dt.destroy_event then
     dt.destroy_event(PLUGIN .. "_selection_changed", "selection-changed")
     dt.destroy_event(PLUGIN .. "_view_changed", "view-changed")
+    dt.destroy_event(PLUGIN .. "_darkroom_history_changed", "darkroom-image-history-changed")
     dt.destroy_event(PLUGIN .. "_exit", "exit")
   end
   if __dtrmflickr_autoscan then __dtrmflickr_autoscan:flush(load_token()) end
@@ -18018,6 +18019,24 @@ end)
 dt.register_event(PLUGIN .. "_view_changed", "view-changed", function()
   __dtrmflickr_autoscan:flush(load_token())
   refresh_panel(true, false)
+end)
+function __dtrmflickr_on_darkroom_history_changed(image)
+  local acc = load_token()
+  if not acc or not image then return end
+  local photo_id = state.get_photo_id(image, acc.nsid)
+  if not photo_id then return end
+  state.mark_reason(image, acc.nsid, "image")
+  if panel_current and panel_current.account and panel_current.account.nsid == acc.nsid
+    and (panel_current.image == image or panel_current.photo_id == photo_id) then
+    panel_sets.refresh_publish_state_label(image, acc, photo_id)
+    local ok_sync, sync_err = pcall(panel_sets.refresh_sync_surface, nil)
+    if not ok_sync then
+      dt.print_log("[dtrmflickr] refresh_sync_surface (history-changed) failed: " .. tostring(sync_err))
+    end
+  end
+end
+dt.register_event(PLUGIN .. "_darkroom_history_changed", "darkroom-image-history-changed", function(first, second)
+  __dtrmflickr_on_darkroom_history_changed(second or first)
 end)
 dt.register_event(PLUGIN .. "_exit", "exit", function()
   __dtrmflickr_autoscan:flush(load_token())
