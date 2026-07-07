@@ -13912,7 +13912,7 @@ function panel_sets.create_from_selection()
     notes[#notes + 1] = string.format(_("%d add failed"), #add_errors)
   end
   local suffix = (#notes > 0) and (" (" .. table.concat(notes, ", ") .. ")") or ""
-  panel_sets.status_label.label = string.format(_("created '%s' with %d photo(s)"), title, added) .. suffix
+  panel_sets.status_label.label = string.format(_("created album '%s' with %d photo(s)"), title, added) .. suffix
   dt.print(panel_sets.status_label.label)
   if #add_errors > 0 then
     dt.print(_("Flickr: some photos could not be added: ") .. table.concat(add_errors, "; "))
