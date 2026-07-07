@@ -17972,6 +17972,7 @@ script_data.__test = {
   set_panel_current = function(current)
     panel_current = current or { image = nil, account = nil, photo_id = nil, selection_count = 0, remote_loaded = false }
   end,
+  panel_remote_label = function() return panel_remote_label.label end,
   parse_remote_tags = panel_helpers.parse_remote_tags,
   parse_search_content_type = panel_helpers.parse_search_content_type,
   parse_search_photos = claim.parse_search_photos,
