@@ -17956,6 +17956,7 @@ script_data.__test = {
   safety_values = settings.safety_values,
   content_type_values = settings.content_type_values,
   license_values = settings.license_values,
+  store = store,
 }
 
 dt.register_storage(STORAGE, HUMAN, store, finalize, supported, initialize, storage_widget)
