@@ -2323,6 +2323,7 @@ end
 -- M.pixel_fingerprint / evaluate_publish_state for why change_timestamp is
 -- compared by equality rather than ordering.
 local PIXEL_FIELD = "pixels"
+local PIXEL_NONE <const> = "__none__"
 
 -- Fingerprint field snapshotting the host's date/time rendering environment
 -- alongside the pixel baseline (issue #95). change_timestamp is a locale- and
@@ -2573,18 +2574,15 @@ function M.set_image_published_at(image, account_nsid, stamp)
   M.clear_reason(image, account_nsid, "image")
   -- Snapshot the pixel baseline so a later develop-history edit is detectable by
   -- equality (see evaluate_publish_state). change_timestamp is empty until the
-  -- image's first develop edit; store nothing then and drop any stale baseline.
-  local fp = M.pixel_fingerprint(image)
-  if fp then
-    M.set_fingerprint(image, account_nsid, PIXEL_FIELD, fp)
-    local env = M.locale_env_signature()
-    if env then
-      M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, env)
-    else
-      M.clear_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
-    end
+  -- image's first develop edit; store an explicit "none yet" sentinel so the
+  -- first later crop/develop edit is still detectable. A truly missing baseline
+  -- remains reserved for legacy links published before pixel snapshots existed.
+  local fp = M.pixel_fingerprint(image) or PIXEL_NONE
+  M.set_fingerprint(image, account_nsid, PIXEL_FIELD, fp)
+  local env = M.locale_env_signature()
+  if env then
+    M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, env)
   else
-    M.clear_fingerprint(image, account_nsid, PIXEL_FIELD)
     M.clear_fingerprint(image, account_nsid, PIXEL_ENV_FIELD)
   end
   return result
@@ -2985,7 +2983,7 @@ function M.evaluate_publish_state(image, account_nsid, opts)
   -- after a metadata sync is still caught here. When there is no stored baseline
   -- (photo published before this snapshotting existed) we cannot compare, so we
   -- leave it "current" rather than flag every legacy photo.
-  local current_pixels = M.pixel_fingerprint(image)
+  local current_pixels = M.pixel_fingerprint(image) or PIXEL_NONE
   local baseline_pixels = M.get_fingerprint(image, account_nsid, PIXEL_FIELD)
   if current_pixels and baseline_pixels and current_pixels ~= baseline_pixels then
     -- Guard against a host locale/timezone change re-rendering change_timestamp
@@ -18016,6 +18014,7 @@ dt.register_event(PLUGIN .. "_selection_changed", "selection-changed", function(
 end)
 dt.register_event(PLUGIN .. "_view_changed", "view-changed", function()
   __dtrmflickr_autoscan:flush(load_token())
+  refresh_panel(true, false)
 end)
 dt.register_event(PLUGIN .. "_exit", "exit", function()
   __dtrmflickr_autoscan:flush(load_token())
