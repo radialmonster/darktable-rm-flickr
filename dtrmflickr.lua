@@ -16511,16 +16511,17 @@ function panel_pools.submit()
   -- Detailed lines for anything that was not a clean add, so the user sees why a
   -- pool rejected the photo or left it pending.
   local notes = {}
+  local translate = _
   for _, d in ipairs(summary.details) do
     if d.category ~= "added" and d.category ~= "already_in_pool" then
-      notes[#notes + 1] = groups.outcome_label(d.category, d.name, _)
+      notes[#notes + 1] = groups.outcome_label(d.category, d.name, translate)
     end
   end
   for _, e in ipairs(errors) do
     notes[#notes + 1] = string.format("%s: %s", e.query, e.reason)
   end
 
-  local tally = groups.format_summary(summary, _)
+  local tally = groups.format_summary(summary, translate)
   if tally == "" then tally = _("no groups submitted") end
   panel_pools.status_label.label = tally
   if #notes > 0 then
@@ -17972,6 +17973,7 @@ script_data.__test = {
   -- Sync-surface rebuild (poll-driven live refresh) test hooks.
   refresh_sync_surface = panel_sets.refresh_sync_surface,
   panel_sets = panel_sets,
+  panel_pools = panel_pools,
   privacy_values = settings.privacy_values,
   safety_values = settings.safety_values,
   content_type_values = settings.content_type_values,
