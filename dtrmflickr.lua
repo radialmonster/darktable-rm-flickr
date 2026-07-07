@@ -10502,6 +10502,57 @@ end
 return M
 end
 
+package.preload["dtrmflickr.panel_reupload"] = function(...)
+local M = {}
+
+local function safe_slug(value)
+  local s = tostring(value or "image")
+  s = s:gsub("[^%w%-_]+", "_")
+  s = s:gsub("^_+", ""):gsub("_+$", "")
+  if s == "" then s = "image" end
+  return s
+end
+
+function M.temp_path(dt, image, index)
+  local dir = "."
+  if dt and dt.configuration then
+    dir = dt.configuration.tmp_dir or dt.configuration.config_dir or "."
+  end
+  local sep = dir:sub(-1) == "/" or dir:sub(-1) == "\\"
+  local name = string.format("dtrmflickr_reupload_%s_%d_%d.jpg",
+    safe_slug(image and image.filename), tonumber(index) or 1, os.time())
+  return sep and (dir .. name) or (dir .. "/" .. name)
+end
+
+function M.candidates(selection, account_nsid, state)
+  local out = {}
+  local skipped = { unlinked = 0 }
+  if not account_nsid or not state then return out, skipped end
+  for _, image in ipairs(selection or {}) do
+    local photo_id = state.get_photo_id(image, account_nsid)
+    if photo_id and photo_id ~= "" then
+      out[#out + 1] = { image = image, photo_id = photo_id }
+    else
+      skipped.unlinked = skipped.unlinked + 1
+    end
+  end
+  return out, skipped
+end
+
+function M.format_start(count, skipped, tr)
+  tr = tr or function(s) return s end
+  skipped = skipped or {}
+  if count <= 0 then return tr("Flickr: no linked selected photos to reupload") end
+  if (skipped.unlinked or 0) > 0 then
+    return string.format(tr("Flickr: reuploading %d linked photo(s); %d unlinked skipped"),
+      count, skipped.unlinked)
+  end
+  return string.format(tr("Flickr: reuploading %d linked photo(s)"), count)
+end
+
+return M
+end
+
 package.preload["dtrmflickr.panel_gating"] = function(...)
 -- panel_gating.lua — pure selection-aware control gating for the Flickr panel (#88).
 --
@@ -16595,6 +16646,11 @@ panel_sets.mark_published_button = dt.new_widget("button") {
   tooltip = _("re-mark the linked photo(s) as published/current without re-uploading; reconciles drifted state"),
   clicked_callback = function() panel_sets.mark_published_selection() end,
 }
+panel_sets.reupload_button = dt.new_widget("button") {
+  label = _("reupload selected to Flickr"),
+  tooltip = _("render selected linked photo(s) to temporary JPEG files through darktable's Lua export path, then replace the existing Flickr photo IDs in place. Uses darktable's current JPEG/export processing defaults; for another format or exact Export module target settings, use Export > Flickr."),
+  clicked_callback = function() panel_sets.reupload_selection() end,
+}
 
 local panel_tab_stack = dt.new_widget("stack") {
   -- 1: sync — the daily loop (#87): one diff-driven summary of every syncable
@@ -16869,6 +16925,7 @@ local panel_tab_stack = dt.new_widget("stack") {
       tooltip = _("re-evaluate publish state for the selection now; auto-scan already does this on selection change, so this is a manual fallback"),
       clicked_callback = function() panel_sets.scan_selected_publish_state() end,
     },
+    panel_sets.reupload_button,
     dt.new_widget("button") {
       label = _("scan missing on Flickr"),
       tooltip = _("check each linked selected photo against Flickr (one request per photo) and flag any that were deleted/removed on Flickr as 'missing on Flickr' in the dashboard"),
@@ -17894,6 +17951,75 @@ local function finalize(storage, image_table, extra_data)
     extra_data.progress_job.valid = false
   end
   extra_data.progress_job = nil
+end
+
+function panel_sets.reupload_selection(selection_override)
+  local pr = require("dtrmflickr.panel_reupload")
+  local selection = selection_override or __dtrmflickr_current_selection()
+  if #selection == 0 then
+    dt.print(_("Flickr: select one or more linked images before reuploading."))
+    return
+  end
+  local acc = load_token()
+  if not acc then
+    dt.print(_("Flickr: log in from Lua Options before reuploading."))
+    return
+  end
+  if not dt.new_format then
+    dt.print(_("Flickr: this darktable build cannot render from Lua; use Export > Flickr."))
+    return
+  end
+  local candidates, skipped = pr.candidates(selection, acc.nsid, state)
+  if #candidates == 0 then
+    dt.print(pr.format_start(0, skipped, _))
+    return
+  end
+  local fmt_ok, fmt = pcall(function() return dt.new_format("jpeg") end)
+  if not fmt_ok or not fmt or not fmt.write_image then
+    dt.print(_("Flickr: JPEG export format is not available; use Export > Flickr."))
+    return
+  end
+
+  local images = {}
+  for i, item in ipairs(candidates) do images[i] = item.image end
+  local extra_data = {}
+  local filtered = initialize(nil, fmt, images, true, extra_data)
+  if type(filtered) == "table" then
+    local allowed = {}
+    for _, image in ipairs(filtered) do allowed[image] = true end
+    local kept = {}
+    for _, item in ipairs(candidates) do
+      if allowed[item.image] then kept[#kept + 1] = item end
+    end
+    candidates = kept
+  end
+  if #candidates == 0 then
+    dt.print(_("Flickr: reupload cancelled before rendering."))
+    return
+  end
+
+  local files = {}
+  dt.print(pr.format_start(#candidates, skipped, _))
+  for i, item in ipairs(candidates) do
+    local image = item.image
+    local path = pr.temp_path(dt, image, i)
+    files[image] = path
+    local ok, wrote = pcall(function() return fmt:write_image(image, path, true) end)
+    if ok and wrote then
+      store(nil, image, fmt, path, i, #candidates, true, extra_data)
+    else
+      extra_data.failed = extra_data.failed or {}
+      extra_data.failed[#extra_data.failed + 1] = {
+        image = image, filename = path, error = wrote or _("render failed"),
+      }
+      dt.print(string.format(_("Flickr: render failed for %s"), image and image.filename or "image"))
+      dt.print_log(string.format("[dtrmflickr] panel reupload render failed for '%s': %s",
+        tostring(image and image.filename or "image"), tostring(wrote)))
+    end
+    pcall(os.remove, path)
+  end
+  finalize(nil, files, extra_data)
+  refresh_panel(true, false)
 end
 
 ----------------------------------------------------------------------
