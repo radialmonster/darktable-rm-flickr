@@ -2875,13 +2875,11 @@ function M.backfill_baseline(image, account_nsid, metadata_fingerprints)
 
   local filled = 0
   if not M.get_fingerprint(image, account_nsid, PIXEL_FIELD) then
-    local current_pixels = M.pixel_fingerprint(image)
-    if current_pixels then
-      M.set_fingerprint(image, account_nsid, PIXEL_FIELD, current_pixels)
-      local env = M.locale_env_signature()
-      if env then M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, env) end
-      filled = filled + 1
-    end
+    local current_pixels = M.pixel_fingerprint(image) or PIXEL_NONE
+    M.set_fingerprint(image, account_nsid, PIXEL_FIELD, current_pixels)
+    local env = M.locale_env_signature()
+    if env then M.set_fingerprint(image, account_nsid, PIXEL_ENV_FIELD, env) end
+    filled = filled + 1
   end
   for field, fingerprint in pairs(metadata_fingerprints or {}) do
     if fingerprint ~= nil and not M.get_fingerprint(image, account_nsid, field) then
