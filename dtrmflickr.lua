@@ -2324,6 +2324,7 @@ end
 -- compared by equality rather than ordering.
 local PIXEL_FIELD = "pixels"
 local PIXEL_NONE <const> = "__none__"
+local PIXEL_ALTERED <const> = "__altered__"
 
 -- Fingerprint field snapshotting the host's date/time rendering environment
 -- alongside the pixel baseline (issue #95). change_timestamp is a locale- and
@@ -2362,7 +2363,11 @@ end
 function M.pixel_fingerprint(image)
   local value = image and image.change_timestamp or nil
   value = value and tostring(value):match("^%s*(.-)%s*$") or nil
-  if not value or value == "" then return nil end
+  if not value or value == "" then
+    local ok, altered = pcall(function() return image and image.is_altered end)
+    if ok and altered == true then return PIXEL_ALTERED end
+    return nil
+  end
   value = value:gsub("|", "/")  -- '|' is the tag-component separator; never store it raw
   if value == "" then return nil end
   return value
