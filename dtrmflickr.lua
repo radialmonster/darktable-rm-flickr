@@ -18130,6 +18130,9 @@ script_data.__test = {
   -- Sync-surface rebuild (poll-driven live refresh) test hooks.
   refresh_sync_surface = panel_sets.refresh_sync_surface,
   panel_sets = panel_sets,
+  -- Real tab-switcher stack (#82), so a live driver can assert .active directly
+  -- instead of only inferring it from the tab-button label prefix.
+  panel_tab_stack = panel_tab_stack,
   panel_remote_write_widgets = {
     privacy = panel_privacy_widget,
     safety = panel_safety_widget,
