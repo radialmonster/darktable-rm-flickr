@@ -3238,8 +3238,19 @@ local function expand_range(s, vars)
   while i <= n do
     local c = s:sub(i, i)
     if c == "\\" then
-      out[#out + 1] = s:sub(i + 1, i + 1)
-      i = i + 2
+      -- Only the 5 documented escapes ("\{" "\}" "\[" "\]" "\\") consume the
+      -- backslash; anything else — including a trailing "\" with nothing
+      -- after it — was being silently eaten (a literal Windows-style path in
+      -- a template lost every backslash). Keep the backslash literal and let
+      -- the next character be processed normally on the following iteration.
+      local nextc = s:sub(i + 1, i + 1)
+      if nextc == "{" or nextc == "}" or nextc == "[" or nextc == "]" or nextc == "\\" then
+        out[#out + 1] = nextc
+        i = i + 2
+      else
+        out[#out + 1] = c
+        i = i + 1
+      end
     elseif c == "{" then
       local j = s:find("}", i + 1, true)
       if not j then
@@ -4945,14 +4956,17 @@ function Tracker:observe(payload)
   local id = payload.id
   if id == nil then return end
   local rec = tracker_record(self, id)
+
+  -- Once terminal, only the surviving job's own terminal events matter; ignore
+  -- the rest — including the field writes below — so a stale/late event (e.g.
+  -- a "started" for attempt N+1 arriving after "succeeded") cannot rewrite a
+  -- finished record's method/label/nsid/attempts, not just its state.
+  if M.is_terminal(rec.state) then return end
+
   if payload.method ~= nil then rec.method = payload.method end
   if payload.label ~= nil then rec.label = payload.label end
   if payload.nsid ~= nil and payload.nsid ~= "" then rec.nsid = tostring(payload.nsid) end
   if payload.attempt ~= nil then rec.attempts = tonumber(payload.attempt) or rec.attempts end
-
-  -- Once terminal, only the surviving job's own terminal events matter; ignore
-  -- the rest so a stale `started`/`waiting` cannot un-finish a job.
-  if M.is_terminal(rec.state) then return end
 
   if event == "enqueued" then
     rec.state = "queued"
@@ -5028,7 +5042,12 @@ function Tracker:cancel_for_account_change(active_nsid)
   for _, id in ipairs(self.order) do
     local rec = self.jobs[id]
     if rec and not M.is_terminal(rec.state) then
-      local owner = rec.nsid or ""
+      -- tostring() here mirrors the owner-check in partition_by_account/
+      -- plan_resume/plan_resume_safe below: rec.nsid is currently always
+      -- nil-or-string because bind_account/observe already coerce it, but
+      -- keeping the check consistent avoids a silent mismatch (and a wrongly
+      -- "orphaned" cancel) if a future writer ever assigns rec.nsid directly.
+      local owner = rec.nsid ~= nil and tostring(rec.nsid) or ""
       if active_nsid == "" or owner ~= active_nsid then
         rec.state = "cancelled"
         rec.reason = "account-changed"
@@ -7050,6 +7069,7 @@ package.preload["dtrmflickr.report"] = function(...)
 -- are unit-tested offline (see tests/test_report.lua).
 
 local urls = require "dtrmflickr.urls"
+local upload_limits = require "dtrmflickr.upload_limits"
 
 local M = {}
 
@@ -7131,6 +7151,36 @@ local function join_names(entries, max)
 end
 M.join_names = join_names
 
+-- Collapse post-upload-error entries to one per affected image before naming
+-- them in the toast (issue #127): the store() callback calls record_post_error
+-- once per failing setter (title/description, license, date, tags, location
+-- visibility), so one image with several failed setters produces several
+-- entries. result_rows below already folds these by image when building the
+-- persistent per-row table; finalize_detail_lines's toast line did not, so a
+-- single heavily-failing image's name could repeat and crowd out other
+-- affected images behind the "(+N more)" cap. Keyed the same way result_rows
+-- folds them: photo_id first, falling back to image object identity.
+local function dedupe_post_errors(entries)
+  local out, seen_id, seen_image = {}, {}, {}
+  for _, pe in ipairs(entries or {}) do
+    if type(pe) == "table" and pe.photo_id ~= nil and pe.photo_id ~= "" then
+      local key = tostring(pe.photo_id)
+      if not seen_id[key] then
+        seen_id[key] = true
+        out[#out + 1] = pe
+      end
+    elseif type(pe) == "table" and pe.image ~= nil then
+      if not seen_image[pe.image] then
+        seen_image[pe.image] = true
+        out[#out + 1] = pe
+      end
+    else
+      out[#out + 1] = pe
+    end
+  end
+  return out
+end
+
 -- Build concise per-image detail lines for the finalize summary so a large
 -- batch is not reported as a silent count. Returns a (possibly empty) list of
 -- strings the caller prints after the aggregate line.
@@ -7154,7 +7204,8 @@ function M.finalize_detail_lines(extra_data, opts)
   end
   local post_errors = (extra_data and extra_data.post_errors) or {}
   if #post_errors > 0 then
-    lines[#lines + 1] = string.format(tr("Flickr: post-upload metadata errors: %s"), join_names(post_errors, max))
+    lines[#lines + 1] = string.format(tr("Flickr: post-upload metadata errors: %s"),
+      join_names(dedupe_post_errors(post_errors), max))
   end
   return lines
 end
@@ -7224,6 +7275,14 @@ local function skip_reason(entry)
   end
   if entry.reason == "color_label" then
     return string.format("color label '%s' matched skip rule", tostring(entry.label))
+  end
+  if entry.reason == "filesize" then
+    -- Mirrors upload_limits.format_skip_message's wording (the toast printed
+    -- at store() time) so the persistent per-image row/panel table says the
+    -- same useful thing instead of falling through to the bare word
+    -- "filesize" via the generic entry.reason branch below.
+    return string.format("%s over the account's %s per-photo upload limit",
+      upload_limits.human_bytes(entry.size), upload_limits.human_bytes(entry.max))
   end
   if entry.filter then
     return string.format("keyword '%s' matched skip rule '%s'",
@@ -7654,7 +7713,12 @@ local M = {}
 -- legal username character — is classified as a username
 -- (flickr.people.findByUsername). Returns a list of { value = <trimmed string>,
 -- kind = "email" | "username" }.
-local EMAIL_PATTERN = "^[%w%.%+%-]+@[%w%.%-]+%.[%a][%a]+$"
+-- Lua's %w class is alphanumeric-only (no underscore, unlike \w in most other
+-- regex flavors), so a plain [%w%.%+%-] local-part class missed the very
+-- common first_last@domain shape and misrouted it to findByUsername instead
+-- of findByEmail. Underscore is added to both the local-part and domain
+-- classes.
+local EMAIL_PATTERN = "^[%w%.%+%-_]+@[%w%.%-_]+%.[%a][%a]+$"
 
 local function looks_like_email(value)
   return value:match(EMAIL_PATTERN) ~= nil
@@ -7801,13 +7865,16 @@ function M.matches_query(item, query)
   -- has been enriched with each album's collection path, typing a collection
   -- name surfaces its albums. Absent on un-annotated items, so it is a no-op
   -- until collections are loaded.
-  local haystack = table.concat({
-    tostring(item.id or ""),
-    tostring(item.title or ""),
-    M.label(item),
-    tostring(item.collection_path or ""),
-  }, " "):lower()
-  return haystack:find(query, 1, true) ~= nil
+  --
+  -- Each field is checked independently (not concatenated into one haystack):
+  -- joining fields with a separator lets a query spanning the join point (tail
+  -- of one field + head of the next) match even though neither field contains
+  -- it on its own, which disagreed with match_score's per-field checks below.
+  if tostring(item.id or ""):lower():find(query, 1, true) then return true end
+  if tostring(item.title or ""):lower():find(query, 1, true) then return true end
+  if M.label(item):lower():find(query, 1, true) then return true end
+  if tostring(item.collection_path or ""):lower():find(query, 1, true) then return true end
+  return false
 end
 
 -- Relevance score for `item` against an already-lowercased `query` (lower bins
@@ -7986,9 +8053,12 @@ function M.resolve_existing(value, resolver)
         seen_ids[id] = true
         targets[#targets + 1] = { kind = "existing", photoset_id = id, title = item.title or id, match = kind }
       end
-    elseif part:match("^%d+$") then
+    elseif kind ~= "ambiguous" and part:match("^%d+$") then
       -- A bare numeric reference is treated as a manual photoset id even when it
       -- is not in the fetched cache (same fallback the single-album path used).
+      -- Skipped when the resolver reports "ambiguous": a numeric-looking query
+      -- that fuzzy-matches several cached albums must surface as an error, not
+      -- silently resolve to itself as a literal (and likely wrong) photoset id.
       if not seen_ids[part] then
         seen_ids[part] = true
         targets[#targets + 1] = { kind = "existing", photoset_id = part, title = part, match = "manual-id" }
@@ -8628,10 +8698,13 @@ function M.resolve_existing(value, resolver)
         seen_ids[id] = true
         targets[#targets + 1] = { kind = "existing", group_id = id, name = item.name or id, match = kind }
       end
-    elseif looks_like_nsid(part) then
+    elseif kind ~= "ambiguous" and looks_like_nsid(part) then
       -- A bare NSID is treated as a manual group id even when it is not in the
       -- fetched cache (mirrors the album numeric-id fallback). The add will fail
-      -- with Flickr error 2 if the user is not a member of that group.
+      -- with Flickr error 2 if the user is not a member of that group. Skipped
+      -- when the resolver reports "ambiguous": an NSID-shaped query that
+      -- fuzzy-matches several cached groups must surface as an error, not
+      -- silently resolve to itself as a literal (and likely wrong) group id.
       if not seen_ids[part] then
         seen_ids[part] = true
         targets[#targets + 1] = { kind = "existing", group_id = part, name = part, match = "manual-id" }
