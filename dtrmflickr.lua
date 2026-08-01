@@ -9163,10 +9163,21 @@ end
 -- Trim a value for single-line panel display, collapsing newlines and clipping to
 -- `n` characters with an ellipsis so a long title/description does not blow up the
 -- panel label. Pure.
+--
+-- Clips on UTF-8 codepoint boundaries, not raw bytes: titles/descriptions are
+-- free-form UTF-8 (accented, CJK, emoji, ...), and a byte-index cut can land
+-- inside a multi-byte character, producing an invalid/corrupted string. Falls
+-- back to a raw byte cut only if the value is not valid UTF-8 to begin with.
 local function ellipsize(value, n)
   local s = norm(value):gsub("%s+", " "):match("^%s*(.-)%s*$")
-  if #s > n then return s:sub(1, n - 1) .. "\u{2026}" end
-  return s
+  local char_len = utf8.len(s)
+  if not char_len then
+    if #s > n then return s:sub(1, n - 1) .. "\u{2026}" end
+    return s
+  end
+  if char_len <= n then return s end
+  local cut = utf8.offset(s, n)
+  return s:sub(1, cut - 1) .. "\u{2026}"
 end
 
 -- describe_field(label, local_value, remote_value): one human-readable comparison
@@ -10786,11 +10797,14 @@ function M.evaluate(state, translate)
   local HINT_PUBLISH  = tr("not on Flickr yet — publish first (Export ▸ Flickr)")
   local HINT_NOTPUB   = tr("already on Flickr — nothing to link")
 
-  -- Per-capability enablement.
-  local write_enabled        = s.logged_in and s.count > 0
+  -- Per-capability enablement. write/remote_write also require `configured`:
+  -- a cached login token can outlive cleared API-key/secret preferences (the
+  -- two live in separate stores — dt.password vs dt.preferences), so
+  -- `logged_in` alone is not proof a write can actually be signed (#139).
+  local write_enabled        = s.configured and s.logged_in and s.count > 0
   local publish_enabled      = s.logged_in and s.unpublished > 0
   local remote_view_enabled  = s.published > 0
-  local remote_write_enabled = s.logged_in and s.published > 0
+  local remote_write_enabled = s.configured and s.logged_in and s.published > 0
 
   -- Per-capability disabled-reason hint. The most specific reason wins so the
   -- user sees the single actionable step (select, then set up / log in, then
@@ -10819,7 +10833,7 @@ function M.evaluate(state, translate)
   local function remote_write_hint()
     if remote_write_enabled then return "" end
     if s.count == 0 then return HINT_SELECT end
-    if not s.logged_in then return login_step_hint() end
+    if not s.logged_in or not s.configured then return login_step_hint() end
     return HINT_PUBLISH
   end
 
@@ -11133,7 +11147,9 @@ end
 -- getInfo does not require auth, but we sign it (so the caller's own contact
 -- context is available and one code path covers it) and pass the account's nsid.
 function M.fetch_identity(rest, api_key, api_secret, account)
-  if not (account and account.nsid) then return nil, "not logged in to Flickr" end
+  if not (account and account.nsid and account.nsid ~= "") then
+    return nil, "not logged in to Flickr"
+  end
   local body, err = rest.call(api_key, api_secret, account, "flickr.people.getInfo",
     { user_id = account.nsid })
   if not body then return nil, err end
@@ -11145,7 +11161,8 @@ end
 -- fetch_upload_status(rest, api_key, api_secret, account) -> status, raw | nil, err
 -- Requires a signed (read) call.
 function M.fetch_upload_status(rest, api_key, api_secret, account)
-  if not (account and account.token and account.secret) then
+  if not (account and account.token and account.token ~= ""
+    and account.secret and account.secret ~= "") then
     return nil, "not logged in to Flickr"
   end
   local body, err = rest.call(api_key, api_secret, account, "flickr.people.getUploadStatus", {})
