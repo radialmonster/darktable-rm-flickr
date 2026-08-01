@@ -15794,11 +15794,16 @@ function panel_sets.scan_selected_publish_state()
     end
   end
   -- Persist the roll-up into the panel's dashboard label (issue #7) so the
-  -- scan result stays visible instead of only flashing as a toast.
+  -- scan result stays visible instead of only flashing as a toast. Must run
+  -- AFTER refresh_panel: refresh_panel repaints dashboard_label with the
+  -- first-selected image's single-image view (like every other selection
+  -- change does), so setting the roll-up first and refreshing after silently
+  -- discarded it (mirrors the already-correct order in scan_missing_on_flickr
+  -- just below).
+  refresh_panel(true, false)
   if panel_sets.dashboard_label then
     panel_sets.dashboard_label.label = panel_helpers.publish_dashboard(entries, { translate = _ }).text
   end
-  refresh_panel(true, false)
   dt.print(string.format(_("Flickr: scanned %d selected photo(s): %d need sync, %d current, %d unknown, %d unpublished"),
     #selection, counts["needs-republish"] or 0, counts.current or 0, counts.unknown or 0, counts.unpublished or 0))
   local breakdown = state.describe_reason_tally and state.describe_reason_tally(field_tally) or ""
@@ -18059,6 +18064,14 @@ script_data.__test = {
   save_token = save_token,
   load_token = load_token,
   clear_token = clear_token,
+  -- In-memory session_account get/set with NO dt.password.save/dt.preferences
+  -- side effects at all (#7). load_token() still gates on the active_nsid
+  -- preference matching, so a driver using this must also set that itself via
+  -- plain dt.preferences.write -- never through save_token()/clear_token(),
+  -- which persist to the real, shared-across-configdirs Windows Credential
+  -- Manager (see the incident note in verify_publish_dashboard_widget_cli.lua).
+  set_session_account = function(acc) session_account = acc end,
+  get_session_account = function() return session_account end,
   pack_token = pack_token,
   unpack_token = unpack_token,
   json_object = json_object,
