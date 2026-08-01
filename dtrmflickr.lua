@@ -10017,6 +10017,59 @@ end
 return M
 end
 
+package.preload["dtrmflickr.upload_limits"] = function(...)
+-- upload_limits.lua — pure "exceeds Flickr's per-photo upload size" check
+-- and skip-message formatter (issue #26, "enforce Flickr limits" half).
+--
+-- Flickr's per-photo filesize cap is account-tier-dependent and changes over
+-- time (free vs Pro, and Flickr has raised it before), so this deliberately
+-- does NOT hardcode a number. The cap is fetched once per export batch via
+-- flickr.people.getUploadStatus (account_info.fetch_upload_status, already
+-- used for the #9 quota display) and passed in here as max_bytes. "Resize to
+-- a target megapixel count" is a separate, export-module concern (a Lua
+-- storage callback only receives an already-exported file, it cannot drive
+-- darktable's own export resize) and is intentionally NOT covered here — see
+-- issue #26 and docs/design-notes.md for that split.
+--
+-- Like source_check.lua, this stays pure/injectable so it is fully offline
+-- testable: the caller (dtrmflickr.lua's store()) does the actual io.open
+-- file-size read and passes the resulting number in.
+
+local M = {}
+
+-- size_bytes/max_bytes: numbers, or nil/non-positive when unknown/uncapped.
+-- Mirrors source_check's safety rule: anything we cannot definitively compare
+-- is NOT flagged (never invent a false alarm from a missing/zero cap or an
+-- unreadable file size).
+function M.exceeds_limit(size_bytes, max_bytes)
+  if type(size_bytes) ~= "number" or size_bytes <= 0 then return false end
+  if type(max_bytes) ~= "number" or max_bytes <= 0 then return false end
+  return size_bytes > max_bytes
+end
+
+-- Human-friendly byte count, coarsest unit that keeps at least one whole digit.
+local function human_bytes(n)
+  if type(n) ~= "number" or n < 0 then return "?" end
+  if n >= 1024 * 1024 * 1024 then return string.format("%.2f GB", n / (1024 * 1024 * 1024)) end
+  if n >= 1024 * 1024 then return string.format("%.1f MB", n / (1024 * 1024)) end
+  if n >= 1024 then return string.format("%.0f KB", n / 1024) end
+  return string.format("%d B", n)
+end
+M.human_bytes = human_bytes
+
+-- Message for an image being skipped because its exported file is over the
+-- account's cap. `tr` is an optional gettext-style wrapper (defaults to
+-- identity), matching source_check.format_warning's convention.
+function M.format_skip_message(label, size_bytes, max_bytes, tr)
+  if type(tr) ~= "function" then tr = function(s) return s end end
+  return string.format(
+    tr("Flickr: skipped %s (%s) — over the account's %s per-photo upload limit"),
+    tostring(label), human_bytes(size_bytes), human_bytes(max_bytes))
+end
+
+return M
+end
+
 package.preload["dtrmflickr.preflight"] = function(...)
 -- preflight.lua — pure guided-preflight / dry-run planner (issue #13).
 --
@@ -17264,6 +17317,17 @@ local function initialize(storage, format, images, high_quality, extra_data)
       dt.print_log("[dtrmflickr] initialize: " .. warning)
     end
   end
+  -- Fetch the account's real per-photo upload size cap once for the whole
+  -- batch (issue #26, "enforce Flickr limits" half). Deliberately not
+  -- hardcoded: the cap is account-tier-dependent and Flickr has changed it
+  -- over time. Advisory-only fetch — a failure here just leaves the cap
+  -- unknown, in which case store()'s size check never flags anything (same
+  -- "never invent a false alarm" rule as the missing-source scan above).
+  if extra_data.account then
+    local account_info = require("dtrmflickr.account_info")
+    local status = account_info.fetch_upload_status(rest, extra_data.api_key, extra_data.api_secret, extra_data.account)
+    extra_data.filesize_max_bytes = status and status.filesize and status.filesize.maxbytes or nil
+  end
   return nil
 end
 
@@ -17381,6 +17445,37 @@ local function store(storage, image, format, filename, number, total, high_quali
     dt.print(_("Flickr upload skipped: ") .. err)
     dt.print_log("[dtrmflickr] store: skipped, missing API credentials")
     return
+  end
+
+  -- Skip an exported file that is over the account's real per-photo upload
+  -- cap (issue #26): analogous to the keyword/rating skip rules below, this
+  -- reports a clear preflight message and never calls flickr.upload for this
+  -- image, rather than letting Flickr's own upload call fail with a less
+  -- friendly REST error after spending the bandwidth to attempt it. The cap
+  -- was fetched once for the batch in initialize(); a nil cap (fetch failed,
+  -- not logged in yet, or Flickr reports no cap) never flags anything.
+  do
+    local upload_limits = require("dtrmflickr.upload_limits")
+    local size = nil
+    local f = io.open(filename, "rb")
+    if f then
+      size = f:seek("end")
+      f:close()
+    end
+    if upload_limits.exceeds_limit(size, extra_data.filesize_max_bytes) then
+      extra_data.skipped = extra_data.skipped or {}
+      extra_data.skipped[#extra_data.skipped + 1] = {
+        image = image,
+        filename = filename,
+        reason = "filesize",
+        size = size,
+        max = extra_data.filesize_max_bytes,
+      }
+      local msg = upload_limits.format_skip_message(image and image.filename or filename, size, extra_data.filesize_max_bytes, _)
+      dt.print(msg)
+      dt.print_log("[dtrmflickr] store: " .. msg)
+      return
+    end
   end
 
   local privacy = extra_data.privacy or current_privacy()
