@@ -6825,10 +6825,15 @@ function M.record_keyword_conflict(extra_data, conflict)
   if not extra_data or not conflict then return end
   extra_data.keyword_conflicts = extra_data.keyword_conflicts or {}
   extra_data.keyword_conflict_seen = extra_data.keyword_conflict_seen or {}
+  -- Affected-image count, distinct from the deduped list below: every call
+  -- represents one more image whose privacy/safety/content-type/license was
+  -- auto-resolved, even when its conflict signature repeats (issue #124).
+  extra_data.keyword_conflict_count = (extra_data.keyword_conflict_count or 0) + 1
   local key = table.concat({ conflict.kind or "", conflict.used or "", conflict.filters or "", conflict.tags or "" }, "|")
-  if extra_data.keyword_conflict_seen[key] then return end
-  extra_data.keyword_conflict_seen[key] = true
-  extra_data.keyword_conflicts[#extra_data.keyword_conflicts + 1] = conflict
+  if not extra_data.keyword_conflict_seen[key] then
+    extra_data.keyword_conflict_seen[key] = true
+    extra_data.keyword_conflicts[#extra_data.keyword_conflicts + 1] = conflict
+  end
   local msg = _("Flickr: keyword rule conflicts found; using safest/first matching rule")
   if not extra_data.keyword_conflict_toast_shown then
     if dt.print_toast then dt.print_toast(msg) else dt.print(msg) end
@@ -17864,7 +17869,9 @@ local function finalize(storage, image_table, extra_data)
   local failed = #(extra_data.failed or {})
   local skipped = #(extra_data.skipped or {})
   local post_errors = #(extra_data.post_errors or {})
-  local keyword_conflicts = #(extra_data.keyword_conflicts or {})
+  -- Affected-image count (issue #124), not the deduped-signature list length:
+  -- N images sharing one conflict signature must report as N, not 1.
+  local keyword_conflicts = extra_data.keyword_conflict_count or 0
   local tag_limit_warnings = #(extra_data.tag_limit_warnings or {})
   local album = extra_data.album or { mode = "none", targets = {}, errors = {} }
   local album_errors = 0
