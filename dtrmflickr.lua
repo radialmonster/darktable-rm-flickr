@@ -18069,7 +18069,13 @@ script_data.__test = {
     album_entry = album_entry,
     album_new_entry = album_new_entry,
     album_match = album_widget,
+    privacy = privacy_widget,
   },
+  -- Export sync-toggle check_buttons keyed by field name (title/description/tags/
+  -- date_taken/gps/strip_gps), so a live driver can force which fields the real
+  -- initialize()/store() pair syncs without depending on whatever the account's
+  -- own darktablerc happens to have saved (issue #21 producer-wiring driver).
+  sync_widgets = sync_widgets,
   album_label = albums.label,
   set_album_cache = set_album_cache,
   export_album_widgets = {
@@ -18147,6 +18153,22 @@ script_data.__test = {
   content_type_values = settings.content_type_values,
   license_values = settings.license_values,
   store = store,
+  -- Registered dt.register_storage callbacks (issue #21 producer-wiring residual):
+  -- exposing the REAL initialize()/store() pair (rather than only hand-built
+  -- extra_data) lets a live driver prove the fresh-upload uploaded-at seeding at
+  -- store()'s actual call site, not just the underlying state.lua helper.
+  initialize = initialize,
+  -- Real panel remote-load callback (issue #21 producer-wiring residual): proves
+  -- the getInfo dateuploaded backfill fires from the actual panel entry point.
+  -- Reads/writes the panel_current upvalue, so callers must route through
+  -- set_panel_current first.
+  load_remote_settings = load_remote_settings,
+  -- Companion to initialize()/store() above: a producer-wiring driver that calls
+  -- the real initialize()+store() pair must also call the real finalize() in its
+  -- cleanup, or it leaks the progress job initialize() created via
+  -- dt.gui.create_job and the resume-pending record store() added via
+  -- __dtrmflickr_resume.add_pending (issue #21 producer-wiring residual).
+  finalize = finalize,
 }
 
 dt.register_storage(STORAGE, HUMAN, store, finalize, supported, initialize, storage_widget)
