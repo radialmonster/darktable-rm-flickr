@@ -6631,13 +6631,24 @@ local FLICKR_TAG_LIMIT <const> = 75
 
 local function _(msgid) return dt.gettext.gettext(msgid) end
 
-function M.split_filter_list(value)
-  local filters = {}
+-- Shared comma-split/trim/lowercase/placeholder-strip parser (issue #126):
+-- both filter-list and color-label prefs used near-duplicate versions of this
+-- that disagreed on whether "<none>" was matched before or after lowercasing.
+-- `keep` is an optional predicate run on the lowercased item (used by
+-- split_color_label_list to also require a known color name).
+local function split_comma_list(value, keep)
+  local items = {}
   for item in tostring(value or ""):gmatch("[^,]+") do
-    item = item:match("^%s*(.-)%s*$")
-    if item ~= "" and item ~= EMPTY_FILTER_PREF then filters[#filters + 1] = item:lower() end
+    item = item:match("^%s*(.-)%s*$"):lower()
+    if item ~= "" and item ~= EMPTY_FILTER_PREF and (not keep or keep(item)) then
+      items[#items + 1] = item
+    end
   end
-  return filters
+  return items
+end
+
+function M.split_filter_list(value)
+  return split_comma_list(value)
 end
 
 function M.read_keyword_rules(prefix, values)
@@ -6699,22 +6710,30 @@ M.color_label_values = {
 }
 
 function M.split_color_label_list(value)
-  local labels = {}
-  for item in tostring(value or ""):gmatch("[^,]+") do
-    item = item:match("^%s*(.-)%s*$"):lower()
-    if item ~= "" and item ~= EMPTY_FILTER_PREF and M.color_label_values[item] then
-      labels[#labels + 1] = item
-    end
-  end
-  return labels
+  return split_comma_list(value, function(item) return M.color_label_values[item] end)
 end
+
+-- Warned-once-per-session guard (issue #125): a rating-threshold pref is
+-- free text, so a typo (e.g. "3 stars") parses to nil exactly like an
+-- intentionally blank/disabled pref. Surface that distinction once per pref
+-- per darktable session instead of silently no-opping either way.
+local rating_pref_warned = {}
 
 function M.read_rating_threshold(pref_name)
   local raw = dt.preferences.read(PLUGIN, pref_name, "string")
   raw = tostring(raw or ""):match("^%s*(.-)%s*$")
   if raw == "" then return nil end
   local rating = tonumber(raw)
-  if not rating then return nil end
+  if not rating then
+    if not rating_pref_warned[pref_name] then
+      rating_pref_warned[pref_name] = true
+      local msg = string.format(_("Flickr: preference '%s' is set to '%s', which is not a number; rating rule disabled"),
+        pref_name, raw)
+      if dt.print_toast then dt.print_toast(msg) else dt.print(msg) end
+      dt.print_log(string.format("[dtrmflickr] read_rating_threshold: unparseable pref %s='%s'", pref_name, raw))
+    end
+    return nil
+  end
   if rating < 0 then rating = 0 end
   if rating > 5 then rating = 5 end
   return math.floor(rating)
