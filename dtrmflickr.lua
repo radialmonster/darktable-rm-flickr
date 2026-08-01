@@ -15920,6 +15920,15 @@ function panel_sets.scan_missing_on_flickr()
   if panel_sets.dashboard_label then
     panel_sets.dashboard_label.label = panel_helpers.publish_dashboard(result.entries, { translate = _ }).text
   end
+  -- Single-image selection: publish_dashboard's one-entry branch deliberately
+  -- omits the status line (the header label owns it -- see test_missing_scan.lua),
+  -- but refresh_panel's refresh_publish_state_label above only ever computes the
+  -- LOCAL verdict, which can never be "missing". Without this, a single missing
+  -- photo silently showed its stale local status instead of the scan result.
+  if #selection == 1 and result.entries[1] and result.entries[1].status == "missing" then
+    panel_sets.publish_label.label = panel_helpers.publish_state_label(
+      "missing", result.entries[1].published_at, result.entries[1].reasons, _)
+  end
   dt.print(missing_scan.summary_text(result.summary, _))
 end
 
