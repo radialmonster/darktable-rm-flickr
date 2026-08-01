@@ -18143,6 +18143,10 @@ script_data.__test = {
   -- Real tab-switcher stack (#82), so a live driver can assert .active directly
   -- instead of only inferring it from the tab-button label prefix.
   panel_tab_stack = panel_tab_stack,
+  -- The URL-open helper (#83) -- not otherwise reachable from outside the
+  -- account_ui.build() injection -- so a live driver can assert it prefers
+  -- http.shell_open over dt.control.execute (no console flash).
+  open_url = open_url,
   panel_remote_write_widgets = {
     privacy = panel_privacy_widget,
     safety = panel_safety_widget,
