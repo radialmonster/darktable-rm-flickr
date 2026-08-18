@@ -8097,21 +8097,17 @@ function M.target_membership_status(value, resolver, member_ids)
   local result = { entries = {}, members = 0, non_members = 0, unresolved = 0, total = 0 }
 
   -- Normalize member_ids into a string-keyed set, accepting either a list
-  -- ({"100","200"}) or a set ({ ["100"] = true }).
+  -- ({"100","200"}, including a sparse list) or a set ({ ["100"] = true }).
   local member_set = {}
   if type(member_ids) == "table" then
-    local is_list = member_ids[1] ~= nil
-    if is_list then
-      for _, id in ipairs(member_ids) do
+    for key, value in pairs(member_ids) do
+      -- Numeric entries whose value is an id are list entries. A boolean value
+      -- denotes a numeric-keyed set, so preserve its key instead.
+      local id = (type(key) == "number" and type(value) ~= "boolean") and value or key
+      local present = (type(key) == "number" and type(value) ~= "boolean") or value
+      if present then
         local s = tostring(id or "")
         if s ~= "" then member_set[s] = true end
-      end
-    else
-      for id, present in pairs(member_ids) do
-        if present then
-          local s = tostring(id or "")
-          if s ~= "" then member_set[s] = true end
-        end
       end
     end
   end
