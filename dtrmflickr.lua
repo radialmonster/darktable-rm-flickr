@@ -6555,7 +6555,7 @@ M.geo_perm_values = {
 }
 
 M.default_setting_specs = {
-  { name = "default_privacy", label = "privacy", values = M.privacy_values, default = "private" },
+  { name = "default_privacy", label = "privacy", values = M.privacy_values, default = "public" },
   { name = "default_safety", label = "safety", values = M.safety_values, default = "safe" },
   { name = "default_content_type", label = "content type", values = M.content_type_values, default = "photo" },
   { name = "default_license", label = "license", values = M.license_values, default = "CC BY-NC-SA 4.0" },
@@ -12503,7 +12503,7 @@ local sync_strip_gps_widget = sync_check_button("strip_gps", _("strip GPS on res
   _("remove the photo's location on Flickr on every upload/resend instead of sending coordinates; overrides 'GPS location' above"))
 
 local function apply_default_privacy()
-  local pref = read_default_pref("default_privacy", "private")
+  local pref = read_default_pref("default_privacy", "public")
   local index = settings.privacy_index_from_pref(pref)
   privacy_widget.selected = index
   dt.print_log(string.format("[dtrmflickr] default_privacy=%s -> privacy selected=%d (%s)",
