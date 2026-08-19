@@ -10684,6 +10684,10 @@ package.preload["dtrmflickr.panel_gating"] = function(...)
 --   publish      — claim/link an unpublished image to an existing Flickr photo:
 --                  needs logged-in and >=1 selected image that is NOT yet on
 --                  Flickr.
+--   panel_publish — render through the selected Flickr Export preset: needs a
+--                  configured logged-in account and >=1 selected image. It
+--                  deliberately applies to both linked (replace) and unlinked
+--                  (new upload) photos.
 --   remote_view  — read-only actions on an already-published photo: open / copy
 --                  its Flickr URL, show its remote tags. Works even logged out
 --                  (the stored photo-id tag + api key are enough), so it only
@@ -10751,6 +10755,7 @@ function M.evaluate(state, translate)
   -- `logged_in` alone is not proof a write can actually be signed (#139).
   local write_enabled        = s.configured and s.logged_in and s.count > 0
   local publish_enabled      = s.logged_in and s.unpublished > 0
+  local panel_publish_enabled = write_enabled
   local remote_view_enabled  = s.published > 0
   local remote_write_enabled = s.configured and s.logged_in and s.published > 0
 
@@ -10821,6 +10826,7 @@ function M.evaluate(state, translate)
     caps = {
       write        = { enabled = write_enabled,        hint = write_hint() },
       publish      = { enabled = publish_enabled,      hint = publish_hint() },
+      panel_publish = { enabled = panel_publish_enabled, hint = write_hint() },
       remote_view  = { enabled = remote_view_enabled,  hint = remote_view_hint() },
       remote_write = { enabled = remote_write_enabled, hint = remote_write_hint() },
     },
@@ -13580,6 +13586,15 @@ function panel_sets.apply_gating(count, logged_in, published, configured)
       configured = configured }, _)
   if panel_sets.guidance_label then
     panel_sets.guidance_label.label = decision.guidance
+  end
+  if panel_sets.publish_selected_button then
+    -- #143 publishes unlinked images as new photos and replaces linked images,
+    -- so it follows the general writable-selection gate rather than the older
+    -- claim-only `publish` capability (which intentionally excludes links).
+    panel_sets.publish_selected_button.sensitive = decision.caps.panel_publish.enabled
+    panel_sets.publish_selected_button.tooltip = decision.caps.panel_publish.hint ~= ""
+      and decision.caps.panel_publish.hint
+      or _("queue the selected images through the named Flickr Export preset; linked images replace their current Flickr photo and unlinked images upload as new photos")
   end
   local rw = decision.caps.remote_write.enabled
   -- Only push the disabled state; enabling stale controls is the remote-load
