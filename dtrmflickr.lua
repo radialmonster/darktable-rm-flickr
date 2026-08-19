@@ -3616,7 +3616,12 @@ function M.tag_under_location_root(name, root)
 end
 
 local function flickr_quote_tag(tag)
-  tag = tostring(tag or "")
+  -- This accepts direct callers too (not only image_keyword_names, which has
+  -- already normalized its leaves). Flickr's tags grammar cannot safely encode
+  -- embedded double quotes, so match tag_reconcile.encode_tag: strip them,
+  -- trim surrounding whitespace, and drop a now-empty value before quoting.
+  tag = tostring(tag or ""):gsub('"', ""):match("^%s*(.-)%s*$")
+  if tag == "" then return nil end
   if tag:find("%s") then return '"' .. tag .. '"' end
   return tag
 end
@@ -3731,7 +3736,10 @@ function M.encode_flickr_tags(names)
   for _, name in ipairs(names or {}) do sorted[#sorted + 1] = tostring(name) end
   table.sort(sorted, function(a, b) return a:lower() < b:lower() end)
   local encoded = {}
-  for _, tag in ipairs(sorted) do encoded[#encoded + 1] = flickr_quote_tag(tag) end
+  for _, tag in ipairs(sorted) do
+    local quoted = flickr_quote_tag(tag)
+    if quoted then encoded[#encoded + 1] = quoted end
+  end
   return #encoded > 0 and table.concat(encoded, " ") or nil
 end
 
