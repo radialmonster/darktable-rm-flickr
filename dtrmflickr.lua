@@ -17399,7 +17399,15 @@ local function initialize(storage, format, images, high_quality, extra_data)
   extra_data.uploaded = {}
   extra_data.failed   = {}
   extra_data.skipped  = {}
-  extra_data.account  = request and __dtrmflickr_load_token_for_nsid(request.account_nsid) or load_token()
+  -- A panel-publish request is bound to the account selected when it was
+  -- accepted.  Do not use Lua's `and/or` shorthand here: a missing token for
+  -- that account would otherwise fall through to load_token() and silently
+  -- publish through whichever account became active while the job waited.
+  if request then
+    extra_data.account = __dtrmflickr_load_token_for_nsid(request.account_nsid)
+  else
+    extra_data.account = load_token()
+  end
   extra_data.api_key, extra_data.api_secret = get_credentials()
   -- Proactive token validation (issue #53): before committing this batch, cheaply
   -- confirm the saved OAuth token still works via flickr.auth.oauth.checkToken, so
@@ -17438,11 +17446,18 @@ local function initialize(storage, format, images, high_quality, extra_data)
   extra_data.keyword_conflicts = {}
   extra_data.keyword_conflict_seen = {}
   extra_data.publish_stamp = state.now_stamp()
-  local album_mode = album_mode_widget.selected or 1
-  local wants_album = request and request.album and #(request.album.targets or {}) > 0
-    or (album_mode == 2 and album_input_value() ~= "")
-    or (album_mode == 3 and trim(album_new_entry.text or "") ~= "")
-  if album_mode ~= 1 and wants_album and extra_data.account then
+  -- As with the account, a queued request must not inherit album choices made
+  -- in the Export UI after it was accepted. Only legacy direct exports read
+  -- the live widgets here.
+  local wants_album = false
+  if request then
+    wants_album = request.album and #(request.album.targets or {}) > 0
+  else
+    local album_mode = album_mode_widget.selected or 1
+    wants_album = (album_mode == 2 and album_input_value() ~= "")
+      or (album_mode == 3 and trim(album_new_entry.text or "") ~= "")
+  end
+  if wants_album and extra_data.account then
     local _sets, album_refresh_err = refresh_album_cache_for_export(extra_data.api_key, extra_data.api_secret,
       extra_data.account, { use_cache = true })
     if album_refresh_err then
