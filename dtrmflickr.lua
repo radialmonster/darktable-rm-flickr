@@ -9982,6 +9982,9 @@ local function publish_dashboard(entries, opts)
     if fields ~= "" then
       lines[#lines + 1] = string.format(tr("fields needing sync: %s"), fields)
     end
+    if (tally.image or 0) > 0 then
+      lines[#lines + 1] = tr("Export > Flickr to publish darkroom edits.")
+    end
   end
 
   return {
@@ -10659,57 +10662,6 @@ end
 return M
 end
 
-package.preload["dtrmflickr.panel_reupload"] = function(...)
-local M = {}
-
-local function safe_slug(value)
-  local s = tostring(value or "image")
-  s = s:gsub("[^%w%-_]+", "_")
-  s = s:gsub("^_+", ""):gsub("_+$", "")
-  if s == "" then s = "image" end
-  return s
-end
-
-function M.temp_path(dt, image, index)
-  local dir = "."
-  if dt and dt.configuration then
-    dir = dt.configuration.tmp_dir or dt.configuration.config_dir or "."
-  end
-  local sep = dir:sub(-1) == "/" or dir:sub(-1) == "\\"
-  local name = string.format("dtrmflickr_reupload_%s_%d_%d.jpg",
-    safe_slug(image and image.filename), tonumber(index) or 1, os.time())
-  return sep and (dir .. name) or (dir .. "/" .. name)
-end
-
-function M.candidates(selection, account_nsid, state)
-  local out = {}
-  local skipped = { unlinked = 0 }
-  if not account_nsid or not state then return out, skipped end
-  for _, image in ipairs(selection or {}) do
-    local photo_id = state.get_photo_id(image, account_nsid)
-    if photo_id and photo_id ~= "" then
-      out[#out + 1] = { image = image, photo_id = photo_id }
-    else
-      skipped.unlinked = skipped.unlinked + 1
-    end
-  end
-  return out, skipped
-end
-
-function M.format_start(count, skipped, tr)
-  tr = tr or function(s) return s end
-  skipped = skipped or {}
-  if count <= 0 then return tr("Flickr: no linked selected photos to reupload") end
-  if (skipped.unlinked or 0) > 0 then
-    return string.format(tr("Flickr: reuploading %d linked photo(s); %d unlinked skipped"),
-      count, skipped.unlinked)
-  end
-  return string.format(tr("Flickr: reuploading %d linked photo(s)"), count)
-end
-
-return M
-end
-
 package.preload["dtrmflickr.panel_gating"] = function(...)
 -- panel_gating.lua — pure selection-aware control gating for the Flickr panel (#88).
 --
@@ -10873,6 +10825,56 @@ function M.evaluate(state, translate)
       remote_write = { enabled = remote_write_enabled, hint = remote_write_hint() },
     },
   }
+end
+
+return M
+end
+
+package.preload["dtrmflickr.panel_publish"] = function(...)
+-- panel_publish.lua — immutable request snapshots and terminal status for the
+-- host-queued "Publish / update selected" panel action (issue #143).
+
+local M = {}
+
+local function copy(value, seen)
+  if type(value) ~= "table" then return value end
+  seen = seen or {}
+  if seen[value] then return seen[value] end
+  local result = {}
+  seen[value] = result
+  for key, item in pairs(value) do result[copy(key, seen)] = copy(item, seen) end
+  return result
+end
+
+-- Keep the context independent from live widgets/preferences after the host has
+-- accepted the request. The host binds this one table to only the matching
+-- Lua-storage instance; this helper deliberately owns no pending-request queue.
+function M.snapshot(values)
+  values = values or {}
+  return {
+    account_nsid = tostring(values.account_nsid or ""),
+    privacy = copy(values.privacy),
+    safety = copy(values.safety),
+    content_type = copy(values.content_type),
+    license = copy(values.license),
+    permissions = copy(values.permissions),
+    sync = copy(values.sync),
+    album = copy(values.album),
+  }
+end
+
+function M.copy(value)
+  return copy(value)
+end
+
+function M.terminal_summary(uploaded, failed, skipped, cleanup_errors, translate)
+  local tr = type(translate) == "function" and translate or function(s) return s end
+  cleanup_errors = tonumber(cleanup_errors) or 0
+  if cleanup_errors > 0 then
+    return string.format(tr("Flickr: partial completion — %d uploaded/updated, %d failed, %d skipped; temporary-file cleanup failed for %d image(s)"),
+      tonumber(uploaded) or 0, tonumber(failed) or 0, tonumber(skipped) or 0, cleanup_errors)
+  end
+  return nil
 end
 
 return M
@@ -11904,6 +11906,7 @@ local account_ui = require "dtrmflickr.account_ui"  -- account-login widget + se
 local queue_panel = require "dtrmflickr.queue_panel"  -- pure live job-lifecycle grid formatter (#56)
 local batch_apply = require "dtrmflickr.batch_apply"  -- pure multi-select settings-apply planner/formatter (#49)
 local panel_gating = require "dtrmflickr.panel_gating"  -- pure selection-aware control gating + guidance (#88)
+__dtrmflickr_panel_publish = require "dtrmflickr.panel_publish" -- queued panel publisher (#143)
 
 local PLUGIN     <const> = "dtrmflickr"            -- reserved namespace (prefs, password, tags)
 local STORAGE    <const> = "dtrmflickr"            -- register_storage plugin_name
@@ -12147,8 +12150,7 @@ local function save_token(acc)
   return true
 end
 
-local function load_token()
-  local nsid = dt.preferences.read(PLUGIN, "active_nsid", "string")
+function __dtrmflickr_load_token_for_nsid(nsid)
   if not nsid or nsid == "" then return nil end
   if session_account and session_account.nsid == nsid then return session_account end
   local packed = dt.password.get(PLUGIN, nsid)
@@ -12157,12 +12159,18 @@ local function load_token()
   if not packed or packed == "" then return nil end
   local token, secret = unpack_token(packed)
   if not token then return nil end
-  local path_alias = dt.preferences.read(PLUGIN, "active_path_alias", "string")
+  local active_nsid = dt.preferences.read(PLUGIN, "active_nsid", "string")
+  local path_alias = active_nsid == nsid
+    and dt.preferences.read(PLUGIN, "active_path_alias", "string") or nil
   return {
     nsid = nsid, token = token, secret = secret,
-    username = dt.preferences.read(PLUGIN, "active_username", "string"),
+    username = active_nsid == nsid and dt.preferences.read(PLUGIN, "active_username", "string") or nsid,
     path_alias = (path_alias and path_alias ~= "") and path_alias or nil,
   }
+end
+
+local function load_token()
+  return __dtrmflickr_load_token_for_nsid(dt.preferences.read(PLUGIN, "active_nsid", "string"))
 end
 
 local function clear_token()
@@ -12405,6 +12413,10 @@ dt.preferences.register(PLUGIN, "settings_help", "lua",
   "info",
   settings_help_widget,
   keep_label_pref)
+dt.preferences.register(PLUGIN, "panel_publish_preset", "string",
+  _("Flickr: panel publish Export preset"),
+  _("exact name of a normal Export preset that uses Flickr storage; the lighttable Publish / update selected action queues this preset without changing Export settings"),
+  "")
 
 -- issue #72: restrict who may view a photo's location after its coordinates are
 -- (re)sent to Flickr, via flickr.photos.geo.setPerms. Reads the "who can see
@@ -16818,17 +16830,16 @@ panel_sets.push_all_button = dt.new_widget("button") {
   tooltip = _("push changed metadata fields to Flickr: title/description, keywords, GPS/date taken, and other sync-enabled Flickr settings as applicable. This does not upload rendered pixels; crop/develop/darkroom changes need Export > Flickr to reupload/replace the photo."),
   clicked_callback = function() panel_sets.push_all_changed() end,
 }
+panel_sets.publish_selected_button = dt.new_widget("button") {
+  label = _("Publish / update selected"),
+  tooltip = _("queue the selected images through the named Flickr Export preset; linked images replace their current Flickr photo and unlinked images upload as new photos"),
+  clicked_callback = function() panel_sets.publish_selected() end,
+}
 panel_sets.mark_published_button = dt.new_widget("button") {
   label = _("mark as published"),
   tooltip = _("re-mark the linked photo(s) as published/current without re-uploading; reconciles drifted state"),
   clicked_callback = function() panel_sets.mark_published_selection() end,
 }
-panel_sets.reupload_button = dt.new_widget("button") {
-  label = _("reupload selected to Flickr"),
-  tooltip = _("render selected linked photo(s) to temporary JPEG files through darktable's Lua export path, then replace the existing Flickr photo IDs in place. Uses darktable's current JPEG/export processing defaults; for another format or exact Export module target settings, use Export > Flickr."),
-  clicked_callback = function() panel_sets.reupload_selection() end,
-}
-
 local panel_tab_stack = dt.new_widget("stack") {
   -- 1: sync — the daily loop (#87): one diff-driven summary of every syncable
   -- field's divergence from the last-synced baseline, a single "push all
@@ -16838,6 +16849,7 @@ local panel_tab_stack = dt.new_widget("stack") {
     panel_remote_label,
     dt.new_widget("label") { label = _("sync status") },
     panel_sets.sync_surface_label,
+    panel_sets.publish_selected_button,
     panel_sets.push_all_button,
     dt.new_widget("button") {
       label = _("push title/description to Flickr"),
@@ -17102,7 +17114,6 @@ local panel_tab_stack = dt.new_widget("stack") {
       tooltip = _("re-evaluate publish state for the selection now; auto-scan already does this on selection change, so this is a manual fallback"),
       clicked_callback = function() panel_sets.scan_selected_publish_state() end,
     },
-    panel_sets.reupload_button,
     dt.new_widget("button") {
       label = _("scan missing on Flickr"),
       tooltip = _("check each linked selected photo against Flickr (one request per photo) and flag any that were deleted/removed on Flickr as 'missing on Flickr' in the dashboard"),
@@ -17240,7 +17251,7 @@ panel_sets.set_active_tab(dt.preferences.read(PLUGIN, "panel_active_tab", "integ
 ----------------------------------------------------------------------
 -- Storage callbacks.
 ----------------------------------------------------------------------
-local supported_formats = { jpg = true, jpeg = true, tif = true, tiff = true, png = true, webp = true }
+local supported_formats = { jpg = true, jpeg = true, tif = true, tiff = true, png = true }
 
 local function current_privacy()
   local index = privacy_widget.selected
@@ -17329,6 +17340,50 @@ local function supported(storage, format)
   return supported_formats[format.extension] == true
 end
 
+function panel_sets.publish_selected()
+  local selection = dt.gui.selection and dt.gui.selection() or {}
+  local account = load_token()
+  local preset = trim(dt.preferences.read(PLUGIN, "panel_publish_preset", "string") or "")
+  if #selection == 0 then
+    dt.print(_("Flickr: select one or more images before publishing."))
+    return nil, "no selection"
+  end
+  if not account then
+    dt.print(_("Flickr: log in from Lua Options before publishing."))
+    return nil, "not logged in"
+  end
+  if preset == "" then
+    dt.print(_("Flickr: set the panel publish Export preset in Lua Options first."))
+    return nil, "missing preset"
+  end
+  if not dt.control or type(dt.control.enqueue_export_preset) ~= "function" then
+    dt.print(_("Flickr: this darktable build does not support queued panel publishing yet."))
+    return nil, "host API unavailable"
+  end
+  local api_key, api_secret = get_credentials()
+  if not api_key or not api_secret then
+    dt.print(_("Flickr: missing API key/secret."))
+    return nil, "missing API credentials"
+  end
+  local context = __dtrmflickr_panel_publish.snapshot {
+    account_nsid = account.nsid,
+    privacy = current_privacy(), safety = current_safety(),
+    content_type = current_content_type(), license = current_license(),
+    permissions = current_permissions(), sync = current_sync_fields(),
+    album = current_album(),
+  }
+  local queued, err = dt.control.enqueue_export_preset(selection, preset, STORAGE, context)
+  if not queued then
+    local message = string.format(_("Flickr: could not queue panel publish: %s"), tostring(err or "unknown error"))
+    panel_sets.status_label.label = message
+    dt.print(message)
+    return nil, err
+  end
+  panel_sets.status_label.label = string.format(_("Flickr: queued %d image(s) with Export preset '%s'"), #selection, preset)
+  dt.print(panel_sets.status_label.label)
+  return true
+end
+
 local function initialize(storage, format, images, high_quality, extra_data)
   -- Start each export with a clean queue scoreboard so the panel's
   -- "queue: N ok/failed/retried - throttled Nx - waited X.Xs total" reflects
@@ -17340,10 +17395,11 @@ local function initialize(storage, format, images, high_quality, extra_data)
   if __dtrmflickr_queue and __dtrmflickr_queue.reset_stats then
     __dtrmflickr_queue:reset_stats()
   end
+  local request = type(extra_data.request_context) == "table" and extra_data.request_context or nil
   extra_data.uploaded = {}
   extra_data.failed   = {}
   extra_data.skipped  = {}
-  extra_data.account  = load_token()
+  extra_data.account  = request and __dtrmflickr_load_token_for_nsid(request.account_nsid) or load_token()
   extra_data.api_key, extra_data.api_secret = get_credentials()
   -- Proactive token validation (issue #53): before committing this batch, cheaply
   -- confirm the saved OAuth token still works via flickr.auth.oauth.checkToken, so
@@ -17372,18 +17428,19 @@ local function initialize(storage, format, images, high_quality, extra_data)
       dt.print_log("[dtrmflickr] initialize: proactive checkToken inconclusive, continuing: " .. tostring(verr))
     end
   end
-  extra_data.privacy = current_privacy()
-  extra_data.safety = current_safety()
-  extra_data.content_type = current_content_type()
-  extra_data.license = current_license()
-  extra_data.permissions = current_permissions()
-  extra_data.sync = current_sync_fields()
+  extra_data.privacy = request and __dtrmflickr_panel_publish.copy(request.privacy) or current_privacy()
+  extra_data.safety = request and __dtrmflickr_panel_publish.copy(request.safety) or current_safety()
+  extra_data.content_type = request and __dtrmflickr_panel_publish.copy(request.content_type) or current_content_type()
+  extra_data.license = request and __dtrmflickr_panel_publish.copy(request.license) or current_license()
+  extra_data.permissions = request and __dtrmflickr_panel_publish.copy(request.permissions) or current_permissions()
+  extra_data.sync = request and __dtrmflickr_panel_publish.copy(request.sync) or current_sync_fields()
   extra_data.post_errors = {}
   extra_data.keyword_conflicts = {}
   extra_data.keyword_conflict_seen = {}
   extra_data.publish_stamp = state.now_stamp()
   local album_mode = album_mode_widget.selected or 1
-  local wants_album = (album_mode == 2 and album_input_value() ~= "")
+  local wants_album = request and request.album and #(request.album.targets or {}) > 0
+    or (album_mode == 2 and album_input_value() ~= "")
     or (album_mode == 3 and trim(album_new_entry.text or "") ~= "")
   if album_mode ~= 1 and wants_album and extra_data.account then
     local _sets, album_refresh_err = refresh_album_cache_for_export(extra_data.api_key, extra_data.api_secret,
@@ -17393,7 +17450,7 @@ local function initialize(storage, format, images, high_quality, extra_data)
       dt.print_log(string.format("[dtrmflickr] initialize: album refresh failed: %s", tostring(album_refresh_err)))
     end
   end
-  extra_data.album = current_album()
+  extra_data.album = request and __dtrmflickr_panel_publish.copy(request.album) or current_album()
   -- Show a progress bar in darktable's background-jobs area for the whole batch
   -- (issue #2). darktable calls store() once per image in order, so the bar can
   -- fill as images complete; the per-image dt.print toast scrolls away on a
@@ -17544,7 +17601,7 @@ local function record_post_error(extra_data, image, photo_id, action, err)
     action, tostring(photo_id), tostring(err)))
 end
 
-local function store(storage, image, format, filename, number, total, high_quality, extra_data)
+local function store_impl(storage, image, format, filename, number, total, high_quality, extra_data)
   -- Advance the batch progress bar to "images before this one are done". Placed
   -- before the early-return guards (skip/credential) so the bar still moves for
   -- images that never upload. finalize() fills it to 100% and destroys it.
@@ -17967,13 +18024,59 @@ local function store(storage, image, format, filename, number, total, high_quali
   end
 end
 
+-- The Lua storage ABI leaves temporary-file ownership with the storage callback.
+-- Upload synchronously while the file exists, then remove that one file before
+-- moving to the next image. A wrapper covers every early return and Lua error;
+-- finalize() retains a defensive fallback for a callback interrupted before this
+-- point. We intentionally do not alter generic host-wide Lua-storage lifecycle.
+function __dtrmflickr_cleanup_export_file(extra_data, image, filename)
+  if type(filename) ~= "string" or filename == "" then return true end
+  extra_data.cleaned_files = extra_data.cleaned_files or {}
+  if extra_data.cleaned_files[filename] then return true end
+  local probe = io.open(filename, "rb")
+  if not probe then return true end -- already removed by the host/error path
+  probe:close()
+  local ok, err = os.remove(filename)
+  if ok then
+    extra_data.cleaned_files[filename] = true
+    return true
+  end
+  extra_data.cleanup_errors = extra_data.cleanup_errors or {}
+  extra_data.cleanup_errors[#extra_data.cleanup_errors + 1] = {
+    image = image, filename = filename, error = tostring(err or "could not remove temporary export file"),
+  }
+  dt.print(string.format(_("Flickr: temporary-file cleanup failed for %s: %s"),
+    image and image.filename or filename, tostring(err or "unknown error")))
+  dt.print_log(string.format("[dtrmflickr] store: temporary-file cleanup failed file='%s': %s",
+    tostring(filename), tostring(err or "unknown error")))
+  return nil, err
+end
+
+function __dtrmflickr_store(storage, image, format, filename, number, total, high_quality, extra_data)
+  local ok, err = pcall(store_impl, storage, image, format, filename, number, total, high_quality, extra_data)
+  __dtrmflickr_cleanup_export_file(extra_data, image, filename)
+  if ok then return end
+  local message = tostring(err)
+  extra_data.failed = extra_data.failed or {}
+  extra_data.failed[#extra_data.failed + 1] = { image = image, filename = filename, error = message }
+  dt.print(string.format(_("Flickr: upload failed for %s: %s"), image and image.filename or "image", message))
+  dt.print_log("[dtrmflickr] store: callback error: " .. message)
+end
+
 local function finalize(storage, image_table, extra_data)
+  -- Store() normally removes its file before returning. If a host callback is
+  -- interrupted between rendering and that cleanup, reclaim any remaining files
+  -- here without double-removing the paths already recorded above.
+  for image, filename in pairs(image_table or {}) do
+    __dtrmflickr_cleanup_export_file(extra_data, image, filename)
+  end
   local total = 0
   for _img in pairs(image_table) do total = total + 1 end
   local uploaded = #(extra_data.uploaded or {})
   local failed = #(extra_data.failed or {})
   local skipped = #(extra_data.skipped or {})
   local post_errors = #(extra_data.post_errors or {})
+  local cleanup_errors = #(extra_data.cleanup_errors or {})
   -- Affected-image count (issue #124), not the deduped-signature list length:
   -- N images sharing one conflict signature must report as N, not 1.
   local keyword_conflicts = extra_data.keyword_conflict_count or 0
@@ -18118,6 +18221,13 @@ local function finalize(storage, image_table, extra_data)
     uploaded = fresh_uploads, updated = replaced_uploads, skipped = skipped,
     failed = failed, post_errors = post_errors, album_errors = album_errors, total = total,
   }, { translate = _ }))
+  local terminal = __dtrmflickr_panel_publish.terminal_summary(
+    uploaded, failed, skipped, cleanup_errors, _)
+  if terminal then
+    dt.print(terminal)
+    dt.print_log("[dtrmflickr] finalize: " .. terminal)
+    panel_sets.status_label.label = terminal
+  end
   -- Name *which* images failed/were skipped, not just how many. The per-image
   -- dt.print messages emitted during store scroll out of view on a large batch,
   -- so without this the count line is the only end-state the user sees.
@@ -18174,75 +18284,6 @@ local function finalize(storage, image_table, extra_data)
   extra_data.progress_job = nil
 end
 
-function panel_sets.reupload_selection(selection_override)
-  local pr = require("dtrmflickr.panel_reupload")
-  local selection = selection_override or __dtrmflickr_current_selection()
-  if #selection == 0 then
-    dt.print(_("Flickr: select one or more linked images before reuploading."))
-    return
-  end
-  local acc = load_token()
-  if not acc then
-    dt.print(_("Flickr: log in from Lua Options before reuploading."))
-    return
-  end
-  if not dt.new_format then
-    dt.print(_("Flickr: this darktable build cannot render from Lua; use Export > Flickr."))
-    return
-  end
-  local candidates, skipped = pr.candidates(selection, acc.nsid, state)
-  if #candidates == 0 then
-    dt.print(pr.format_start(0, skipped, _))
-    return
-  end
-  local fmt_ok, fmt = pcall(function() return dt.new_format("jpeg") end)
-  if not fmt_ok or not fmt or not fmt.write_image then
-    dt.print(_("Flickr: JPEG export format is not available; use Export > Flickr."))
-    return
-  end
-
-  local images = {}
-  for i, item in ipairs(candidates) do images[i] = item.image end
-  local extra_data = {}
-  local filtered = initialize(nil, fmt, images, true, extra_data)
-  if type(filtered) == "table" then
-    local allowed = {}
-    for _, image in ipairs(filtered) do allowed[image] = true end
-    local kept = {}
-    for _, item in ipairs(candidates) do
-      if allowed[item.image] then kept[#kept + 1] = item end
-    end
-    candidates = kept
-  end
-  if #candidates == 0 then
-    dt.print(_("Flickr: reupload cancelled before rendering."))
-    return
-  end
-
-  local files = {}
-  dt.print(pr.format_start(#candidates, skipped, _))
-  for i, item in ipairs(candidates) do
-    local image = item.image
-    local path = pr.temp_path(dt, image, i)
-    files[image] = path
-    local ok, wrote = pcall(function() return fmt:write_image(image, path, true) end)
-    if ok and wrote then
-      store(nil, image, fmt, path, i, #candidates, true, extra_data)
-    else
-      extra_data.failed = extra_data.failed or {}
-      extra_data.failed[#extra_data.failed + 1] = {
-        image = image, filename = path, error = wrote or _("render failed"),
-      }
-      dt.print(string.format(_("Flickr: render failed for %s"), image and image.filename or "image"))
-      dt.print_log(string.format("[dtrmflickr] panel reupload render failed for '%s': %s",
-        tostring(image and image.filename or "image"), tostring(wrote)))
-    end
-    pcall(os.remove, path)
-  end
-  finalize(nil, files, extra_data)
-  refresh_panel(true, false)
-end
-
 ----------------------------------------------------------------------
 -- script_manager integration + registration.
 ----------------------------------------------------------------------
@@ -18279,6 +18320,7 @@ script_data.show = script_data.restart
 script_data.__test = {
   save_token = save_token,
   load_token = load_token,
+  load_token_for_nsid = __dtrmflickr_load_token_for_nsid,
   clear_token = clear_token,
   -- In-memory session_account get/set with NO dt.password.save/dt.preferences
   -- side effects at all (#7). load_token() still gates on the active_nsid
@@ -18293,6 +18335,8 @@ script_data.__test = {
   json_object = json_object,
   json_string_field = json_string_field,
   current_album = current_album,
+  panel_publish = __dtrmflickr_panel_publish,
+  publish_selected = function() return panel_sets.publish_selected() end,
   export_widgets = {
     album_mode = album_mode_widget,
     album_entry = album_entry,
@@ -18389,7 +18433,7 @@ script_data.__test = {
   safety_values = settings.safety_values,
   content_type_values = settings.content_type_values,
   license_values = settings.license_values,
-  store = store,
+  store = __dtrmflickr_store,
   -- Registered dt.register_storage callbacks (issue #21 producer-wiring residual):
   -- exposing the REAL initialize()/store() pair (rather than only hand-built
   -- extra_data) lets a live driver prove the fresh-upload uploaded-at seeding at
@@ -18408,7 +18452,7 @@ script_data.__test = {
   finalize = finalize,
 }
 
-dt.register_storage(STORAGE, HUMAN, store, finalize, supported, initialize, storage_widget)
+dt.register_storage(STORAGE, HUMAN, __dtrmflickr_store, finalize, supported, initialize, storage_widget)
 dt.register_lib(
   PANEL,
   HUMAN,
