@@ -5134,8 +5134,8 @@ end
 -- never re-run. Returns three lists:
 --   runnable — resumable AND owned by the active account (safe to re-run)
 --   orphaned — resumable but owned by another account / unbound / logged out
---   finished — already terminal (succeeded/failed/stale/cancelled): skip, never
---              re-run, regardless of which account owns it
+--   finished — not resumable (terminal or an unrecognized/missing state): skip,
+--              never re-run, regardless of which account owns it
 -- Pure (no mutation). A logged-out active account (nil/"") sends every resumable
 -- record to `orphaned`. This wires the documented `is_resumable` contract into
 -- the partition path so the persistence layer is resume-safe end to end.
@@ -5144,15 +5144,18 @@ function M.plan_resume(records, active_nsid)
   local runnable, orphaned, finished = {}, {}, {}
   for _, rec in ipairs(records or {}) do
     if type(rec) == "table" then
-      if M.is_terminal(rec.state) then
-        finished[#finished + 1] = rec
-      else
+      if M.is_resumable(rec.state) then
         local owner = rec.nsid ~= nil and tostring(rec.nsid) or ""
         if active_nsid ~= "" and owner == active_nsid then
           runnable[#runnable + 1] = rec
         else
           orphaned[#orphaned + 1] = rec
         end
+      else
+        -- Keep this exact predicate aligned with to_resumable(): a hand-built
+        -- record with no/unknown state is not a safe replay candidate, even
+        -- though it is not one of the named terminal states.
+        finished[#finished + 1] = rec
       end
     end
   end
@@ -5214,7 +5217,8 @@ end
 --               or may not have completed on Flickr; surface for a user decision,
 --               never auto re-run (would risk a duplicate photo/album)
 --   orphaned  — resumable but other-account / unbound / logged out
---   finished  — already terminal: skip, never re-run, regardless of owner
+--   finished  — not resumable (terminal or missing/unknown state): skip, never
+--               re-run, regardless of owner
 -- Pure (no mutation). A logged-out active account (nil/"") sends every resumable
 -- record to `orphaned` (uncertain stays empty — an other-account upload is
 -- orphaned/cancelled regardless of how far it got).
@@ -5223,9 +5227,7 @@ function M.plan_resume_safe(records, active_nsid)
   local runnable, uncertain, orphaned, finished = {}, {}, {}, {}
   for _, rec in ipairs(records or {}) do
     if type(rec) == "table" then
-      if M.is_terminal(rec.state) then
-        finished[#finished + 1] = rec
-      else
+      if M.is_resumable(rec.state) then
         local owner = rec.nsid ~= nil and tostring(rec.nsid) or ""
         if active_nsid ~= "" and owner == active_nsid then
           if M.is_safely_resumable(rec) then
@@ -5236,6 +5238,10 @@ function M.plan_resume_safe(records, active_nsid)
         else
           orphaned[#orphaned + 1] = rec
         end
+      else
+        -- Match to_resumable()/plan_resume: never surface a malformed state as
+        -- runnable or uncertain for a future replay decision.
+        finished[#finished + 1] = rec
       end
     end
   end
