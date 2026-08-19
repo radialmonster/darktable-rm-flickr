@@ -8957,12 +8957,13 @@ end
 -- Extract the text content of the first <name>...</name> element. Returns the
 -- decoded string (possibly "") when the element is present, or nil when the
 -- element is absent or self-closing (<name />) — so callers can distinguish
--- "Flickr says the field is empty" from "Flickr did not report the field".
+-- "Flickr says the field is empty" from "Flickr did not report the field". The
+-- name boundary is intentional: <titlecase> must not be mistaken for <title>.
 local function element_text(body, name)
   body = tostring(body or "")
   -- self-closing => present but empty
   if body:match("<" .. name .. "%s*/>") then return "" end
-  local inner = body:match("<" .. name .. "[^>]*>(.-)</" .. name .. ">")
+  local inner = body:match("<" .. name .. "%f[%s>/][^>]*>(.-)</" .. name .. ">")
   if inner == nil then return nil end
   return xml_unescape(inner)
 end
@@ -8997,7 +8998,9 @@ end
 --   dateuploaded        — the raw dateuploaded attribute string or nil
 function M.parse_info(body)
   body = tostring(body or "")
-  if not body:match("<photo[%s>]") then return nil end
+  -- Accept the valid bare/self-closing <photo/> form while still rejecting
+  -- similarly prefixed elements such as <photograph>.
+  if not body:match("<photo[%s>/]") then return nil end
   -- views appears either as a photo attribute (views="N") or, on some responses,
   -- as a <views>N</views> element; comments is the <comments>N</comments> count.
   local views = attr(body, "views") or element_text(body, "views")
