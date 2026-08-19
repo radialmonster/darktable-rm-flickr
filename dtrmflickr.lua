@@ -2076,12 +2076,17 @@ end
 function M.parse_upload_tickets(body)
   local tickets = {}
   for attrs in tostring(body or ""):gmatch("<ticket%s+([^>]*)>") do
-    local id = attrs:match('id="(.-)"') or attrs:match("id='(.-)'")
+    -- XML attribute order is not meaningful. In particular, an unanchored
+    -- `id=` search can consume the `id` suffix of a preceding `photoid=` and
+    -- store this ticket under its photo id, making the async resolver think its
+    -- original ticket is still processing. Reuse the quote-aware parser used by
+    -- the other Flickr XML response readers.
+    local attr = parse_attrs(attrs)
+    local id = attr.id
     if id and id ~= "" then
-      local complete = attrs:match('complete="(.-)"') or attrs:match("complete='(.-)'")
-        or attrs:match('status="(.-)"') or attrs:match("status='(.-)'")
-      local photoid = attrs:match('photoid="(.-)"') or attrs:match("photoid='(.-)'")
-      local invalid = attrs:match('invalid="(.-)"') or attrs:match("invalid='(.-)'")
+      local complete = attr.complete or attr.status
+      local photoid = attr.photoid
+      local invalid = attr.invalid
       tickets[xml_unescape(id)] = {
         id = xml_unescape(id),
         complete = complete and tonumber(complete) or nil,
