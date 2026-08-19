@@ -13254,22 +13254,40 @@ end
 local panel_loading = false
 local panel_dirty = { privacy = false, safety = false, content_type = false, license = false, comment_perm = false, addmeta_perm = false }
 panel_privacy_widget.changed_callback = function()
-  if not panel_loading then panel_dirty.privacy = true end
+  if not panel_loading then
+    panel_dirty.privacy = true
+    panel_sets.batch_save_armed = nil
+  end
 end
 panel_safety_widget.changed_callback = function()
-  if not panel_loading then panel_dirty.safety = true end
+  if not panel_loading then
+    panel_dirty.safety = true
+    panel_sets.batch_save_armed = nil
+  end
 end
 panel_content_type_widget.changed_callback = function()
-  if not panel_loading then panel_dirty.content_type = true end
+  if not panel_loading then
+    panel_dirty.content_type = true
+    panel_sets.batch_save_armed = nil
+  end
 end
 panel_license_widget.changed_callback = function()
-  if not panel_loading then panel_dirty.license = true end
+  if not panel_loading then
+    panel_dirty.license = true
+    panel_sets.batch_save_armed = nil
+  end
 end
 panel_comment_perm_widget.changed_callback = function()
-  if not panel_loading then panel_dirty.comment_perm = true end
+  if not panel_loading then
+    panel_dirty.comment_perm = true
+    panel_sets.batch_save_armed = nil
+  end
 end
 panel_addmeta_perm_widget.changed_callback = function()
-  if not panel_loading then panel_dirty.addmeta_perm = true end
+  if not panel_loading then
+    panel_dirty.addmeta_perm = true
+    panel_sets.batch_save_armed = nil
+  end
 end
 
 local function panel_is_visible()
