@@ -11220,6 +11220,23 @@ local account_info = require "dtrmflickr.account_info"
 
 local M = {}
 
+-- Keep an error concise for the one-line account-status and info labels. Flickr
+-- error text can include localized/user-provided UTF-8, so clip by codepoint
+-- rather than byte: a raw byte cut can leave an invalid tail in the label. Keep
+-- the prior 160-character display budget (157 characters plus "..."). Invalid
+-- UTF-8 remains displayable via the old byte-based fallback.
+function M.short_error(err)
+  local s = tostring(err or ""):gsub("%s+", " ")
+  local char_len = utf8.len(s)
+  if not char_len then
+    if #s > 160 then return s:sub(1, 157) .. "..." end
+    return s
+  end
+  if char_len <= 160 then return s end
+  local cut = utf8.offset(s, 158)
+  return s:sub(1, cut - 1) .. "..."
+end
+
 -- build(deps) -> { widget, refresh_status, note_auth_failure }
 --   widget             the account-login box to register as the "lua" preference
 --   refresh_status     re-render the status line + widget visibility from current
@@ -11287,12 +11304,6 @@ function M.build(deps)
   -- count, profile + buddyicon (avatar) URLs, and the monthly-upload quota. Empty
   -- until the user clicks "refresh account info"; cleared on logout.
   local info_label = dt.new_widget("label") { label = "" }
-
-  local function short_error(err)
-    local s = tostring(err or ""):gsub("%s+", " ")
-    if #s > 160 then s = s:sub(1, 157) .. "..." end
-    return s
-  end
 
   local function refresh_status()
     local acc = load_token()
@@ -11430,7 +11441,7 @@ function M.build(deps)
       if not key then dt.print(_("Enter your Flickr API key and secret first.")); return end
       local acc, err = auth.get_access_token(key, secret, pending.token, pending.secret, code)
       if not acc then
-        last_error = short_error(err)
+        last_error = M.short_error(err)
         refresh_status()
         dt.print(_("Flickr access-token failed: ") .. last_error)
         dt.print_log("[dtrmflickr] access_token error: " .. tostring(err))
@@ -11482,7 +11493,7 @@ function M.build(deps)
       local info, ierr = info_mod.fetch_identity(rest_mod, key, secret, acc)
       if not info then
         if __dtrmflickr_note_auth_failure then __dtrmflickr_note_auth_failure(ierr) end
-        info_label.label = _("could not load account info: ") .. short_error(ierr)
+        info_label.label = _("could not load account info: ") .. M.short_error(ierr)
         dt.print_log("[dtrmflickr] account info (getInfo) failed: " .. tostring(ierr))
         return
       end
