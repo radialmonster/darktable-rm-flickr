@@ -321,12 +321,24 @@ local function read_file_binary(path)
   return body
 end
 
+local write_file_failure
+
 local function write_file(path, body)
+  -- Tests can force a particular temporary-file creation to fail. Production
+  -- never sets this hook.
+  if write_file_failure and write_file_failure(path, body) then return nil end
   local f = io.open(path, "wb")
   if not f then return nil end
   f:write(body)
   f:close()
   return true
+end
+
+local function remove_temps(...)
+  for i = 1, select("#", ...) do
+    local path = select(i, ...)
+    if path and path ~= "" then os.remove(path) end
+  end
 end
 
 -- Sentinel appended to curl's stdout via --write-out so we can read the final
@@ -401,7 +413,10 @@ local function run_windows_hidden(cmd)
       batch_escape(cmd) .. ' > "' .. out_path .. '" 2> "' .. err_path .. '"',
       "exit /b %ERRORLEVEL%",
     }, "\r\n")
-    if not write_file(bat_path, bat) then return nil, "could not write temporary command" end
+    if not write_file(bat_path, bat) then
+      remove_temps(vbs_path, bat_path, out_path, err_path)
+      return nil, "could not write temporary command"
+    end
     wrapped = 'cmd.exe /d /c ""' .. bat_path .. '""'
   end
   local script = table.concat({
@@ -409,16 +424,16 @@ local function run_windows_hidden(cmd)
     'code = shell.Run(' .. vbs_quote(wrapped) .. ', 0, True)',
     'WScript.Quit code',
   }, "\r\n")
-  if not write_file(vbs_path, script) then return nil, "could not write temporary script" end
+  if not write_file(vbs_path, script) then
+    remove_temps(vbs_path, bat_path, out_path, err_path)
+    return nil, "could not write temporary script"
+  end
   -- pcall'd so the vbs/bat/out/err temp files are always removed, even if
   -- launch_windows raises instead of returning a failure code (#111).
   local pok, ok, why, code = pcall(launch_windows, "wscript.exe //B //Nologo " .. shq(vbs_path))
   local out = read_file(out_path) or ""
   local err = read_file(err_path) or ""
-  os.remove(vbs_path)
-  if bat_path then os.remove(bat_path) end
-  os.remove(out_path)
-  os.remove(err_path)
+  remove_temps(vbs_path, bat_path, out_path, err_path)
   if not pok then error(ok) end
   if not command_succeeded(ok, why, code) then
     local detail = err ~= "" and err or out
@@ -494,22 +509,23 @@ local function windows_http(method, url, body, content_type)
   local vbs_path = temp_path(".vbs")
 
   if body ~= nil and not write_file(body_path, body) then
+    remove_temps(vbs_path, body_path, out_path, err_path)
     return nil, "could not write temporary request body"
   end
 
   local script = build_windows_http_vbs(method, url, body_path, content_type, out_path, err_path)
 
-  if not write_file(vbs_path, script) then return nil, "could not write temporary HTTP script" end
+  if not write_file(vbs_path, script) then
+    remove_temps(vbs_path, body_path, out_path, err_path)
+    return nil, "could not write temporary HTTP script"
+  end
   -- pcall'd so the vbs/body/out/err temp files (the body may carry OAuth-signed
   -- form data, #111) are always removed, even if launch_windows raises.
   local pok, ok, why, code = pcall(launch_windows, "wscript.exe //B //Nologo " .. shq(vbs_path))
 
   local out = read_file(out_path) or ""
   local err = read_file(err_path) or ""
-  os.remove(vbs_path)
-  if body_path ~= "" then os.remove(body_path) end
-  os.remove(out_path)
-  os.remove(err_path)
+  remove_temps(vbs_path, body_path, out_path, err_path)
   if not pok then error(ok) end
   if not command_succeeded(ok, why, code) then
     local detail = err ~= "" and err or out
@@ -726,6 +742,11 @@ M.__test = {
   run_curl_config = run_curl_config,
   build_multipart = build_multipart,
   build_windows_http_vbs = build_windows_http_vbs,
+  -- Failure-injection and direct transport entry points let the offline suite
+  -- cover cleanup before the VBS launcher is reached (#111).
+  set_write_file_failure = function(fn) write_file_failure = fn end,
+  run_windows_hidden = run_windows_hidden,
+  windows_http = windows_http,
   -- Engage an authoritative override. Passing a stub forces the native path;
   -- passing nil forces the "native ABSENT" branch deterministically on any box
   -- (even one with a loadable DLL) — see native_http_override_set (#91).
