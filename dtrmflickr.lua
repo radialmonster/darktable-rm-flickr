@@ -4729,7 +4729,6 @@ function Queue:pump()
       if #self.pending > 0 and self.pump_yield then self.pump_yield(self.pump_tick_ms) end
     end
   end)
-  self.pump_running = false
   if not ok then
     -- A non-job scheduler error (e.g. an on_event/backoff_delay_ms callback
     -- raising, or anything else that slips past the per-job pcalls in run_job)
@@ -4738,9 +4737,12 @@ function Queue:pump()
     -- would kill the dispatched pump coroutine with pending work stranded until
     -- a later submit_async's ensure_pump happens to retry the same trigger and
     -- hit the same throw again. The next ensure_pump()/submit_async() call will
-    -- start a fresh pump over the still-pending jobs.
+    -- start a fresh pump over the still-pending jobs. Emit before clearing the
+    -- flag: the durable-resume listener is gated on pumping(), and must save
+    -- the queued recovery set before a shutdown can discard it.
     self:emit("pump_error", nil, { error = err })
   end
+  self.pump_running = false
 end
 
 -- Enqueue work to run asynchronously and make sure a pump is draining it. Use
